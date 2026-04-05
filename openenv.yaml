@@ -4,4 +4,21 @@ type: space
 runtime: fastapi
 app: server.app:app
 port: 8000
+description: Deterministic OpenEnv benchmark for CI/CD pipeline repair.
+tasks:
+  - task_id: easy_merge_conflict
+    key: easy
+    title: Resolve failing merge stage
+    difficulty: easy
+  - task_id: medium_docker_dep_failure
+    key: medium
+    title: Repair docker build dependency failure
+    difficulty: medium
+  - task_id: hard_permission_timeout_chain
+    key: hard
+    title: Fix deploy permission and timeout chain
+    difficulty: hard
+graders:
+  module: server.graders
+  function: grade_episode
 

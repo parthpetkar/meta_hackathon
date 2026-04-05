@@ -29,17 +29,21 @@ class MetaHackathonEnv(
         >>> # Connect to a running server
         >>> with MetaHackathonEnv(base_url="http://localhost:8000") as client:
         ...     result = client.reset()
-        ...     print(result.observation.echoed_message)
+        ...     print(result.observation.task_id)
         ...
-        ...     result = client.step(MetaHackathonAction(message="Hello!"))
-        ...     print(result.observation.echoed_message)
+        ...     result = client.step(
+        ...         MetaHackathonAction(operation="inspect_pipeline", target="", value="")
+        ...     )
+        ...     print(result.observation.pipeline_status)
 
     Example with Docker:
         >>> # Automatically start container and connect
         >>> client = MetaHackathonEnv.from_docker_image("meta_hackathon-env:latest")
         >>> try:
         ...     result = client.reset()
-        ...     result = client.step(MetaHackathonAction(message="Test"))
+        ...     result = client.step(
+        ...         MetaHackathonAction(operation="inspect_logs", target="", value="")
+        ...     )
         ... finally:
         ...     client.close()
     """
@@ -55,7 +59,9 @@ class MetaHackathonEnv(
             Dictionary representation suitable for JSON encoding
         """
         return {
-            "message": action.message,
+            "operation": action.operation,
+            "target": action.target,
+            "value": action.value,
         }
 
     def _parse_result(self, payload: Dict) -> StepResult[MetaHackathonObservation]:
@@ -70,8 +76,22 @@ class MetaHackathonEnv(
         """
         obs_data = payload.get("observation", {})
         observation = MetaHackathonObservation(
-            echoed_message=obs_data.get("echoed_message", ""),
-            message_length=obs_data.get("message_length", 0),
+            task_id=obs_data.get("task_id", ""),
+            task_title=obs_data.get("task_title", ""),
+            difficulty=obs_data.get("difficulty", ""),
+            pipeline_status=obs_data.get("pipeline_status", "unknown"),
+            current_stage=obs_data.get("current_stage", ""),
+            available_stages=obs_data.get("available_stages", []),
+            available_tools=obs_data.get("available_tools", []),
+            visible_alerts=obs_data.get("visible_alerts", []),
+            visible_logs=obs_data.get("visible_logs", []),
+            visible_metrics=obs_data.get("visible_metrics", []),
+            findings=obs_data.get("findings", []),
+            action_history=obs_data.get("action_history", []),
+            current_hypothesis=obs_data.get("current_hypothesis", ""),
+            attempted_fix=obs_data.get("attempted_fix", ""),
+            incident_resolved=obs_data.get("incident_resolved", False),
+            final_score=obs_data.get("final_score", 0.0),
             done=payload.get("done", False),
             reward=payload.get("reward"),
             metadata=obs_data.get("metadata", {}),
