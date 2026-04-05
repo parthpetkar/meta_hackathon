@@ -1,42 +1,87 @@
+"""
+Inference Script Example
+===================================
+MANDATORY
+- Before submitting, ensure the following variables are defined in your environment configuration:
+    API_BASE_URL   The API endpoint for the LLM.
+    MODEL_NAME     The model identifier to use for inference.
+    HF_TOKEN       Your Hugging Face / API key.
+    LOCAL_IMAGE_NAME The name of the local image to use for the environment if you are using from_docker_image()
+                     method
+
+- Defaults are set only for API_BASE_URL and MODEL_NAME 
+    (and should reflect your active inference setup):
+    API_BASE_URL = os.getenv("API_BASE_URL", "<your-active-endpoint>")
+    MODEL_NAME = os.getenv("MODEL_NAME", "<your-active-model>")
+    
+- The inference script must be named `inference.py` and placed in the root directory of the project
+- Participants must use OpenAI Client for all LLM calls using above variables
+
+STDOUT FORMAT
+- The script must emit exactly three line types to stdout, in this order:
+
+    [START] task=<task_name> env=<benchmark> model=<model_name>
+    [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
+    [END]   success=<true|false> steps=<n> rewards=<r1,r2,...,rn>
+
+  Rules:
+    - One [START] line at episode begin.
+    - One [STEP] line per step, immediately after env.step() returns.
+    - One [END] line after env.close(), always emitted (even on exception).
+    - reward and rewards are formatted to 2 decimal places.
+    - done and success are lowercase booleans: true or false.
+    - error is the raw last_action_error string, or null if none.
+    - All fields on a single line with no newlines within a line.
+
+  Example:
+    [START] task=click-test env=miniwob model=Qwen3-VL-30B
+    [STEP] step=1 action=click('123') reward=0.00 done=false error=null
+    [STEP] step=2 action=fill('456','text') reward=0.00 done=false error=null
+    [STEP] step=3 action=click('789') reward=1.00 done=true error=null
+    [END] success=true steps=3 rewards=0.00,0.00,1.00
+"""
+
 import asyncio
-import importlib
-import json
 import os
+import sys
 import textwrap
+from pathlib import Path
 from typing import List, Optional
 
-from client import MetaHackathonEnv
-from models import MetaHackathonAction
-IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME") or os.getenv("IMAGE_NAME") or "meta_hackathon-env:latest"
-API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+from dotenv import load_dotenv
+from openai import OpenAI
+
+load_dotenv()
+
+PACKAGE_ROOT = Path(__file__).resolve().parent
+PARENT_DIR = PACKAGE_ROOT.parent
+if str(PARENT_DIR) not in sys.path:
+    sys.path.insert(0, str(PARENT_DIR))
+
+from meta_hackathon import MetaHackathonAction, MetaHackathonEnv
+IMAGE_NAME = os.getenv("IMAGE_NAME") # If you are using docker image 
+API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 
 API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
 MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
+TASK_NAME = os.getenv("META_HACKATHON_TASK", "echo")
 BENCHMARK = os.getenv("META_HACKATHON_BENCHMARK", "meta_hackathon")
-MAX_STEPS = 10
-TEMPERATURE = 0.2
-MAX_TOKENS = 220
-SUCCESS_SCORE_THRESHOLD = 0.65
+MAX_STEPS = 8
+TEMPERATURE = 0.7
+MAX_TOKENS = 150
+SUCCESS_SCORE_THRESHOLD = 0.1  # normalized score in [0, 1]
+
+# Max possible reward: each token contributes 0.1, across all steps
+_MAX_REWARD_PER_STEP = MAX_TOKENS * 0.1
+MAX_TOTAL_REWARD = MAX_STEPS * _MAX_REWARD_PER_STEP
 
 SYSTEM_PROMPT = textwrap.dedent(
     """
-    You are an SRE agent operating a simulated production incident system.
-    Return exactly one JSON object with keys: operation, target, value.
-
-    Allowed operations:
-    - inspect_alerts
-    - inspect_metrics
-    - inspect_service
-    - inspect_logs
-    - set_hypothesis
-    - apply_fix
-    - verify_fix
-
-    Rules:
-    - Use operation names exactly.
-    - target can be empty unless required by operation.
-    - value can be empty unless setting hypothesis or applying fix.
-    - Never output anything except valid JSON.
+    You are interacting with a simple echo environment.
+    Each turn you must send a message. The environment will echo it back.
+    Reward is proportional to message length: reward = len(message) * 0.1
+    Your goal is to maximize total reward by sending meaningful, substantive messages.
+    Reply with exactly one message string — no quotes, no prefixes, just the message text.
     """
 ).strip()
 
@@ -54,97 +99,27 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
     )
 
 
-def log_end(success: bool, steps: int, rewards: List[float]) -> None:
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
-    print(f"[END] success={str(success).lower()} steps={steps} rewards={rewards_str}", flush=True)
+    print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
 
 
-def _action_to_str(action: MetaHackathonAction) -> str:
-    return f"{action.operation}(target={action.target},value={action.value})"
-
-
-def _safe_load_action(raw: str) -> Optional[MetaHackathonAction]:
-    try:
-        payload = json.loads(raw)
-        operation = str(payload.get("operation", "")).strip()
-        target = str(payload.get("target", "")).strip()
-        value = str(payload.get("value", "")).strip()
-        if not operation:
-            return None
-        return MetaHackathonAction(operation=operation, target=target, value=value)
-    except Exception:
-        return None
-
-
-def _heuristic_action(observation, step: int) -> MetaHackathonAction:
-    fix_by_task = {
-        "easy": "scale-cache-cluster",
-        "medium": "increase-payment-db-pool",
-        "hard": "rollback-search-rollout",
-    }
-    hypothesis_by_task = {
-        "easy": "redis cache miss storm with key eviction",
-        "medium": "db connection pool saturation in payment service",
-        "hard": "search thread pool exhaustion after rollout",
-    }
-
-    if step == 1:
-        return MetaHackathonAction(operation="inspect_alerts", target="", value="")
-    if step == 2:
-        return MetaHackathonAction(operation="inspect_metrics", target="", value="")
-
-    primary_service = observation.available_services[0] if observation.available_services else ""
-    if step == 3:
-        return MetaHackathonAction(operation="inspect_service", target=primary_service, value="")
-    if step == 4:
-        return MetaHackathonAction(operation="inspect_logs", target=primary_service, value="")
-    if step == 5:
-        return MetaHackathonAction(
-            operation="set_hypothesis",
-            target="",
-            value=hypothesis_by_task.get(observation.task_id, "incident dependency bottleneck"),
-        )
-    if step == 6:
-        return MetaHackathonAction(
-            operation="apply_fix",
-            target="",
-            value=fix_by_task.get(observation.task_id, "rollback-search-rollout"),
-        )
-    if step == 7:
-        return MetaHackathonAction(operation="verify_fix", target="", value="")
-
-    return MetaHackathonAction(operation="verify_fix", target="", value="")
-
-
-def build_user_prompt(step: int, observation, last_reward: float, history: List[str]) -> str:
+def build_user_prompt(step: int, last_echoed: str, last_reward: float, history: List[str]) -> str:
     history_block = "\n".join(history[-4:]) if history else "None"
-    suggested = ", ".join(observation.recommended_actions) if observation.recommended_actions else "None"
     return textwrap.dedent(
         f"""
         Step: {step}
-        Task: {observation.task_id} ({observation.difficulty})
-        Title: {observation.task_title}
-        Status: {observation.status}
-        Latest finding: {observation.latest_finding}
-        Alerts: {observation.visible_alerts}
-        Metrics: {observation.visible_metrics}
-        Visible logs: {observation.visible_logs}
-        Current hypothesis: {observation.current_hypothesis}
-        Suggested actions: {suggested}
-        Services: {observation.available_services}
+        Last echoed message: {last_echoed!r}
         Last reward: {last_reward:.2f}
         Previous steps:
         {history_block}
-        Return one JSON action.
+        Send your next message.
         """
     ).strip()
 
 
-def get_model_action(client, step: int, observation, last_reward: float, history: List[str]) -> MetaHackathonAction:
-    if client is None:
-        return _heuristic_action(observation, step)
-
-    user_prompt = build_user_prompt(step, observation, last_reward, history)
+def get_model_message(client: OpenAI, step: int, last_echoed: str, last_reward: float, history: List[str]) -> str:
+    user_prompt = build_user_prompt(step, last_echoed, last_reward, history)
     try:
         completion = client.chat.completions.create(
             model=MODEL_NAME,
@@ -157,89 +132,65 @@ def get_model_action(client, step: int, observation, last_reward: float, history
             stream=False,
         )
         text = (completion.choices[0].message.content or "").strip()
-        parsed = _safe_load_action(text)
-        if parsed:
-            return parsed
-    except Exception:
-        pass
-    return _heuristic_action(observation, step)
+        return text if text else "hello"
+    except Exception as exc:
+        print(f"[DEBUG] Model request failed: {exc}", flush=True)
+        return "hello"
 
 
-async def run_single_task(client, env) -> float:
-    rewards: List[float] = []
-    steps_taken = 0
-    success = False
-    last_reward = 0.0
+async def main() -> None:
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-    result = await env.reset()
-    observation = result.observation
-
-    log_start(task=observation.task_id, env=BENCHMARK, model=MODEL_NAME)
+    env = await MetaHackathonEnv.from_docker_image(IMAGE_NAME)
 
     history: List[str] = []
+    rewards: List[float] = []
+    steps_taken = 0
+    score = 0.0
+    success = False
+
+    log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
+
     try:
+        result = await env.reset() # OpenENV.reset()
+        last_echoed = result.observation.echoed_message
+        last_reward = 0.0
+
         for step in range(1, MAX_STEPS + 1):
             if result.done:
                 break
 
-            action = get_model_action(client, step, observation, last_reward, history)
-            action_str = _action_to_str(action)
-            error: Optional[str] = None
+            message = get_model_message(client, step, last_echoed, last_reward, history)
 
-            try:
-                result = await env.step(action)
-            except Exception as exc:
-                error = str(exc)
-                log_step(step=step, action=action_str, reward=0.0, done=False, error=error)
-                history.append(f"Step {step}: {action_str} -> error={error}")
-                continue
+            result = await env.step(MetaHackathonAction(message=message))
+            obs = result.observation
 
-            observation = result.observation
             reward = result.reward or 0.0
             done = result.done
+            error = None
 
             rewards.append(reward)
             steps_taken = step
+            last_echoed = obs.echoed_message
             last_reward = reward
 
-            log_step(step=step, action=action_str, reward=reward, done=done, error=error)
-            history.append(f"Step {step}: {action_str} -> reward {reward:+.2f}")
+            log_step(step=step, action=message, reward=reward, done=done, error=error)
+
+            history.append(f"Step {step}: {message!r} -> reward {reward:+.2f}")
 
             if done:
                 break
 
-        success = bool(observation.final_score >= SUCCESS_SCORE_THRESHOLD)
-    finally:
-        log_end(success=success, steps=steps_taken, rewards=rewards)
-
-    return float(observation.final_score)
-
-
-async def main() -> None:
-    dotenv_module = importlib.util.find_spec("dotenv")
-    if dotenv_module is not None:
-        importlib.import_module("dotenv").load_dotenv()
-
-    client = None
-    openai_module = importlib.util.find_spec("openai")
-    if openai_module is not None:
-        openai_lib = importlib.import_module("openai")
-        client = openai_lib.OpenAI(base_url=API_BASE_URL, api_key=API_KEY or "missing-api-key")
-
-    env = await MetaHackathonEnv.from_docker_image(IMAGE_NAME)
-
-    try:
-        scores = []
-        for _ in range(3):
-            score = await run_single_task(client, env)
-            scores.append(score)
+        score = sum(rewards) / MAX_TOTAL_REWARD if MAX_TOTAL_REWARD > 0 else 0.0
+        score = min(max(score, 0.0), 1.0)  # clamp to [0, 1]
+        success = score >= SUCCESS_SCORE_THRESHOLD
 
     finally:
         try:
             await env.close()
-        except Exception:
-            # Do not fail submission run on container teardown timeout.
-            pass
+        except Exception as e:
+            print(f"[DEBUG] env.close() error (container cleanup): {e}", flush=True)
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
 
 if __name__ == "__main__":

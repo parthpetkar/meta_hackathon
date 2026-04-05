@@ -12,10 +12,7 @@ from openenv.core import EnvClient
 from openenv.core.client_types import StepResult
 from openenv.core.env_server.types import State
 
-try:
-    from .models import MetaHackathonAction, MetaHackathonObservation
-except ImportError:
-    from models import MetaHackathonAction, MetaHackathonObservation
+from .models import MetaHackathonAction, MetaHackathonObservation
 
 
 class MetaHackathonEnv(
@@ -58,9 +55,7 @@ class MetaHackathonEnv(
             Dictionary representation suitable for JSON encoding
         """
         return {
-            "operation": action.operation,
-            "target": action.target,
-            "value": action.value,
+            "message": action.message,
         }
 
     def _parse_result(self, payload: Dict) -> StepResult[MetaHackathonObservation]:
@@ -75,19 +70,8 @@ class MetaHackathonEnv(
         """
         obs_data = payload.get("observation", {})
         observation = MetaHackathonObservation(
-            task_id=obs_data.get("task_id", ""),
-            task_title=obs_data.get("task_title", ""),
-            difficulty=obs_data.get("difficulty", ""),
-            status=obs_data.get("status", "investigating"),
-            available_services=obs_data.get("available_services", []),
-            visible_alerts=obs_data.get("visible_alerts", []),
-            visible_metrics=obs_data.get("visible_metrics", {}),
-            visible_logs=obs_data.get("visible_logs", []),
-            latest_finding=obs_data.get("latest_finding", ""),
-            current_hypothesis=obs_data.get("current_hypothesis", ""),
-            recommended_actions=obs_data.get("recommended_actions", []),
-            incident_resolved=obs_data.get("incident_resolved", False),
-            final_score=obs_data.get("final_score", 0.0),
+            echoed_message=obs_data.get("echoed_message", ""),
+            message_length=obs_data.get("message_length", 0),
             done=payload.get("done", False),
             reward=payload.get("reward"),
             metadata=obs_data.get("metadata", {}),
