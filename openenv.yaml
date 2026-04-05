@@ -1,0 +1,7 @@
+spec_version: 1
+name: meta_hackathon
+type: space
+runtime: fastapi
+app: server.app:app
+port: 8000
+

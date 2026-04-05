@@ -1,0 +1,2 @@
+[console_scripts]
+server = meta_hackathon.server.app:main
