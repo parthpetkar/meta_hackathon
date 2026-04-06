@@ -39,7 +39,7 @@ class MetaHackathonObservation(Observation):
 
     task_id: str = Field(default="", description="Task identifier.")
     task_title: str = Field(default="", description="Human-readable task title.")
-    difficulty: str = Field(default="", description="Task difficulty: easy/medium/hard.")
+    difficulty: str = Field(default="", description="Task difficulty: easy/medium/security/hard.")
     pipeline_status: str = Field(default="unknown", description="Current pipeline status.")
     current_stage: str = Field(default="", description="Current failing stage.")
     pipeline_stages: Dict[str, str] = Field(

@@ -5,6 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List
 
+try:
+    from .failure_patterns import sample_failure_lines
+except ImportError:
+    from server.failure_patterns import sample_failure_lines
+
 
 STAGE_ORDER: List[str] = ["build", "test", "deploy"]
 
@@ -67,6 +72,8 @@ class IncidentStep:
     true_cause: str
     hypothesis_terms: List[str]
     log_variants: List[List[str]]
+    pattern_buckets: List[str]
+    relevant_inspections: List[str]
     config_clues: List[str]
     docker_clues: List[str]
     permission_clues: List[str]
@@ -74,6 +81,8 @@ class IncidentStep:
     correct_fix_terms: List[str]
     partial_fix_terms: List[List[str]]
     partial_fix_reveal: str
+    red_herring_terms: List[List[str]]
+    partial_advances: bool
 
 
 @dataclass(frozen=True)
@@ -106,106 +115,82 @@ class ScenarioCard:
 SCENARIOS: Dict[str, ScenarioCard] = {
     "easy": ScenarioCard(
         task_id="easy_merge_conflict",
-        task_title="Resolve iterative merge and test breakage",
+        task_title="Resolve single-file merge conflict",
         difficulty="easy",
         benchmark="meta_hackathon",
-        pipeline_alert="Build failed with merge conflict-like output.",
+        pipeline_alert="Build failed with merge conflict markers.",
         initial_metrics=[
-            "pipeline.retry_count=1",
-            "pipeline.blocked_prs=1",
+            "pipeline.retry_count=0",
             "merge.conflict_files=1",
         ],
-        max_steps=10,
+        max_steps=8,
         config_templates={
-            "ci.yaml": "stages: [build, test, deploy]\nmerge_policy: strict\nbranch_sync: false",
+            "ci.yaml": "stages: [build, test, deploy]\nmerge_policy: strict\nbranch_sync: false\n",
             "services/api/routes.py": "<<<<<<< HEAD\nhandler_v1()\n=======\nhandler_v2()\n>>>>>>> feature",
         },
-        final_success_message="Pipeline recovered after merge sync and post-merge test stabilization.",
+        final_success_message="Pipeline recovered after resolving merge conflict in routes.py.",
         incident_chain=[
             IncidentStep(
                 stage="build",
-                ambiguous_error="merge-check failed: conflict detected in routes",
+                ambiguous_error="merge-check failed: unresolved conflict markers in routes.py",
                 possible_causes=[
                     "unresolved conflict markers",
-                    "feature branch stale against main",
+                    "stale feature branch",
                 ],
                 family_term_sets=[
                     ["merge", "conflict"],
                     ["stale", "branch"],
                 ],
-                true_cause="feature branch stale and unresolved conflict markers",
-                hypothesis_terms=["merge", "conflict", "stale"],
+                true_cause="unresolved merge markers in services/api/routes.py",
+                hypothesis_terms=["merge", "conflict"],
                 log_variants=[
                     [
                         "CONFLICT (content): Merge conflict in services/api/routes.py",
                         "Automatic merge failed; fix conflicts and commit the result.",
                     ],
                     [
-                        "merge-check exited code 1: competing changes in routes.py",
-                        "hint: branch appears behind origin/main by multiple commits",
+                        "error: Your local changes would be overwritten by merge.",
+                        "merge-check exited code 1: unresolved markers in routes.py",
                     ],
                 ],
+                pattern_buckets=["merge_conflict"],
+                relevant_inspections=["view_logs", "inspect_config"],
                 config_clues=[
-                    "ci.yaml: branch_sync=false for feature pipeline",
-                    "git metadata: feature branch behind main by 6 commits",
+                    "services/api/routes.py contains <<<<<<< and >>>>>>> markers",
+                    "ci.yaml merge_policy is strict and rejects unresolved conflicts",
                 ],
-                docker_clues=["No docker anomaly surfaced for current failure."],
-                permission_clues=["No IAM anomaly surfaced for current failure."],
+                docker_clues=[],
+                permission_clues=[],
                 correct_operation="modify_config",
-                correct_fix_terms=["sync", "resolve", "merge", "conflict"],
-                partial_fix_terms=[["resolve", "conflict"]],
-                partial_fix_reveal="Build passes but tests now fail due to stale API contract after incomplete merge sync.",
-            ),
-            IncidentStep(
-                stage="test",
-                ambiguous_error="contract-test failed after merge",
-                possible_causes=[
-                    "api contract drift",
-                    "stale generated fixtures",
-                ],
-                family_term_sets=[
-                    ["contract", "drift"],
-                    ["stale", "schema"],
-                ],
-                true_cause="stale branch contract after partial merge resolution",
-                hypothesis_terms=["contract", "stale", "branch"],
-                log_variants=[
-                    [
-                        "contract_test.py::test_route_schema failed: expected v2 payload",
-                        "artifact schema generated from outdated branch baseline",
-                    ],
-                ],
-                config_clues=[
-                    "schema.lock mismatch after merge resolution",
-                    "branch sync marker missing from CI metadata",
-                ],
-                docker_clues=["Docker image not implicated in this stage failure."],
-                permission_clues=["Permissions are valid for current stage."],
-                correct_operation="modify_config",
-                correct_fix_terms=["rebase", "feature", "branch"],
+                correct_fix_terms=["resolve", "merge", "conflict"],
                 partial_fix_terms=[],
                 partial_fix_reveal="",
+                red_herring_terms=[
+                    ["delete", "routes"],
+                    ["skip", "merge", "checks"],
+                ],
+                partial_advances=False,
             ),
         ],
         variants=[
             ScenarioVariant(
                 variant_id="easy_v1",
-                pipeline_alert_suffix="Pipeline checks also reported schema drift warnings.",
+                pipeline_alert_suffix="Conflict surfaced in API routing module.",
                 extra_log_lines=[
                     "hint: merge auto-resolution was attempted previously and aborted",
                 ],
                 extra_config_clues=[
-                    "ci.yaml note: strict merge mode requires branch synchronization before final checks",
+                    "git metadata: merge conflict is isolated to services/api/routes.py",
                 ],
             ),
             ScenarioVariant(
                 variant_id="easy_v2",
-                pipeline_alert_suffix="PR metadata indicates stale base revision.",
+                pipeline_alert_suffix="Build stopped at merge validation gate.",
                 extra_log_lines=[
-                    "warning: contract test fixtures may be stale after merge attempts",
+                    "warning: conflict marker scan failed for routes.py",
                 ],
                 extra_config_clues=[
-                    "preflight report: branch baseline hash differs from main verification snapshot",
+                    "ci bot note: resolve markers before branch_sync can proceed",
                 ],
             ),
         ],
@@ -251,6 +236,8 @@ SCENARIOS: Dict[str, ScenarioCard] = {
                         "locked graph contains urllib3 2.x while legacy SDK expects <1.25",
                     ],
                 ],
+                pattern_buckets=["dependency_conflict"],
+                relevant_inspections=["view_logs", "inspect_config", "inspect_dockerfile"],
                 config_clues=[
                     "requirements.txt pins requests==2.20.0 and urllib3==2.1.0",
                     "last green pipeline used a compatibility override",
@@ -264,6 +251,11 @@ SCENARIOS: Dict[str, ScenarioCard] = {
                 correct_fix_terms=["pin", "compatible", "requests", "urllib3"],
                 partial_fix_terms=[["pin", "requests"]],
                 partial_fix_reveal="Dependency conflict reduced, but build still flaky due to Docker install-order mismatch.",
+                red_herring_terms=[
+                    ["upgrade", "latest", "requests"],
+                    ["remove", "urllib3"],
+                ],
+                partial_advances=True,
             ),
             IncidentStep(
                 stage="build",
@@ -284,6 +276,8 @@ SCENARIOS: Dict[str, ScenarioCard] = {
                         "recommend installing system packages before Python package compilation",
                     ],
                 ],
+                pattern_buckets=["docker_layer_cache"],
+                relevant_inspections=["view_logs", "inspect_dockerfile", "inspect_config"],
                 config_clues=[
                     "CI hints: deterministic build requires apt tooling before pip install",
                 ],
@@ -295,6 +289,11 @@ SCENARIOS: Dict[str, ScenarioCard] = {
                 correct_fix_terms=["reorder", "docker", "install"],
                 partial_fix_terms=[],
                 partial_fix_reveal="",
+                red_herring_terms=[
+                    ["clear", "cache"],
+                    ["retry", "without", "change"],
+                ],
+                partial_advances=False,
             ),
         ],
         variants=[
@@ -320,113 +319,302 @@ SCENARIOS: Dict[str, ScenarioCard] = {
             ),
         ],
     ),
-    "hard": ScenarioCard(
-        task_id="hard_permission_timeout_chain",
-        task_title="Fix deploy permission + timeout chain",
-        difficulty="hard",
+    "security": ScenarioCard(
+        task_id="security_secrets_iam_misconfig",
+        task_title="Fix IAM writer role and exposed CI secret",
+        difficulty="security",
         benchmark="meta_hackathon",
-        pipeline_alert="Deploy failed with permission denied and rollout timeout.",
+        pipeline_alert="Deploy failed with IAM denial and secret scanning policy violations.",
         initial_metrics=[
-            "deploy.timeout_seconds=900",
-            "deploy.error_rate=0.44",
-            "iam.denied_events=3",
+            "deploy.error_rate=0.31",
+            "iam.denied_events=2",
+            "secrets.scan_findings=1",
         ],
-        max_steps=12,
+        max_steps=13,
         config_templates={
-            "deploy.yaml": "rollout_timeout: 900\nregistry_repo: team/api\nservice_account: ci-runner\n",
-            "iam.txt": "ci-runner: artifactregistry.reader\n",
+            "deploy.yaml": "service_account: ci-deployer\nregistry_repo: team/secure-api\n",
+            "iam.txt": "ci-deployer: artifactregistry.reader\n",
+            "Dockerfile": "FROM python:3.11-slim\nENV API_KEY=plaintext_dev_key\nCOPY . /app\nRUN pip install -r requirements.txt\n",
         },
-        final_success_message="Deploy completed after permission repair and timeout retuning.",
+        final_success_message="Pipeline recovered after IAM binding repair and secure secret manager usage.",
         incident_chain=[
             IncidentStep(
                 stage="deploy",
-                ambiguous_error="rollout exceeded timeout while image publish reported denied access",
+                ambiguous_error="artifact push denied for service account during deploy",
                 possible_causes=[
-                    "registry write permission missing",
-                    "network congestion causing push timeout",
+                    "missing artifact registry writer role",
+                    "incorrect active service account",
                 ],
                 family_term_sets=[
-                    ["registry", "permission"],
-                    ["push", "denied"],
-                    ["timeout", "deploy"],
+                    ["artifactregistry", "permission"],
+                    ["service", "account"],
                 ],
-                true_cause="ci service account missing artifactregistry.writer role",
-                hypothesis_terms=["registry", "write", "permission"],
+                true_cause="ci-deployer missing roles/artifactregistry.writer",
+                hypothesis_terms=["artifactregistry", "writer", "permission"],
                 log_variants=[
                     [
-                        "docker push denied: permission denied for repository team/api",
-                        "rollout waiting for image tag that never published",
+                        "ERROR: (gcloud.artifacts.docker.push) PERMISSION_DENIED",
+                        "denied: Permission 'artifactregistry.repositories.uploadArtifacts' denied",
                     ],
                     [
-                        "publish retries exhausted with authz denied events",
-                        "deployment timed out waiting for image availability",
+                        "iam.serviceAccounts.actAs permission denied on service account ci-deployer",
+                        "publish failed while writing to team/secure-api registry",
                     ],
                 ],
+                pattern_buckets=["permission_denied"],
+                relevant_inspections=["view_logs", "inspect_permissions", "inspect_config"],
                 config_clues=[
-                    "deploy.yaml timeout is 900s with aggressive retry policy",
-                    "auth scope uses service account ci-runner",
+                    "deploy.yaml uses service_account=ci-deployer",
+                    "registry repo team/secure-api requires writer on push",
                 ],
-                docker_clues=[
-                    "publish command retries with exponential backoff",
-                ],
+                docker_clues=[],
                 permission_clues=[
-                    "service account ci-runner has artifactregistry.reader",
-                    "missing role artifactregistry.writer",
+                    "iam: ci-deployer currently has artifactregistry.reader only",
                 ],
                 correct_operation="modify_config",
-                correct_fix_terms=["grant", "artifactregistry", "writer"],
-                partial_fix_terms=[["increase", "timeout"], ["20m"]],
-                partial_fix_reveal="Timeout change alone increases wait time but does not fix denied push permissions.",
+                correct_fix_terms=["grant", "artifactregistry", "writer", "ci-deployer"],
+                partial_fix_terms=[],
+                partial_fix_reveal="",
+                red_herring_terms=[
+                    ["grant", "reader"],
+                    ["grant", "viewer"],
+                ],
+                partial_advances=False,
             ),
             IncidentStep(
                 stage="deploy",
-                ambiguous_error="permission resolved but rollout still close to timeout threshold",
+                ambiguous_error="security policy blocked deploy due plaintext secret in Dockerfile",
                 possible_causes=[
-                    "timeout still too low for current rollout profile",
-                    "residual publish retry overhead",
+                    "API_KEY exposed in ENV instruction",
+                    "missing secret manager reference",
                 ],
                 family_term_sets=[
-                    ["timeout", "rollout"],
-                    ["tune", "timeout"],
+                    ["secret", "dockerfile"],
+                    ["api_key", "plaintext"],
                 ],
-                true_cause="timeout needs retuning after auth recovery",
-                hypothesis_terms=["timeout", "rollout", "tune"],
+                true_cause="Dockerfile uses ENV API_KEY plaintext instead of secret manager binding",
+                hypothesis_terms=["secret", "manager", "api_key"],
                 log_variants=[
                     [
-                        "image publish now succeeds, rollout reaches 92% before timeout",
-                        "recommend extending rollout timeout to absorb warm start",
+                        "WARNING: secrets detected in Dockerfile ENV instruction",
+                        "policy gate: plaintext API_KEY is prohibited in deploy artifact",
+                    ],
+                    [
+                        "security scanner blocked image promotion due exposed credential",
+                        "build metadata: ENV API_KEY present in Dockerfile layer history",
                     ],
                 ],
+                pattern_buckets=["secrets_exposed"],
+                relevant_inspections=["view_logs", "inspect_dockerfile", "inspect_config"],
                 config_clues=[
-                    "deploy.yaml rollout_timeout currently 900",
+                    "deploy policy requires secrets sourced from secret manager",
                 ],
-                docker_clues=["Docker publish step healthy after permission fix."],
-                permission_clues=["artifactregistry.writer role now present for ci-runner."],
+                docker_clues=[
+                    "Dockerfile contains: ENV API_KEY=plaintext_dev_key",
+                ],
+                permission_clues=[],
+                correct_operation="modify_config",
+                correct_fix_terms=["secret", "manager", "api_key"],
+                partial_fix_terms=[["remove", "api_key"]],
+                partial_fix_reveal=(
+                    "Plaintext key removed, but deployment still needs a managed secret reference for API_KEY."
+                ),
+                red_herring_terms=[
+                    ["base64", "api_key"],
+                    ["arg", "api_key"],
+                ],
+                partial_advances=False,
+            ),
+        ],
+        variants=[
+            ScenarioVariant(
+                variant_id="security_v1",
+                pipeline_alert_suffix="Security gate activated after IAM retry burst.",
+                extra_log_lines=[
+                    "audit: release blocked by combined IAM and secret policy failures",
+                ],
+                extra_config_clues=[
+                    "release checklist: writer role and secret-manager references are mandatory",
+                ],
+            ),
+            ScenarioVariant(
+                variant_id="security_v2",
+                pipeline_alert_suffix="Credential scanner and deploy auth checks both failing.",
+                extra_log_lines=[
+                    "policy engine: plaintext credentials found in image metadata",
+                ],
+                extra_config_clues=[
+                    "sre note: avoid Dockerfile ENV secrets; use runtime secret injection",
+                ],
+            ),
+        ],
+    ),
+    "hard": ScenarioCard(
+        task_id="hard_multiservice_cascade",
+        task_title="Resolve multi-service registry/deploy cascade with rollback",
+        difficulty="hard",
+        benchmark="meta_hackathon",
+        pipeline_alert="Build and deploy failing in cascade across Service A and Service B.",
+        initial_metrics=[
+            "build.push_failures=3",
+            "deploy.error_rate=0.44",
+            "iam.denied_events=4",
+        ],
+        max_steps=14,
+        config_templates={
+            "deploy.yaml": (
+                "services:\n"
+                "  service-a:\n"
+                "    image_repo: team/service-a\n"
+                "    service_account: ci-service-a\n"
+                "  service-b:\n"
+                "    image: team/service-b:canary\n"
+                "    rollout_timeout: 900\n"
+            ),
+            "iam.txt": "ci-service-a: artifactregistry.reader\nci-service-b: run.admin\n",
+        },
+        final_success_message="Cascade recovered after Service A permission fix, rollback, and timeout tuning.",
+        incident_chain=[
+            IncidentStep(
+                stage="build",
+                ambiguous_error="service-a image push denied, blocking downstream release",
+                possible_causes=[
+                    "service-a registry write permission missing",
+                    "transient registry network issue",
+                ],
+                family_term_sets=[
+                    ["service-a", "registry", "permission"],
+                    ["push", "denied"],
+                ],
+                true_cause="ci-service-a missing artifactregistry.writer role for image publish",
+                hypothesis_terms=["service-a", "artifactregistry", "writer"],
+                log_variants=[
+                    [
+                        "Service A: denied: Permission 'artifactregistry.repositories.uploadArtifacts' denied",
+                        "release orchestrator: Service B deploy blocked until Service A image exists",
+                    ],
+                    [
+                        "Service A publish retries exhausted with authz denied events",
+                        "manifest assembly stopped: missing digest for team/service-a",
+                    ],
+                ],
+                pattern_buckets=["permission_denied", "image_push_failure"],
+                relevant_inspections=["view_logs", "inspect_permissions", "inspect_config"],
+                config_clues=[
+                    "deploy.yaml service-a uses ci-service-a for artifact publish",
+                    "release DAG: service-b depends on service-a image digest",
+                ],
+                docker_clues=[
+                    "Service A publish command fails before manifest publication",
+                ],
+                permission_clues=[
+                    "ci-service-a currently has artifactregistry.reader",
+                    "missing role artifactregistry.writer for ci-service-a",
+                ],
+                correct_operation="modify_config",
+                correct_fix_terms=["grant", "artifactregistry", "writer", "service-a"],
+                partial_fix_terms=[["timeout", "service-b"], ["increase", "rollout", "timeout"]],
+                partial_fix_reveal=(
+                    "Service B tuning helped symptoms, but Service A publish permission still blocks the cascade."
+                ),
+                red_herring_terms=[
+                    ["restart", "cloud", "run"],
+                    ["clear", "deploy", "cache"],
+                ],
+                partial_advances=False,
+            ),
+            IncidentStep(
+                stage="deploy",
+                ambiguous_error="service-b rollout references unavailable image digest",
+                possible_causes=[
+                    "service-b pinned to broken canary image",
+                    "deploy system needs rollback to stable digest",
+                ],
+                family_term_sets=[
+                    ["service-b", "image", "unavailable"],
+                    ["rollback", "stable"],
+                ],
+                true_cause="service-b must rollback to last known-good image before rollout",
+                hypothesis_terms=["rollback", "service-b", "stable"],
+                log_variants=[
+                    [
+                        "Service B deploy: image team/service-b:canary not found in registry",
+                        "release gate suggests rollback to stable revision while new image warms",
+                    ],
+                ],
+                pattern_buckets=["image_unavailable", "rollout_timeout"],
+                relevant_inspections=["view_logs", "inspect_config"],
+                config_clues=[
+                    "deploy.yaml service-b image currently set to team/service-b:canary",
+                ],
+                docker_clues=[],
+                permission_clues=[],
+                correct_operation="modify_config",
+                correct_fix_terms=["rollback", "service-b", "stable"],
+                partial_fix_terms=[["timeout", "20m"], ["increase", "timeout"]],
+                partial_fix_reveal="Timeout tuned, but rollout still targets unavailable canary image.",
+                red_herring_terms=[
+                    ["scale", "service-b", "0"],
+                    ["ignore", "missing", "image"],
+                ],
+                partial_advances=False,
+            ),
+            IncidentStep(
+                stage="deploy",
+                ambiguous_error="rollback succeeded but rollout still times out near completion",
+                possible_causes=[
+                    "timeout budget too low after rollback warm-up",
+                    "insufficient rollout deadline for service-b",
+                ],
+                family_term_sets=[
+                    ["rollout", "timeout"],
+                    ["service-b", "deadline"],
+                ],
+                true_cause="rollout timeout must be increased after rollback stabilization",
+                hypothesis_terms=["timeout", "20m", "service-b"],
+                log_variants=[
+                    [
+                        "Deployment 'service-b' exceeded progress deadline after 900s",
+                        "recommend increasing rollout timeout to 20m for post-rollback warm-up",
+                    ],
+                ],
+                pattern_buckets=["rollout_timeout"],
+                relevant_inspections=["view_logs", "inspect_config"],
+                config_clues=[
+                    "deploy.yaml service-b rollout_timeout currently 900",
+                ],
+                docker_clues=[],
+                permission_clues=[],
                 correct_operation="modify_config",
                 correct_fix_terms=["timeout", "20m"],
                 partial_fix_terms=[],
                 partial_fix_reveal="",
+                red_herring_terms=[
+                    ["set", "timeout", "5m"],
+                    ["keep", "900"],
+                ],
+                partial_advances=False,
             ),
         ],
         variants=[
             ScenarioVariant(
                 variant_id="hard_v1",
-                pipeline_alert_suffix="Deploy retry storm observed in last 15 minutes.",
+                pipeline_alert_suffix="Cross-service release DAG stalled on missing artifacts.",
                 extra_log_lines=[
-                    "authz monitor: repeated denied writes detected before timeout escalation",
+                    "orchestrator: service-a digest missing; service-b rollout remains blocked",
                 ],
                 extra_config_clues=[
-                    "deploy policy: timeout extension allowed only after auth remediation",
+                    "runbook: repair upstream publisher before downstream rollout tuning",
                 ],
             ),
             ScenarioVariant(
                 variant_id="hard_v2",
-                pipeline_alert_suffix="Rollout health gates stalled after publish retries.",
+                pipeline_alert_suffix="Service B stuck in image-unavailable and timeout loop.",
                 extra_log_lines=[
-                    "registry event stream: push attempts queued while insufficient permissions persist",
+                    "release monitor: stale canary reference persists until rollback is applied",
                 ],
                 extra_config_clues=[
-                    "sre note: resolve write permissions before adjusting timeout budget",
+                    "sre note: apply rollback before extending timeout budget",
                 ],
             ),
         ],
@@ -449,4 +637,19 @@ def get_scenario(task_key: str) -> ScenarioCard:
 
 def list_task_keys() -> List[str]:
     """Return deterministic task order for baseline runs."""
-    return ["easy", "medium", "hard"]
+    return ["easy", "medium", "security", "hard"]
+
+
+def sample_logs_for_issue(issue: IncidentStep, variant_selector: int, issue_seed: int) -> List[str]:
+    """Build issue logs with deterministic variant selection and sampled real-world patterns."""
+    if not issue.log_variants:
+        logs: List[str] = []
+    else:
+        choice = variant_selector % len(issue.log_variants)
+        logs = list(issue.log_variants[choice])
+
+    for bucket in issue.pattern_buckets:
+        # issue_seed stabilizes repeated view_logs calls within a single episode.
+        logs.extend(sample_failure_lines(bucket, sample_size=1, issue_seed=issue_seed))
+
+    return logs

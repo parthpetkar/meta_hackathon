@@ -15,7 +15,7 @@ except ImportError:
 
 SUCCESS_SCORE_THRESHOLD = float(os.getenv("SUCCESS_SCORE_THRESHOLD", "0.20"))
 EPISODES_PER_TASK = int(os.getenv("EVAL_EPISODES_PER_TASK", "3"))
-TASK_ORDER = ["easy", "medium", "hard"]
+TASK_ORDER = ["easy", "medium", "security", "hard"]
 
 
 def scripted_action(task_name: str, step: int) -> Tuple[str, str, str]:
@@ -23,11 +23,7 @@ def scripted_action(task_name: str, step: int) -> Tuple[str, str, str]:
         "easy": [
             ("view_logs", "build", ""),
             ("inspect_config", "build", ""),
-            ("set_hypothesis", "", "merge conflict from stale feature branch"),
             ("modify_config", "build", "sync branch and resolve merge conflict"),
-            ("rerun_pipeline", "", ""),
-            ("set_hypothesis", "", "contract tests failing due to stale branch baseline"),
-            ("modify_config", "test", "rebase feature branch to refresh contract baseline"),
             ("rerun_pipeline", "", ""),
             ("finalize", "", ""),
         ],
@@ -43,14 +39,27 @@ def scripted_action(task_name: str, step: int) -> Tuple[str, str, str]:
             ("rerun_pipeline", "", ""),
             ("finalize", "", ""),
         ],
+        "security": [
+            ("view_logs", "deploy", ""),
+            ("inspect_permissions", "deploy", ""),
+            ("modify_config", "deploy", "grant artifactregistry writer to ci-deployer"),
+            ("rerun_pipeline", "", ""),
+            ("view_logs", "deploy", ""),
+            ("inspect_dockerfile", "build", ""),
+            ("modify_config", "deploy", "replace Dockerfile API_KEY with secret manager reference"),
+            ("rerun_pipeline", "", ""),
+            ("finalize", "", ""),
+        ],
         "hard": [
+            ("view_logs", "build", ""),
+            ("inspect_permissions", "build", ""),
+            ("modify_config", "build", "grant artifactregistry writer to service-a publisher"),
+            ("rerun_pipeline", "", ""),
             ("view_logs", "deploy", ""),
             ("inspect_config", "deploy", ""),
-            ("inspect_permissions", "", ""),
-            ("set_hypothesis", "", "registry write permission missing for ci-runner"),
-            ("modify_config", "deploy", "grant artifactregistry writer to ci-runner"),
+            ("modify_config", "deploy", "rollback service-b to stable image revision"),
             ("rerun_pipeline", "", ""),
-            ("set_hypothesis", "", "rollout timeout requires tuning after auth recovery"),
+            ("set_hypothesis", "", "service-b rollout timeout requires tuning after rollback"),
             ("modify_config", "deploy", "increase rollout timeout to 20m"),
             ("rerun_pipeline", "", ""),
             ("finalize", "", ""),

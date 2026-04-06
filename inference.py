@@ -32,7 +32,7 @@ MAX_STEPS = 12
 TEMPERATURE = 0.2
 MAX_TOKENS = 180
 SUCCESS_SCORE_THRESHOLD = float(os.getenv("SUCCESS_SCORE_THRESHOLD", "0.20"))
-TASK_ORDER = ["easy", "medium", "hard"]
+TASK_ORDER = ["easy", "medium", "security", "hard"]
 RESCUE_ON_NEGATIVE_REWARD = os.getenv("RESCUE_ON_NEGATIVE_REWARD", "true").lower() == "true"
 VALID_OPERATIONS = {
     "view_logs",
@@ -167,7 +167,7 @@ def normalize_model_action(
         if re.search(r"\b(rebase|sync|merge conflict|resolve conflict|branch)\b", lowered):
             tgt = "build" if step <= 5 else "test"
 
-    if op == "finalize" and step < 6:
+    if op == "finalize" and step < 4:
         op = "rerun_pipeline"
         tgt = ""
         val = ""
@@ -234,11 +234,7 @@ def fallback_action(task_name: str, step: int) -> Tuple[str, str, str]:
         "easy": [
             ("view_logs", "build", ""),
             ("inspect_config", "build", ""),
-            ("set_hypothesis", "", "merge conflict from stale feature branch"),
             ("modify_config", "build", "sync branch and resolve merge conflict"),
-            ("rerun_pipeline", "", ""),
-            ("set_hypothesis", "", "contract tests failing due to stale branch baseline"),
-            ("modify_config", "test", "rebase feature branch to refresh contract baseline"),
             ("rerun_pipeline", "", ""),
             ("finalize", "", ""),
         ],
@@ -254,14 +250,27 @@ def fallback_action(task_name: str, step: int) -> Tuple[str, str, str]:
             ("rerun_pipeline", "", ""),
             ("finalize", "", ""),
         ],
+        "security": [
+            ("view_logs", "deploy", ""),
+            ("inspect_permissions", "deploy", ""),
+            ("modify_config", "deploy", "grant artifactregistry writer to ci-deployer"),
+            ("rerun_pipeline", "", ""),
+            ("view_logs", "deploy", ""),
+            ("inspect_dockerfile", "build", ""),
+            ("modify_config", "deploy", "replace Dockerfile API_KEY with secret manager reference"),
+            ("rerun_pipeline", "", ""),
+            ("finalize", "", ""),
+        ],
         "hard": [
+            ("view_logs", "build", ""),
+            ("inspect_permissions", "build", ""),
+            ("modify_config", "build", "grant artifactregistry writer to service-a publisher"),
+            ("rerun_pipeline", "", ""),
             ("view_logs", "deploy", ""),
             ("inspect_config", "deploy", ""),
-            ("inspect_permissions", "", ""),
-            ("set_hypothesis", "", "registry write permission missing for ci-runner"),
-            ("modify_config", "deploy", "grant artifactregistry writer to ci-runner"),
+            ("modify_config", "deploy", "rollback service-b to stable image revision"),
             ("rerun_pipeline", "", ""),
-            ("set_hypothesis", "", "rollout timeout requires tuning after auth recovery"),
+            ("set_hypothesis", "", "service-b rollout timeout requires tuning after rollback"),
             ("modify_config", "deploy", "increase rollout timeout to 20m"),
             ("rerun_pipeline", "", ""),
             ("finalize", "", ""),
@@ -274,7 +283,6 @@ def fallback_action(task_name: str, step: int) -> Tuple[str, str, str]:
     # After the base sequence, retry canonical diagnose/fix/verify loop.
     tail = {
         "easy": [
-            ("set_hypothesis", "", "stale branch merge issue remains"),
             ("modify_config", "build", "sync branch and resolve merge conflict"),
             ("rerun_pipeline", "", ""),
             ("finalize", "", ""),
@@ -285,9 +293,15 @@ def fallback_action(task_name: str, step: int) -> Tuple[str, str, str]:
             ("rerun_pipeline", "", ""),
             ("finalize", "", ""),
         ],
+        "security": [
+            ("set_hypothesis", "", "iam role or secret manager mapping still incomplete"),
+            ("modify_config", "deploy", "grant writer and use secret manager API_KEY"),
+            ("rerun_pipeline", "", ""),
+            ("finalize", "", ""),
+        ],
         "hard": [
-            ("set_hypothesis", "", "permission or timeout tuning still incomplete"),
-            ("modify_config", "deploy", "grant artifactregistry writer and tune timeout 20m"),
+            ("set_hypothesis", "", "service-a permission, rollback, or timeout tuning still incomplete"),
+            ("modify_config", "deploy", "grant service-a writer then rollback service-b and set timeout 20m"),
             ("rerun_pipeline", "", ""),
             ("finalize", "", ""),
         ],

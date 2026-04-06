@@ -14,9 +14,13 @@ tasks:
     key: medium
     title: Repair docker build dependency failure
     difficulty: medium
-  - task_id: hard_permission_timeout_chain
+  - task_id: security_secrets_iam_misconfig
+    key: security
+    title: Fix IAM writer role and exposed CI secret
+    difficulty: security
+  - task_id: hard_multiservice_cascade
     key: hard
-    title: Fix deploy permission and timeout chain
+    title: Resolve multi-service registry and deploy cascade
     difficulty: hard
 graders:
   module: server.graders

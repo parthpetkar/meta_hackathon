@@ -15,209 +15,164 @@ tags:
 
 ## Meta Hackathon CI/CD Repair Environment
 
-Deterministic OpenEnv environment for CI/CD pipeline failure diagnosis and repair.
+## Environment description
 
-The agent investigates evidence, applies staged remediations, reruns pipeline stages, and finalizes only after full recovery.
+This environment simulates a CI/CD debugging and repair workflow for reinforcement learning agents.
+At every episode, an agent must investigate pipeline evidence, infer the root cause, apply safe fixes,
+rerun the pipeline, and finalize only when the incident is truly resolved.
 
-The benchmark now includes deterministic per-episode scenario variants to improve robustness and reduce memorization.
+Why this matters for RL:
 
-## Why this benchmark is useful
+- The task requires sequential reasoning under uncertainty (logs are noisy and partially ambiguous).
+- The action space mixes diagnosis and intervention, creating realistic credit-assignment challenges.
+- Rewards encourage operationally safe behavior, not just short-term score gaming.
+- Failure logs are sampled from a real-world inspired pattern library so episodes are not identical.
 
-This models a real DevOps workflow with measurable outcomes:
+OpenEnv API compliance:
 
-- investigation quality
-- diagnosis correctness
-- fix correctness
-- verification discipline
-- safe behavior under pressure
+- `reset()` returns the initial observation.
+- `step(action)` returns next observation, reward, and done flag.
+- `state()` returns `episode_id` and `step_count`.
 
-## OpenEnv Interface
+## Action space
 
-The environment implements:
+All actions use the schema: `operation | target | value`
 
-- `reset()` -> initial observation
-- `step(action)` -> next observation with `reward` and `done`
-- `state()` -> `episode_id` and `step_count`
+| Operation | Target (arg) | Value (arg) | Description |
+| --- | --- | --- | --- |
+| `view_logs` | optional stage (`build/test/deploy`) | optional | Read pipeline/runtime logs for the active failure context. |
+| `inspect_config` | optional stage/component | optional | Inspect CI/deploy config clues and surfaced config files. |
+| `inspect_dockerfile` | optional component | optional | Inspect Dockerfile/security build clues. |
+| `inspect_permissions` | optional component | optional | Inspect IAM/service-account permission clues. |
+| `set_hypothesis` | must be empty | hypothesis text | Declare current root-cause hypothesis. |
+| `modify_config` | optional stage/component | fix text | Apply config/deploy/rollback/security fix candidate. |
+| `add_dependency` | optional stage/component | dependency fix text | Apply dependency pin/compatibility fix. |
+| `rerun_pipeline` | empty | empty | Re-run pipeline after fix attempts to validate progression. |
+| `finalize` | empty | empty | End episode and request final scoring. |
 
-## Action Space
+## Observation space
 
-`MetaHackathonAction`
+At each step the agent receives structured state including:
 
-- `operation`: canonical operations
-  - `view_logs`
-  - `inspect_config`
-  - `inspect_dockerfile`
-  - `modify_config`
-  - `add_dependency`
-  - `rerun_pipeline`
-  - `finalize`
-  - `inspect_permissions`
-  - `set_hypothesis`
-- `target`: optional stage/system target
-- `value`: optional hypothesis/fix payload
+- Task metadata: `task_id`, `task_title`, `difficulty`.
+- Pipeline status: `pipeline_status`, `current_stage`, `pipeline_stages`.
+- Evidence: `visible_alerts`, `visible_logs`, `logs_by_stage`, `visible_metrics`, `surfaced_errors`.
+- Config snapshots: `config_files`.
+- Reasoning trace: `findings`, `action_history`, `current_hypothesis`, `attempted_fix`, `hypothesis_history`.
+- Progress indicators: `active_issue_index`, `revealed_issue_count`, `incident_resolved`.
+- Safety/cost signals: `pipeline_health`, `recovery_cost`, `redundant_actions`, `destructive_actions`.
+- Episode outputs: `reward`, `done`, `final_score` (terminal), and `metadata`.
 
-Legacy operations (`inspect_*`, `apply_fix`, `verify_fix`) remain accepted via deterministic alias mapping for backward compatibility.
+## Reward structure
 
-## Observation Space
+Per-step reward schema:
 
-`MetaHackathonObservation`
+| Action type | Reward |
+| --- | --- |
+| `set_hypothesis` (correct, first try) | `+0.22` |
+| `set_hypothesis` (correct, retry) | `+0.10` |
+| `set_hypothesis` (wrong) | `-0.10` |
+| `inspect_*` (relevant stage) | `+0.12` |
+| `inspect_*` (irrelevant stage) | `-0.05` |
+| `modify_config` (correct fix) | `+0.35` |
+| `modify_config` (wrong fix) | `-0.20` |
+| `add_dependency` (correct) | `+0.25` |
+| `add_dependency` (wrong/redundant) | `-0.18` |
+| `rerun_pipeline` (after valid fix) | `+0.18` |
+| `rerun_pipeline` (premature) | `+0.05` |
+| `finalize` (correct) | `+0.25` |
+| `finalize` (incorrect state) | `-0.30` |
 
-- `task_id`, `task_title`, `difficulty`
-- `pipeline_status`, `current_stage`, `pipeline_stages`
-- `available_stages`, `available_tools`
-- `visible_alerts`, `visible_logs`, `visible_metrics`, `logs_by_stage`
-- `config_files`, `surfaced_errors`
-- `findings`, `action_history`, `previous_actions`
-- `current_hypothesis`, `attempted_fix`
-- `hypothesis_history`, `active_issue_index`, `revealed_issue_count`
-- `pipeline_health`, `recovery_cost`, `redundant_actions`, `destructive_actions`
-- `incident_resolved`
-- `final_score` (0.0 to 1.0 at terminal step)
-- `reward`, `done`, `metadata`
+Task-specific reward extensions:
 
-## Tasks (easy -> medium -> hard)
+- Hard task red herring action: additional `-0.15` when a plausible but incorrect shortcut is attempted.
+- Security task: finalizing after fixing exactly one of two required issues gives partial credit; finalizing after both issues are fixed gives `+0.35`.
 
-1. `easy_merge_conflict`
+Terminal score is clipped to `[0.0, 1.0]` and difficulty-calibrated to preserve the expected gradient:
 
-- Iteration 1: ambiguous merge failure in build
-- Partial fix can reveal iteration 2 test contract drift
-- Final state: branch synced/rebased and tests stabilized
+- Easy target: about `0.55` to `0.65`
+- Medium target: about `0.40` to `0.50`
+- Security target: between medium and hard
+- Hard target: about `0.25` to `0.38`
 
-1. `medium_docker_dep_failure`
+## Task descriptions
 
-- Iteration 1: ambiguous dependency conflict (`requests`/`urllib3`) at build
-- Partial fix can reveal iteration 2 Docker install-order instability
-- Final state: compatible dependency pin + corrected Docker order
+`easy` - Single-file merge conflict (5-step resolution target)
 
-1. `hard_permission_timeout_chain`
+- One root cause: unresolved merge markers in `services/api/routes.py`.
+- One inspect pass reveals the issue.
+- One config fix resolves it, then rerun, then finalize.
 
-- Iteration 1: deploy failure mixing permission denied + timeout symptoms
-- Partial fix can reveal iteration 2 timeout tuning after auth recovery
-- Final state: permission repair + timeout retuning
+`medium` - Dependency + Docker ordering chain
 
-## Reward and Grading
+- Build fails due to `requests`/`urllib3` incompatibility.
+- After dependency remediation, Docker install-order instability may remain.
+- Agent must perform dependency fix and Docker order correction.
 
-Per-step reward (`step_reward`) gives shaped feedback:
+`security` - IAM + secret exposure misconfiguration
 
-- positive for novel evidence gathering
-- positive for correct or partial intermediate fixes
-- positive for meaningful rerun progression
-- penalties for redundant or destructive actions
-- penalties for premature finalization
+- Deploy fails because service account lacks `roles/artifactregistry.writer`.
+- Security gate also fails because `API_KEY` is exposed in Dockerfile `ENV`.
+- Agent must inspect deploy logs and Dockerfile, then fix both IAM and secret handling.
 
-Terminal score (`grade_episode`) is deterministic in [0.0, 1.0] with correctness-first weighting:
+`hard` - Multi-service cascade with rollback
 
-- correctness (issue resolution + final recovered state)
-- reasoning quality (inspection coverage + hypothesis quality)
-- efficiency (step economy and redundancy control)
-- health/destructive penalties for harmful trajectories
+- Service A (build/publish) fails first: artifact registry permission denied on image push.
+- Service B deploy then fails due image unavailability and timeout pressure.
+- Correct sequence is: fix Service A permissions -> rollback Service B to stable revision -> tune rollout timeout.
+- Includes a red-herring shortcut action that is penalized.
 
-Additional anti-gaming behavior:
+## Setup instructions
 
-- penalties for blind fixes before evidence collection
-- penalties for premature `finalize` when unresolved stages remain
-- family-level partial credit when hypothesis matches failure family but not exact cause
+### Run locally with Docker
 
-## Quick Start
+1. Build image:
 
-### 1) Install dependencies
+```bash
+docker build -t meta-hackathon-env .
+```
+
+1. Start API server:
+
+```bash
+docker run --rm -p 8000:8000 meta-hackathon-env
+```
+
+1. Validate OpenEnv endpoints:
+
+- `POST /reset`
+- `POST /step`
+- `GET /state`
+
+### Run locally without Docker
 
 ```bash
 uv sync
-```
-
-### 2) Run local server
-
-```bash
 uv run uvicorn server.app:app --host 0.0.0.0 --port 8000
 ```
 
-### 3) Run baseline inference
+## Inference
 
-```bash
-uv run python inference.py
-```
+`inference.py` stays at repo root and prints strict structured logs:
 
-### 4) Run deterministic evaluation suite
+- `[START] task=... env=... model=...`
+- `[STEP] step=... action=operation|target|value reward=... done=... error=...`
+- `[END] success=... steps=... score=... resolved=... rewards=...`
 
-```bash
-uv run evaluate
-```
-
-Optional env vars:
-
-- `EVAL_EPISODES_PER_TASK` (default `3`)
-- `SUCCESS_SCORE_THRESHOLD` (default `0.20`)
-
-## Baseline Results
-
-`inference.py` evaluates one pass of easy -> medium -> hard using an LLM policy with deterministic rescue controls.
-
-Reproduce with:
-
-```bash
-uv run python inference.py
-```
-
-Notes:
-
-- The environment is deterministic, so policy-level scores are stable across runs.
-- Inference stdout is restricted to structured `[START]`, `[STEP]`, and `[END]` lines.
-- Variant IDs are exposed in observation metadata (`metadata.variant_id`) for replayability.
-
-## Environment Variables
-
-Use `.env.example` as template.
-
-Required for model inference:
+Set model/client environment variables:
 
 - `API_BASE_URL`
 - `MODEL_NAME`
 - `HF_TOKEN` (or `OPENAI_API_KEY`)
 
-Useful for local testing:
+Run inference:
 
-- `LOCAL_IMAGE_NAME` / `IMAGE_NAME`
-- `ENV_BASE_URL`
-- `META_HACKATHON_BENCHMARK`
-- `META_HACKATHON_TASK_MODE` (`cycle`, `easy`, `medium`, `hard`)
+```bash
+uv run python inference.py
+```
 
-## UI Testing Inputs
+Run deterministic evaluation:
 
-Use the copy-paste test payloads in:
-
-- `README_UI_TESTING.md`
-
-That file includes:
-
-- golden paths for easy/medium/hard
-- negative tests (unsupported operations, destructive fixes)
-- expected outcomes and smoke checklist
-
-## Inference Log Contract
-
-`inference.py` prints:
-
-- `[START] task=<task> env=<benchmark> model=<model>`
-- `[STEP] step=<n> action=<operation|target|value> reward=<0.00> done=<true|false> error=<msg|null>`
-- `[END] success=<true|false> steps=<n> score=<0.000> resolved=<true|false> rewards=<r1,r2,...,rn>`
-
-`evaluate` prints:
-
-- `[EVAL]` run configuration
-- `[EP]` per-episode task/variant/score/resolution lines
-- `[SUMMARY]` resolved rate, success rate, avg score, avg steps by task
-- `[TOP_FAILURE_REASONS]` for unresolved episodes
-
-## Project Files
-
-- `models.py`
-- `client.py`
-- `inference.py`
-- `eval_runner.py`
-- `openenv.yaml`
-- `server/app.py`
-- `server/meta_hackathon_environment.py`
-- `server/scenarios.py`
-- `server/graders.py`
-- `README_UI_TESTING.md`
+```bash
+uv run evaluate
+```

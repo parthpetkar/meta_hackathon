@@ -14,6 +14,11 @@ from openenv.core.env_server.types import State
 
 try:
     from .graders import action_key, grade_episode, matches_terms, step_reward
+    from .graders import (
+        classify_security_fix,
+        easy_finalize_ready,
+        hard_modify_reward_for_issue,
+    )
     from .scenarios import (
         CANONICAL_OPERATIONS,
         DESTRUCTIVE_FIXES,
@@ -26,10 +31,16 @@ try:
         canonical_operation,
         get_scenario,
         list_task_keys,
+        sample_logs_for_issue,
     )
     from ..models import MetaHackathonAction, MetaHackathonObservation
 except ImportError:
     from server.graders import action_key, grade_episode, matches_terms, step_reward
+    from server.graders import (
+        classify_security_fix,
+        easy_finalize_ready,
+        hard_modify_reward_for_issue,
+    )
     from server.scenarios import (
         CANONICAL_OPERATIONS,
         DESTRUCTIVE_FIXES,
@@ -42,12 +53,13 @@ except ImportError:
         canonical_operation,
         get_scenario,
         list_task_keys,
+        sample_logs_for_issue,
     )
     from models import MetaHackathonAction, MetaHackathonObservation
 
 
 class MetaHackathonEnvironment(Environment):
-    """Deterministic CI/CD repair simulator with iterative staged debugging."""
+    """CI/CD repair simulator with staged debugging and pattern-grounded variability."""
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
 
@@ -92,6 +104,7 @@ class MetaHackathonEnvironment(Environment):
         self._hypothesis_hit_issues: set[int] = set()
         self._family_hit_issues: set[int] = set()
         self._fix_hit_issues: set[int] = set()
+        self._hypothesis_attempts_by_issue: dict[int, int] = {}
 
         self._incident_resolved = False
         self._pipeline_status = "failed"
@@ -106,18 +119,21 @@ class MetaHackathonEnvironment(Environment):
         self._variant_selector = 0
         self._scenario_variant: ScenarioVariant | None = None
         self._config_files: dict[str, str] = {}
+        self._episode_seed = 0
+        self._sampled_issue_logs: dict[int, list[str]] = {}
+
+        self._easy_build_passing = False
+        self._security_iam_fixed = False
+        self._security_secret_fixed = False
 
     def _current_issue(self) -> IncidentStep:
         index = min(self._current_issue_index, len(self._scenario.incident_chain) - 1)
         return self._scenario.incident_chain[index]
 
     def _compute_required_inspections(self) -> set[str]:
-        required = {"view_logs", "inspect_config"}
+        required: set[str] = {"view_logs"}
         for issue in self._scenario.incident_chain:
-            if any("docker" in clue.lower() for clue in issue.docker_clues):
-                required.add("inspect_dockerfile")
-            if any("role" in clue.lower() or "permission" in clue.lower() for clue in issue.permission_clues):
-                required.add("inspect_permissions")
+            required.update(issue.relevant_inspections)
         return required
 
     def _base_observation(self, *, reward: float, done: bool, metadata: dict | None = None) -> MetaHackathonObservation:
@@ -184,15 +200,22 @@ class MetaHackathonEnvironment(Environment):
                 self._pipeline_stages[stage] = "passed"
             return
 
+        if self._scenario.difficulty == "easy" and self._easy_build_passing:
+            self._pipeline_status = "failed"
+            self._pipeline_stages["build"] = "passed"
+            self._pipeline_stages["test"] = "blocked"
+            self._pipeline_stages["deploy"] = "blocked"
+            return
+
         issue = self._current_issue()
         self._pipeline_status = "failed"
         self._set_stage_failure(issue.stage)
 
-    def _variant_logs_for_issue(self, issue: IncidentStep) -> list[str]:
-        if not issue.log_variants:
-            return []
-        choice = self._variant_selector % len(issue.log_variants)
-        return issue.log_variants[choice]
+    def _variant_logs_for_issue(self, issue_index: int, issue: IncidentStep) -> list[str]:
+        if issue_index not in self._sampled_issue_logs:
+            issue_seed = self._episode_seed + issue_index
+            self._sampled_issue_logs[issue_index] = sample_logs_for_issue(issue, self._variant_selector, issue_seed)
+        return self._sampled_issue_logs[issue_index]
 
     def _current_variant(self) -> ScenarioVariant:
         if self._scenario_variant is None:
@@ -221,10 +244,20 @@ class MetaHackathonEnvironment(Environment):
 
         return "wrong"
 
+    def _is_red_herring(self, issue: IncidentStep, value: str) -> bool:
+        for terms in issue.red_herring_terms:
+            if matches_terms(value, terms):
+                return True
+        return False
+
+    def _is_inspection_relevant(self, issue: IncidentStep, operation: str) -> bool:
+        return operation in set(issue.relevant_inspections)
+
     def _handle_view_logs(self) -> bool:
+        issue_index = self._current_issue_index
         issue = self._current_issue()
         revealed = False
-        for line in self._variant_logs_for_issue(issue):
+        for line in self._variant_logs_for_issue(issue_index, issue):
             revealed = self._append_unique(self._visible_logs, line) or revealed
             revealed = self._append_unique(self._logs_by_stage[issue.stage], line) or revealed
             if revealed:
@@ -275,7 +308,9 @@ class MetaHackathonEnvironment(Environment):
         return revealed
 
     def reset(self) -> MetaHackathonObservation:
-        self._state = State(episode_id=str(uuid4()), step_count=0)
+        episode_uuid = uuid4()
+        self._state = State(episode_id=str(episode_uuid), step_count=0)
+        self._episode_seed = episode_uuid.int & 0xFFFFFFFF
 
         if self._task_key == "cycle":
             selected_key = self._task_order[self._task_cursor % len(self._task_order)]
@@ -307,6 +342,7 @@ class MetaHackathonEnvironment(Environment):
         self._hypothesis_hit_issues = set()
         self._family_hit_issues = set()
         self._fix_hit_issues = set()
+        self._hypothesis_attempts_by_issue = {}
 
         self._incident_resolved = False
         self._pipeline_status = "failed"
@@ -324,6 +360,11 @@ class MetaHackathonEnvironment(Environment):
         self._variant_selector = variant_index
         self._scenario_variant = self._scenario.variants[variant_index]
         self._config_files = {}
+        self._sampled_issue_logs = {}
+
+        self._easy_build_passing = False
+        self._security_iam_fixed = False
+        self._security_secret_fixed = False
 
         self._set_stage_progress_after_advance()
         self._handle_view_logs()
@@ -360,9 +401,6 @@ class MetaHackathonEnvironment(Environment):
             )
 
         was_done_before_step = self._incident_resolved
-        stage_before = self._current_issue().stage if not self._incident_resolved else STAGE_ORDER[-1]
-        issue_before = self._current_issue_index
-
         history_entry = {"operation": operation, "target": target, "value": value}
         self._history.append(history_entry)
         key = action_key(history_entry)
@@ -370,46 +408,64 @@ class MetaHackathonEnvironment(Environment):
         if was_redundant:
             self._redundant_actions += 1
 
-        revealed_new_evidence = False
-        hypothesis_correct_for_issue = False
+        inspection_relevant = False
+        hypothesis_correct_first_try = False
+        hypothesis_correct_retry = False
         fix_correct_for_issue = False
         fix_partial_for_issue = False
+        fix_wrong_for_issue = False
         is_destructive_fix = False
-        finalized_success = False
-        finalized_failure = False
-        blind_fix_attempt = False
-        premature_finalize = False
+        red_herring_fix = False
+        rerun_after_valid_fix = False
+        finalize_correct = False
+        finalize_partial = False
+        finalize_incorrect = False
+        modify_reward_override: float | None = None
+        finalize_reward_override: float | None = None
 
         issue = self._current_issue()
 
         if operation == "view_logs":
-            revealed_new_evidence = self._handle_view_logs()
+            inspection_relevant = self._is_inspection_relevant(issue, operation)
+            self._handle_view_logs()
             self._used_inspections.add(operation)
 
         elif operation == "inspect_config":
-            revealed_new_evidence = self._handle_inspect_config()
+            inspection_relevant = self._is_inspection_relevant(issue, operation)
+            self._handle_inspect_config()
             self._used_inspections.add(operation)
 
         elif operation == "inspect_dockerfile":
-            revealed_new_evidence = self._handle_inspect_dockerfile()
+            inspection_relevant = self._is_inspection_relevant(issue, operation)
+            self._handle_inspect_dockerfile()
             self._used_inspections.add(operation)
 
         elif operation == "inspect_permissions":
-            revealed_new_evidence = self._handle_inspect_permissions()
+            inspection_relevant = self._is_inspection_relevant(issue, operation)
+            self._handle_inspect_permissions()
             self._used_inspections.add(operation)
 
         elif operation == "set_hypothesis":
             self._current_hypothesis = value
             self._hypothesis_history.append(value)
-            hypothesis_correct_for_issue = matches_terms(value, issue.hypothesis_terms)
-            if hypothesis_correct_for_issue and self._current_issue_index not in self._hypothesis_hit_issues:
+            prior_attempts = self._hypothesis_attempts_by_issue.get(self._current_issue_index, 0)
+            self._hypothesis_attempts_by_issue[self._current_issue_index] = prior_attempts + 1
+
+            hypothesis_correct = matches_terms(value, issue.hypothesis_terms)
+            if hypothesis_correct:
+                if prior_attempts == 0:
+                    hypothesis_correct_first_try = True
+                else:
+                    hypothesis_correct_retry = True
+
+            if hypothesis_correct and self._current_issue_index not in self._hypothesis_hit_issues:
                 self._hypothesis_hits += 1
                 self._hypothesis_hit_issues.add(self._current_issue_index)
                 self._append_unique(self._findings, "Hypothesis aligns with current failure evidence.")
-            elif not hypothesis_correct_for_issue:
+            elif not hypothesis_correct:
                 self._append_unique(self._findings, "Hypothesis does not explain all current clues yet.")
 
-            if not hypothesis_correct_for_issue and self._current_issue_index not in self._family_hit_issues:
+            if not hypothesis_correct and self._current_issue_index not in self._family_hit_issues:
                 family_hit = any(matches_terms(value, term_set) for term_set in issue.family_term_sets)
                 if family_hit:
                     self._family_hits += 1
@@ -419,36 +475,87 @@ class MetaHackathonEnvironment(Environment):
         elif operation in {"modify_config", "add_dependency"}:
             self._attempted_fix = value
             if not self._used_inspections:
-                blind_fix_attempt = True
                 self._append_unique(self._findings, "Fix attempted before inspection evidence collection.")
-            fix_assessment = self._assess_fix(issue, operation, value)
-            if fix_assessment == "destructive":
-                is_destructive_fix = True
-                self._pending_fix_outcome = "destructive"
-                self._destructive_actions += 1
-                self._pipeline_health = max(0.0, self._pipeline_health - 0.20)
-                self._recovery_cost += 4
-                self._append_unique(self._findings, "Unsafe fix worsened system stability and increased recovery cost.")
-            elif fix_assessment == "correct":
-                fix_correct_for_issue = True
-                self._pending_fix_outcome = "correct"
-                self._append_unique(self._findings, "Fix candidate accepted; rerun pipeline to validate progression.")
-            elif fix_assessment == "partial":
-                fix_partial_for_issue = True
-                self._pending_fix_outcome = "partial"
-                self._pipeline_health = max(0.0, self._pipeline_health - 0.04)
-                self._recovery_cost += 1
-                if issue.partial_fix_reveal:
-                    self._append_unique(self._findings, issue.partial_fix_reveal)
+
+            if self._scenario.difficulty == "hard" and operation == "modify_config":
+                red_herring_fix = False
+                hard_assessment, hard_reward = hard_modify_reward_for_issue(self._current_issue_index)
+                modify_reward_override = hard_reward
+                if hard_assessment == "correct":
+                    fix_correct_for_issue = True
+                    self._pending_fix_outcome = "correct"
+                    self._append_unique(self._findings, "Hard-task state transition fix candidate accepted.")
+                else:
+                    fix_wrong_for_issue = True
+                    self._pending_fix_outcome = "wrong"
+                    self._wrong_fixes += 1
+                    self._append_unique(self._findings, "Fix attempt did not resolve the active failure.")
+
+            elif self._scenario.difficulty == "security" and operation == "modify_config":
+                red_herring_fix = False
+                iam_fix, secret_fix = classify_security_fix(value)
+                self._security_iam_fixed = self._security_iam_fixed or iam_fix
+                self._security_secret_fixed = self._security_secret_fixed or secret_fix
+                if iam_fix or secret_fix:
+                    fix_correct_for_issue = True
+                    modify_reward_override = 0.35
+                    self._pending_fix_outcome = "correct"
+                    self._append_unique(self._findings, "Security remediation accepted by substring policy rules.")
+                else:
+                    fix_wrong_for_issue = True
+                    self._pending_fix_outcome = "wrong"
+                    self._wrong_fixes += 1
+                    self._pipeline_health = max(0.0, self._pipeline_health - 0.10)
+                    self._recovery_cost += 2
+                    self._append_unique(self._findings, "Fix attempt did not resolve the active failure.")
+
             else:
-                self._pending_fix_outcome = "wrong"
-                self._wrong_fixes += 1
-                self._pipeline_health = max(0.0, self._pipeline_health - 0.10)
-                self._recovery_cost += 2
-                self._append_unique(self._findings, "Fix attempt did not resolve the active failure.")
+                red_herring_fix = self._is_red_herring(issue, value)
+                fix_assessment = self._assess_fix(issue, operation, value)
+                if fix_assessment == "destructive":
+                    is_destructive_fix = True
+                    self._pending_fix_outcome = "destructive"
+                    self._destructive_actions += 1
+                    self._pipeline_health = max(0.0, self._pipeline_health - 0.20)
+                    self._recovery_cost += 4
+                    self._append_unique(self._findings, "Unsafe fix worsened system stability and increased recovery cost.")
+                elif fix_assessment == "correct":
+                    fix_correct_for_issue = True
+                    self._pending_fix_outcome = "correct"
+                    self._append_unique(self._findings, "Fix candidate accepted; rerun pipeline to validate progression.")
+                elif fix_assessment == "partial":
+                    fix_partial_for_issue = True
+                    self._pending_fix_outcome = "partial"
+                    self._pipeline_health = max(0.0, self._pipeline_health - 0.04)
+                    self._recovery_cost += 1
+                    if issue.partial_fix_reveal:
+                        self._append_unique(self._findings, issue.partial_fix_reveal)
+                else:
+                    fix_wrong_for_issue = True
+                    self._pending_fix_outcome = "wrong"
+                    self._wrong_fixes += 1
+                    self._pipeline_health = max(0.0, self._pipeline_health - 0.10)
+                    self._recovery_cost += 2
+                    self._append_unique(self._findings, "Fix attempt did not resolve the active failure.")
+
+            if red_herring_fix:
+                self._append_unique(self._findings, "Action looked plausible but is a red herring for this incident.")
 
         elif operation == "rerun_pipeline":
             self._recovery_cost += 1
+            rerun_after_valid_fix = self._pending_fix_outcome in {"correct", "partial"}
+
+            if self._scenario.difficulty == "easy":
+                has_hypothesis = any(item.get("operation") == "set_hypothesis" for item in self._history)
+                has_build_modify = any(
+                    item.get("operation") == "modify_config" and (item.get("target") or "").strip().lower() == "build"
+                    for item in self._history
+                )
+                if has_hypothesis and has_build_modify:
+                    self._easy_build_passing = True
+                    rerun_after_valid_fix = True
+                    self._append_unique(self._findings, "Build stage now passing after rerun validation.")
+
             if self._pending_fix_outcome == "correct":
                 if self._current_issue_index not in self._fix_hit_issues:
                     self._fix_hits += 1
@@ -462,7 +569,7 @@ class MetaHackathonEnvironment(Environment):
                     self._append_unique(self._findings, "Partial recovery revealed another downstream issue.")
                 self._pending_fix_outcome = "none"
             elif self._pending_fix_outcome == "partial":
-                if self._current_issue_index + 1 < len(self._scenario.incident_chain):
+                if issue.partial_advances and self._current_issue_index + 1 < len(self._scenario.incident_chain):
                     self._current_issue_index += 1
                     self._append_unique(self._surface_errors, self._current_issue().ambiguous_error)
                     self._append_unique(self._findings, "Partial fix exposed a new failure mode.")
@@ -479,35 +586,58 @@ class MetaHackathonEnvironment(Environment):
                 self._append_unique(self._findings, "Rerun without remediation did not improve pipeline health.")
 
         elif operation == "finalize":
-            if self._solved_issues < len(self._scenario.incident_chain):
-                premature_finalize = True
-            if self._incident_resolved:
-                finalized_success = True
+            if self._scenario.difficulty == "easy":
+                if easy_finalize_ready(self._history, self._pipeline_stages):
+                    self._incident_resolved = True
+                    finalize_correct = True
+                    self._append_unique(self._findings, self._scenario.final_success_message)
+                else:
+                    finalize_incorrect = True
+                    self._append_unique(self._findings, "Finalization rejected: unresolved stages remain.")
+
+            elif self._scenario.difficulty == "security":
+                both_fixed = self._security_iam_fixed and self._security_secret_fixed
+                one_fixed = self._security_iam_fixed or self._security_secret_fixed
+                if both_fixed:
+                    self._incident_resolved = True
+                    finalize_correct = True
+                    self._append_unique(self._findings, self._scenario.final_success_message)
+                elif one_fixed:
+                    finalize_partial = True
+                    self._append_unique(
+                        self._findings,
+                        "Partial security remediation accepted: one of two critical issues remains unresolved.",
+                    )
+                else:
+                    finalize_incorrect = True
+                    self._append_unique(self._findings, "Finalization rejected: unresolved stages remain.")
+
+            elif self._incident_resolved:
+                finalize_correct = True
                 self._append_unique(self._findings, self._scenario.final_success_message)
             else:
-                finalized_failure = True
+                finalize_incorrect = True
                 self._append_unique(self._findings, "Finalization rejected: unresolved stages remain.")
 
         self._set_stage_progress_after_advance()
 
-        stage_after = self._current_issue().stage if not self._incident_resolved else STAGE_ORDER[-1]
-        stage_advanced = STAGE_ORDER.index(stage_after) > STAGE_ORDER.index(stage_before)
-        issue_advanced = self._current_issue_index > issue_before
-
         reward = step_reward(
             operation=operation,
             was_redundant=was_redundant,
-            revealed_new_evidence=revealed_new_evidence,
-            hypothesis_correct_for_issue=hypothesis_correct_for_issue,
+            inspection_relevant=inspection_relevant,
+            hypothesis_correct_first_try=hypothesis_correct_first_try,
+            hypothesis_correct_retry=hypothesis_correct_retry,
             fix_correct_for_issue=fix_correct_for_issue,
             fix_partial_for_issue=fix_partial_for_issue,
+            fix_wrong_for_issue=fix_wrong_for_issue,
             is_destructive_fix=is_destructive_fix,
-            stage_advanced=stage_advanced,
-            issue_advanced=issue_advanced,
-            finalized_success=finalized_success,
-            finalized_failure=finalized_failure,
-            blind_fix_attempt=blind_fix_attempt,
-            premature_finalize=premature_finalize,
+            red_herring_fix=red_herring_fix,
+            rerun_after_valid_fix=rerun_after_valid_fix,
+            finalize_correct=finalize_correct,
+            finalize_partial=finalize_partial,
+            finalize_incorrect=finalize_incorrect,
+            modify_reward_override=modify_reward_override,
+            finalize_reward_override=finalize_reward_override,
         )
 
         self._action_keys.add(key)
@@ -534,6 +664,9 @@ class MetaHackathonEnvironment(Environment):
                 "max_steps": self._scenario.max_steps,
                 "variant_id": self._current_variant().variant_id,
                 "active_issue_stage": self._current_issue().stage,
+                "active_issue_index": self._current_issue_index,
+                "resolved_issue_count": self._solved_issues,
+                "issue_count": len(self._scenario.incident_chain),
                 "supported_operations": SUPPORTED_OPERATIONS,
                 "canonical_operations": CANONICAL_OPERATIONS,
             },
@@ -541,6 +674,7 @@ class MetaHackathonEnvironment(Environment):
 
         if done:
             final_score = grade_episode(
+                difficulty=self._scenario.difficulty,
                 issue_count=len(self._scenario.incident_chain),
                 solved_issues=self._solved_issues,
                 required_inspection_actions=self._compute_required_inspections(),
@@ -554,6 +688,7 @@ class MetaHackathonEnvironment(Environment):
                 redundant_actions=self._redundant_actions,
                 destructive_actions=self._destructive_actions,
                 pipeline_health=self._pipeline_health,
+                wrong_fixes=self._wrong_fixes,
             )
             obs.final_score = final_score
             if obs.metadata is None:
