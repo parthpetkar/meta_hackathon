@@ -1,155 +1,153 @@
-"""Deterministic scoring helpers for CI/CD repair episodes."""
+"""Deterministic grading helpers for staged CI/CD repair episodes."""
 
 from __future__ import annotations
 
-from typing import Dict, List, Set, Tuple
+import re
+from typing import Dict, List, Set
+
+
+_NORMALIZE_REPLACEMENTS = {
+    "outdated": "stale",
+    "old": "stale",
+    "conflicting": "incompatible",
+    "conflict": "incompatible",
+    "permissions": "permission",
+    "authorize": "permission",
+    "authorisation": "permission",
+    "authorization": "permission",
+    "artifact registry": "artifactregistry",
+    "writer role": "writer",
+    "re-order": "reorder",
+}
 
 
 def _normalize(value: str) -> str:
-    return (value or "").strip().lower()
+    normalized = (value or "").strip().lower()
+    normalized = re.sub(r"[_\-]", " ", normalized)
+    for before, after in _NORMALIZE_REPLACEMENTS.items():
+        normalized = normalized.replace(before, after)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
 
 
-def _contains_all(value: str, terms: List[str]) -> bool:
-    normalized = _normalize(value)
-    return all(term in normalized for term in terms)
+def _contains_all(text: str, terms: List[str]) -> bool:
+    normalized = _normalize(text)
+    return bool(terms) and all(_normalize(term) in normalized for term in terms)
 
 
-def matches_hypothesis(expected_hypothesis: str, provided_hypothesis: str) -> bool:
-    """Match hypothesis with deterministic tolerant rules for natural language outputs."""
-    expected = _normalize(expected_hypothesis)
-    provided = _normalize(provided_hypothesis)
-    if not provided:
-        return False
-    if provided == expected:
-        return True
-
-    if expected == "feature branch is stale and contains unresolved merge conflict":
-        return _contains_all(provided, ["merge", "conflict"])
-
-    if expected == "requests 2.20.0 conflicts with urllib3 constraints required by the app":
-        return _contains_all(provided, ["requests", "urllib3"]) and (
-            "conflict" in provided or "incompatible" in provided
-        )
-
-    if expected == "ci service account lacks registry write permission causing delayed retries and timeout":
-        return (
-            "artifactregistry.writer" in provided
-            or _contains_all(provided, ["registry", "write", "permission"])
-        )
-
-    return False
+def action_key(action: Dict[str, str]) -> str:
+    """Create a deterministic key for repeated-action detection."""
+    operation = _normalize(action.get("operation", ""))
+    target = _normalize(action.get("target", ""))
+    value = _normalize(action.get("value", ""))
+    return f"{operation}|{target}|{value}"
 
 
-def matches_fix(expected_fix: str, provided_fix: str) -> bool:
-    """Match remediation action with deterministic tolerant rules."""
-    expected = _normalize(expected_fix)
-    provided = _normalize(provided_fix)
-    if not provided:
-        return False
-    if provided == expected:
-        return True
-
-    if expected == "resolve-merge-conflict":
-        return _contains_all(provided, ["resolve", "merge", "conflict"])
-
-    if expected == "pin-compatible-requests-version":
-        return "urllib3" in provided and (
-            "pin" in provided
-            or "constraint" in provided
-            or "compatible" in provided
-            or "downgrade" in provided
-        )
-
-    if expected == "grant-registry-write-permission":
-        return (
-            "artifactregistry.writer" in provided
-            or _contains_all(provided, ["registry", "write", "permission"])
-        )
-
-    return False
+def matches_terms(value: str, required_terms: List[str]) -> bool:
+    """Return True when value contains all required terms."""
+    return _contains_all(value, required_terms)
 
 
 def grade_episode(
     *,
-    action_history: List[str],
-    discovered_clues: Set[Tuple[str, str]],
-    expected_clue_ops: Set[str],
-    expected_hypothesis: str,
-    hypothesis: str,
-    expected_fix: str,
-    attempted_fix: str,
-    incident_resolved: bool,
+    issue_count: int,
+    solved_issues: int,
+    required_inspection_actions: Set[str],
+    used_inspection_actions: Set[str],
+    hypothesis_hits: int,
+    fix_hits: int,
+    final_resolved: bool,
+    action_count: int,
     max_steps: int,
+    redundant_actions: int,
     destructive_actions: int,
+    pipeline_health: float,
 ) -> float:
-    """Return deterministic score in [0.0, 1.0] for a completed episode."""
+    """Return deterministic final score in [0.0, 1.0].
 
-    if max_steps <= 0:
-        max_steps = 1
+    Correctness-first weighting:
+    - correctness 55%
+    - reasoning quality 30%
+    - efficiency 15%
+    """
+    safe_max_steps = max(max_steps, 1)
+    safe_issue_count = max(issue_count, 1)
 
-    clue_coverage = 0.0
-    if expected_clue_ops:
-        discovered_ops = {op for (op, _payload) in discovered_clues}
-        clue_coverage = min(len(discovered_ops & expected_clue_ops) / len(expected_clue_ops), 1.0)
+    progression_score = min(solved_issues / safe_issue_count, 1.0)
+    resolved_score = 1.0 if final_resolved else 0.0
+    correctness = (0.35 * progression_score) + (0.20 * resolved_score)
 
-    hypothesis_score = 1.0 if matches_hypothesis(expected_hypothesis, hypothesis) else 0.0
-    fix_score = 1.0 if matches_fix(expected_fix, attempted_fix) else 0.0
-    verify_score = 1.0 if incident_resolved else 0.0
+    reasoning_coverage = 0.0
+    if required_inspection_actions:
+        reasoning_coverage = min(
+            len(required_inspection_actions & used_inspection_actions) / len(required_inspection_actions),
+            1.0,
+        )
+    reasoning_hypothesis = min(hypothesis_hits / safe_issue_count, 1.0)
+    reasoning_quality = 0.60 * reasoning_coverage + 0.40 * reasoning_hypothesis
 
-    action_count = max(len(action_history), 1)
-    efficiency_score = max(0.0, 1.0 - ((action_count - 1) / max_steps))
+    action_count = max(action_count, 1)
+    efficiency_base = max(0.0, 1.0 - ((action_count - 1) / safe_max_steps))
+    redundancy_penalty = min(redundant_actions * 0.05, 0.30)
+    efficiency = max(0.0, efficiency_base - redundancy_penalty)
 
-    score = (
-        0.30 * clue_coverage
-        + 0.25 * hypothesis_score
-        + 0.30 * fix_score
-        + 0.10 * verify_score
-        + 0.05 * efficiency_score
-    )
+    health_penalty = min(max(0.0, 1.0 - pipeline_health), 0.40)
+    destructive_penalty = min(destructive_actions * 0.12, 0.40)
 
-    penalty = min(destructive_actions * 0.20, 0.40)
-    score = max(0.0, min(1.0, score - penalty))
-    return round(score, 3)
+    score = (0.55 * correctness) + (0.30 * reasoning_quality) + (0.15 * efficiency)
+    score -= health_penalty + destructive_penalty
+
+    return round(max(0.0, min(1.0, score)), 3)
 
 
 def step_reward(
     *,
     operation: str,
-    op_target: str,
-    seen_action_keys: Set[str],
-    expected_hypothesis: str,
-    hypothesis_value: str,
-    expected_fix: str,
-    fix_value: str,
-    incident_resolved: bool,
+    was_redundant: bool,
+    revealed_new_evidence: bool,
+    hypothesis_correct_for_issue: bool,
+    fix_correct_for_issue: bool,
+    fix_partial_for_issue: bool,
     is_destructive_fix: bool,
+    stage_advanced: bool,
+    issue_advanced: bool,
+    finalized_success: bool,
+    finalized_failure: bool,
 ) -> float:
-    """Return per-step shaped reward for an action."""
-
-    op_key = f"{_normalize(operation)}::{_normalize(op_target)}"
+    """Return deterministic per-step shaped reward."""
     reward = 0.0
 
-    if operation.startswith("inspect_"):
-        reward += 0.10 if op_key not in seen_action_keys else -0.05
+    if revealed_new_evidence:
+        reward += 0.12
+
+    if was_redundant:
+        reward -= 0.08
 
     if operation == "set_hypothesis":
-        reward += 0.30 if matches_hypothesis(expected_hypothesis, hypothesis_value) else -0.15
+        reward += 0.22 if hypothesis_correct_for_issue else -0.10
 
-    if operation == "apply_fix":
+    if operation in {"modify_config", "add_dependency"}:
         if is_destructive_fix:
-            reward -= 0.40
+            reward -= 0.45
+        elif fix_correct_for_issue:
+            reward += 0.35
+        elif fix_partial_for_issue:
+            reward += 0.15
         else:
-            reward += 0.50 if matches_fix(expected_fix, fix_value) else -0.20
+            reward -= 0.18
 
-    if operation == "verify_fix":
-        reward += 0.20 if incident_resolved else -0.10
+    if operation == "rerun_pipeline":
+        if issue_advanced:
+            reward += 0.18
+        elif stage_advanced:
+            reward += 0.10
+        else:
+            reward -= 0.05
+
+    if operation == "finalize":
+        if finalized_success:
+            reward += 0.25
+        elif finalized_failure:
+            reward -= 0.15
 
     return round(reward, 3)
-
-
-def action_key(action: Dict[str, str]) -> str:
-    """Create a compact deterministic key for repeated-action detection."""
-    operation = _normalize(action.get("operation", ""))
-    target = _normalize(action.get("target", ""))
-    value = _normalize(action.get("value", ""))
-    return f"{operation}|{target}|{value}"

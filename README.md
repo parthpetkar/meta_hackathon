@@ -17,7 +17,7 @@ tags:
 
 Deterministic OpenEnv environment for CI/CD pipeline failure diagnosis and repair.
 
-The agent investigates pipeline evidence, sets a root-cause hypothesis, applies a fix, and verifies recovery.
+The agent investigates evidence, applies staged remediations, reruns pipeline stages, and finalizes only after full recovery.
 
 ## Why this benchmark is useful
 
@@ -41,31 +41,34 @@ The environment implements:
 
 `MetaHackathonAction`
 
-- `operation`: one of
-  - `inspect_pipeline`
-  - `inspect_stage`
-  - `inspect_logs`
-  - `inspect_git`
-  - `inspect_docker`
-  - `inspect_tests`
-  - `inspect_dependencies`
+- `operation`: canonical operations
+  - `view_logs`
+  - `inspect_config`
+  - `inspect_dockerfile`
+  - `modify_config`
+  - `add_dependency`
+  - `rerun_pipeline`
+  - `finalize`
   - `inspect_permissions`
   - `set_hypothesis`
-  - `apply_fix`
-  - `verify_fix`
 - `target`: optional stage/system target
 - `value`: optional hypothesis/fix payload
+
+Legacy operations (`inspect_*`, `apply_fix`, `verify_fix`) remain accepted via deterministic alias mapping for backward compatibility.
 
 ## Observation Space
 
 `MetaHackathonObservation`
 
 - `task_id`, `task_title`, `difficulty`
-- `pipeline_status`, `current_stage`
+- `pipeline_status`, `current_stage`, `pipeline_stages`
 - `available_stages`, `available_tools`
-- `visible_alerts`, `visible_logs`, `visible_metrics`
-- `findings`, `action_history`
+- `visible_alerts`, `visible_logs`, `visible_metrics`, `logs_by_stage`
+- `config_files`, `surfaced_errors`
+- `findings`, `action_history`, `previous_actions`
 - `current_hypothesis`, `attempted_fix`
+- `hypothesis_history`, `active_issue_index`, `revealed_issue_count`
+- `pipeline_health`, `recovery_cost`, `redundant_actions`, `destructive_actions`
 - `incident_resolved`
 - `final_score` (0.0 to 1.0 at terminal step)
 - `reward`, `done`, `metadata`
@@ -74,36 +77,38 @@ The environment implements:
 
 1. `easy_merge_conflict`
 
-- Root cause: feature branch stale + unresolved merge conflict
-- Correct fix: `resolve-merge-conflict`
+- Iteration 1: ambiguous merge failure in build
+- Partial fix can reveal iteration 2 test contract drift
+- Final state: branch synced/rebased and tests stabilized
 
 1. `medium_docker_dep_failure`
 
-- Root cause: dependency conflict (`requests` vs `urllib3` constraints)
-- Correct fix: `pin-compatible-requests-version`
+- Iteration 1: ambiguous dependency conflict (`requests`/`urllib3`) at build
+- Partial fix can reveal iteration 2 Docker install-order instability
+- Final state: compatible dependency pin + corrected Docker order
 
 1. `hard_permission_timeout_chain`
 
-- Root cause: CI service account lacks registry write permission
-- Correct fix: `grant-registry-write-permission`
+- Iteration 1: deploy failure mixing permission denied + timeout symptoms
+- Partial fix can reveal iteration 2 timeout tuning after auth recovery
+- Final state: permission repair + timeout retuning
 
 ## Reward and Grading
 
 Per-step reward (`step_reward`) gives shaped feedback:
 
-- positive for useful new inspections
-- positive for correct hypothesis/fix/verification
-- negative for repeated actions
-- strong negative for destructive fixes
+- positive for novel evidence gathering
+- positive for correct or partial intermediate fixes
+- positive for meaningful rerun progression
+- penalties for redundant or destructive actions
+- penalties for premature finalization
 
-Terminal score (`grade_episode`) is deterministic in [0.0, 1.0] from:
+Terminal score (`grade_episode`) is deterministic in [0.0, 1.0] with correctness-first weighting:
 
-- clue coverage
-- hypothesis correctness
-- fix correctness
-- verification
-- efficiency
-- destructive action penalties
+- correctness (issue resolution + final recovered state)
+- reasoning quality (inspection coverage + hypothesis quality)
+- efficiency (step economy and redundancy control)
+- health/destructive penalties for harmful trajectories
 
 ## Quick Start
 

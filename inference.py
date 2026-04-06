@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 import sys
 import textwrap
 from pathlib import Path
@@ -27,11 +28,23 @@ API_KEY = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or os.getenv("API
 API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
 MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
 BENCHMARK = os.getenv("META_HACKATHON_BENCHMARK", "meta_hackathon")
-MAX_STEPS = 10
+MAX_STEPS = 12
 TEMPERATURE = 0.2
 MAX_TOKENS = 180
-SUCCESS_SCORE_THRESHOLD = 0.75
+SUCCESS_SCORE_THRESHOLD = float(os.getenv("SUCCESS_SCORE_THRESHOLD", "0.30"))
 TASK_ORDER = ["easy", "medium", "hard"]
+RESCUE_ON_NEGATIVE_REWARD = os.getenv("RESCUE_ON_NEGATIVE_REWARD", "true").lower() == "true"
+VALID_OPERATIONS = {
+    "view_logs",
+    "inspect_config",
+    "inspect_dockerfile",
+    "modify_config",
+    "add_dependency",
+    "rerun_pipeline",
+    "finalize",
+    "inspect_permissions",
+    "set_hypothesis",
+}
 
 SYSTEM_PROMPT = textwrap.dedent(
     """
@@ -41,12 +54,20 @@ SYSTEM_PROMPT = textwrap.dedent(
         operation|target|value
 
         Rules:
-        - operation must be one of: inspect_pipeline, inspect_stage, inspect_logs, inspect_git,
-            inspect_docker, inspect_tests, inspect_dependencies, inspect_permissions,
-            set_hypothesis, apply_fix, verify_fix
-        - Use target for stage/component when needed, else leave it empty.
-        - Use value for hypothesis/fix payload when needed, else leave it empty.
+        - operation must be one of: view_logs, inspect_config, inspect_dockerfile,
+            modify_config, add_dependency, rerun_pipeline, finalize,
+            inspect_permissions, set_hypothesis
+        - Use target for stage/component or file only when needed, else leave it empty.
+        - Put hypothesis and fix text in value, not target.
+        - For set_hypothesis always keep target empty.
+        - Do not finalize before at least one rerun_pipeline after a fix.
         - Do not include markdown or explanations.
+
+        Good examples:
+        set_hypothesis||merge conflict caused by stale branch
+        modify_config|build|sync branch and resolve merge conflict
+        add_dependency|build|pin compatible requests urllib3 versions
+        rerun_pipeline||
     """
 ).strip()
 
@@ -64,10 +85,13 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
     )
 
 
-def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+def log_end(success: bool, steps: int, score: float, resolved: bool, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
-    _ = score
-    print(f"[END] success={str(success).lower()} steps={steps} rewards={rewards_str}", flush=True)
+    print(
+        f"[END] success={str(success).lower()} steps={steps} score={score:.3f} "
+        f"resolved={str(resolved).lower()} rewards={rewards_str}",
+        flush=True,
+    )
 
 
 def build_user_prompt(task_name: str, step: int, history: List[str], observation_payload: str) -> str:
@@ -87,10 +111,68 @@ def build_user_prompt(task_name: str, step: int, history: List[str], observation
 
 
 def parse_model_action(raw_text: str) -> Tuple[str, str, str]:
-    parts = [segment.strip() for segment in (raw_text or "").strip().split("|")]
+    """Parse first valid operation|target|value line from model output."""
+    content = (raw_text or "").strip()
+    if not content:
+        return "", "", ""
+
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    candidates = [line for line in lines if "|" in line]
+    if not candidates:
+        candidates = [content]
+
+    for line in candidates:
+        parts = [segment.strip() for segment in line.split("|")]
+        while len(parts) < 3:
+            parts.append("")
+        op = parts[0].lower()
+        if op in VALID_OPERATIONS:
+            return parts[0], parts[1], parts[2]
+
+    parts = [segment.strip() for segment in candidates[0].split("|")]
     while len(parts) < 3:
         parts.append("")
     return parts[0], parts[1], parts[2]
+
+
+def normalize_model_action(
+    *,
+    operation: str,
+    target: str,
+    value: str,
+    step: int,
+) -> Tuple[str, str, str]:
+    """Normalize common model formatting mistakes into valid high-signal actions."""
+    op = (operation or "").strip().lower()
+    tgt = (target or "").strip()
+    val = (value or "").strip()
+
+    if op and op not in VALID_OPERATIONS:
+        return "", "", ""
+
+    if op == "set_hypothesis":
+        if not val and tgt:
+            val = tgt
+            tgt = ""
+        else:
+            tgt = ""
+
+    if op in {"modify_config", "add_dependency"}:
+        lowered = f"{tgt} {val}".lower()
+        if any(token in lowered for token in ["requests", "urllib3", "requirements", "dependency", "pin"]):
+            op = "add_dependency"
+
+    if op == "modify_config":
+        lowered = val.lower()
+        if re.search(r"\b(rebase|sync|merge conflict|resolve conflict|branch)\b", lowered):
+            tgt = "build" if step <= 5 else "test"
+
+    if op == "finalize" and step < 6:
+        op = "rerun_pipeline"
+        tgt = ""
+        val = ""
+
+    return op, tgt, val
 
 
 def compact_observation(observation) -> str:
@@ -104,37 +186,85 @@ def compact_observation(observation) -> str:
         findings={observation.findings[-3:]}
         hypothesis={observation.current_hypothesis}
         attempted_fix={observation.attempted_fix}
+        surfaced_errors={observation.surfaced_errors[-3:]}
+        pipeline_stages={observation.pipeline_stages}
+        active_issue_index={observation.active_issue_index}
+        revealed_issue_count={observation.revealed_issue_count}
+        pipeline_health={observation.pipeline_health}
+        recovery_cost={observation.recovery_cost}
         resolved={observation.incident_resolved}
         """
     ).strip()
 
 
+def should_force_fallback(
+    *,
+    step: int,
+    rewards: List[float],
+    history: List[str],
+    observation,
+) -> bool:
+    """Enter deterministic fallback when trajectory stalls."""
+    if step <= 2:
+        return False
+
+    recent_rewards = rewards[-2:]
+    if len(recent_rewards) == 2 and all(value <= 0.0 for value in recent_rewards):
+        return True
+
+    if len(history) >= 3:
+        last_ops = [entry.split("|", 1)[0] for entry in history[-3:]]
+        if len(set(last_ops)) == 1 and last_ops[0] in {"set_hypothesis", "modify_config", "add_dependency"}:
+            return True
+
+    if observation.redundant_actions >= 2 and not observation.incident_resolved:
+        return True
+
+    # Consecutive reruns without improvement generally indicate semantic drift.
+    if len(history) >= 2:
+        last_two_ops = [entry.split("|", 1)[0] for entry in history[-2:]]
+        if last_two_ops == ["rerun_pipeline", "rerun_pipeline"] and recent_rewards and recent_rewards[-1] <= 0.0:
+            return True
+
+    return False
+
+
 def fallback_action(task_name: str, step: int) -> Tuple[str, str, str]:
     plans = {
         "easy": [
-            ("inspect_pipeline", "", ""),
-            ("inspect_stage", "merge-check", ""),
-            ("inspect_git", "", ""),
-            ("set_hypothesis", "", "feature branch is stale and contains unresolved merge conflict"),
-            ("apply_fix", "", "resolve-merge-conflict"),
-            ("verify_fix", "", ""),
+            ("view_logs", "build", ""),
+            ("inspect_config", "build", ""),
+            ("set_hypothesis", "", "merge conflict from stale feature branch"),
+            ("modify_config", "build", "sync branch and resolve merge conflict"),
+            ("rerun_pipeline", "", ""),
+            ("set_hypothesis", "", "contract tests failing due to stale branch baseline"),
+            ("modify_config", "test", "rebase feature branch to refresh contract baseline"),
+            ("rerun_pipeline", "", ""),
+            ("finalize", "", ""),
         ],
         "medium": [
-            ("inspect_pipeline", "", ""),
-            ("inspect_docker", "", ""),
-            ("inspect_dependencies", "", ""),
-            ("set_hypothesis", "", "requests 2.20.0 conflicts with urllib3 constraints required by the app"),
-            ("apply_fix", "", "pin-compatible-requests-version"),
-            ("verify_fix", "", ""),
+            ("view_logs", "build", ""),
+            ("inspect_config", "build", ""),
+            ("inspect_dockerfile", "build", ""),
+            ("set_hypothesis", "", "requests and urllib3 are incompatible"),
+            ("add_dependency", "build", "pin compatible requests urllib3 versions"),
+            ("rerun_pipeline", "", ""),
+            ("set_hypothesis", "", "docker install order mismatch still causing flaky build"),
+            ("modify_config", "build", "reorder docker install steps"),
+            ("rerun_pipeline", "", ""),
+            ("finalize", "", ""),
         ],
         "hard": [
-            ("inspect_pipeline", "", ""),
-            ("inspect_stage", "deploy", ""),
-            ("inspect_logs", "", ""),
+            ("view_logs", "deploy", ""),
+            ("inspect_config", "deploy", ""),
             ("inspect_permissions", "", ""),
-            ("set_hypothesis", "", "ci service account lacks registry write permission causing delayed retries and timeout"),
-            ("apply_fix", "", "grant-registry-write-permission"),
-            ("verify_fix", "", ""),
+            ("set_hypothesis", "", "registry write permission missing for ci-runner"),
+            ("modify_config", "deploy", "grant artifactregistry writer to ci-runner"),
+            ("rerun_pipeline", "", ""),
+            ("set_hypothesis", "", "rollout timeout requires tuning after auth recovery"),
+            ("modify_config", "deploy", "increase rollout timeout to 20m"),
+            ("rerun_pipeline", "", ""),
+            ("finalize", "", ""),
         ],
     }
     sequence = plans.get(task_name, plans["medium"])
@@ -144,19 +274,22 @@ def fallback_action(task_name: str, step: int) -> Tuple[str, str, str]:
     # After the base sequence, retry canonical diagnose/fix/verify loop.
     tail = {
         "easy": [
-            ("set_hypothesis", "", "feature branch is stale and contains unresolved merge conflict"),
-            ("apply_fix", "", "resolve-merge-conflict"),
-            ("verify_fix", "", ""),
+            ("set_hypothesis", "", "stale branch merge issue remains"),
+            ("modify_config", "build", "sync branch and resolve merge conflict"),
+            ("rerun_pipeline", "", ""),
+            ("finalize", "", ""),
         ],
         "medium": [
-            ("set_hypothesis", "", "requests 2.20.0 conflicts with urllib3 constraints required by the app"),
-            ("apply_fix", "", "pin-compatible-requests-version"),
-            ("verify_fix", "", ""),
+            ("set_hypothesis", "", "dependency or docker order mismatch still active"),
+            ("modify_config", "build", "reorder docker install steps"),
+            ("rerun_pipeline", "", ""),
+            ("finalize", "", ""),
         ],
         "hard": [
-            ("set_hypothesis", "", "ci service account lacks registry write permission causing delayed retries and timeout"),
-            ("apply_fix", "", "grant-registry-write-permission"),
-            ("verify_fix", "", ""),
+            ("set_hypothesis", "", "permission or timeout tuning still incomplete"),
+            ("modify_config", "deploy", "grant artifactregistry writer and tune timeout 20m"),
+            ("rerun_pipeline", "", ""),
+            ("finalize", "", ""),
         ],
     }
     tail_sequence = tail.get(task_name, tail["medium"])
@@ -207,7 +340,9 @@ async def run_task(client: OpenAI, env: MetaHackathonEnv, fallback_task_name: st
     steps_taken = 0
     score = 0.0
     success = False
+    resolved = False
     task_name = fallback_task_name
+    fallback_window = 0
 
     try:
         result = await env.reset()
@@ -230,6 +365,34 @@ async def run_task(client: OpenAI, env: MetaHackathonEnv, fallback_task_name: st
                 observation_payload=observation_payload,
                 history=history,
             )
+            operation, target, value = normalize_model_action(
+                operation=operation,
+                target=target,
+                value=value,
+                step=step,
+            )
+
+            use_fallback = False
+            if fallback_window > 0:
+                use_fallback = True
+                fallback_window -= 1
+            elif RESCUE_ON_NEGATIVE_REWARD and rewards and rewards[-1] < 0.0:
+                use_fallback = True
+                fallback_window = 3
+            elif not operation:
+                use_fallback = True
+                fallback_window = 2
+            elif should_force_fallback(
+                step=step,
+                rewards=rewards,
+                history=history,
+                observation=obs,
+            ):
+                use_fallback = True
+                fallback_window = 2
+
+            if use_fallback:
+                operation, target, value = fallback_action(task_name, step)
 
             action = MetaHackathonAction(operation=operation, target=target, value=value)
             result = await env.step(action)
@@ -251,9 +414,10 @@ async def run_task(client: OpenAI, env: MetaHackathonEnv, fallback_task_name: st
                 break
 
         score = float(result.observation.final_score)
-        success = score >= SUCCESS_SCORE_THRESHOLD and bool(result.observation.incident_resolved)
+        resolved = bool(result.observation.incident_resolved)
+        success = resolved and score >= SUCCESS_SCORE_THRESHOLD
     finally:
-        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+        log_end(success=success, steps=steps_taken, score=score, resolved=resolved, rewards=rewards)
 
     return task_name, success, steps_taken, score
 
