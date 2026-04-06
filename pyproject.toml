@@ -39,6 +39,7 @@ dev = [
 # Server entry point - enables running via: uv run --project . server
 # or: python -m meta_hackathon.server.app
 server = "meta_hackathon.server.app:main"
+evaluate = "meta_hackathon.eval_runner:main"
 
 [tool.setuptools]
 include-package-data = true

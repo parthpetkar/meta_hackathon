@@ -63,6 +63,7 @@ class IncidentStep:
     stage: str
     ambiguous_error: str
     possible_causes: List[str]
+    family_term_sets: List[List[str]]
     true_cause: str
     hypothesis_terms: List[str]
     log_variants: List[List[str]]
@@ -73,6 +74,16 @@ class IncidentStep:
     correct_fix_terms: List[str]
     partial_fix_terms: List[List[str]]
     partial_fix_reveal: str
+
+
+@dataclass(frozen=True)
+class ScenarioVariant:
+    """Deterministic per-episode scenario variant for replayable diversity."""
+
+    variant_id: str
+    pipeline_alert_suffix: str
+    extra_log_lines: List[str]
+    extra_config_clues: List[str]
 
 
 @dataclass(frozen=True)
@@ -89,6 +100,7 @@ class ScenarioCard:
     config_templates: Dict[str, str]
     final_success_message: str
     incident_chain: List[IncidentStep]
+    variants: List[ScenarioVariant]
 
 
 SCENARIOS: Dict[str, ScenarioCard] = {
@@ -116,6 +128,10 @@ SCENARIOS: Dict[str, ScenarioCard] = {
                 possible_causes=[
                     "unresolved conflict markers",
                     "feature branch stale against main",
+                ],
+                family_term_sets=[
+                    ["merge", "conflict"],
+                    ["stale", "branch"],
                 ],
                 true_cause="feature branch stale and unresolved conflict markers",
                 hypothesis_terms=["merge", "conflict", "stale"],
@@ -147,6 +163,10 @@ SCENARIOS: Dict[str, ScenarioCard] = {
                     "api contract drift",
                     "stale generated fixtures",
                 ],
+                family_term_sets=[
+                    ["contract", "drift"],
+                    ["stale", "schema"],
+                ],
                 true_cause="stale branch contract after partial merge resolution",
                 hypothesis_terms=["contract", "stale", "branch"],
                 log_variants=[
@@ -165,6 +185,28 @@ SCENARIOS: Dict[str, ScenarioCard] = {
                 correct_fix_terms=["rebase", "feature", "branch"],
                 partial_fix_terms=[],
                 partial_fix_reveal="",
+            ),
+        ],
+        variants=[
+            ScenarioVariant(
+                variant_id="easy_v1",
+                pipeline_alert_suffix="Pipeline checks also reported schema drift warnings.",
+                extra_log_lines=[
+                    "hint: merge auto-resolution was attempted previously and aborted",
+                ],
+                extra_config_clues=[
+                    "ci.yaml note: strict merge mode requires branch synchronization before final checks",
+                ],
+            ),
+            ScenarioVariant(
+                variant_id="easy_v2",
+                pipeline_alert_suffix="PR metadata indicates stale base revision.",
+                extra_log_lines=[
+                    "warning: contract test fixtures may be stale after merge attempts",
+                ],
+                extra_config_clues=[
+                    "preflight report: branch baseline hash differs from main verification snapshot",
+                ],
             ),
         ],
     ),
@@ -192,6 +234,10 @@ SCENARIOS: Dict[str, ScenarioCard] = {
                 possible_causes=[
                     "requests/urllib3 incompatibility",
                     "bad Docker layer order causing stale constraints",
+                ],
+                family_term_sets=[
+                    ["requests", "urllib3"],
+                    ["dependency", "incompatible"],
                 ],
                 true_cause="requests 2.20.0 incompatible with urllib3 2.x in current lock",
                 hypothesis_terms=["requests", "urllib3", "incompatible"],
@@ -226,6 +272,10 @@ SCENARIOS: Dict[str, ScenarioCard] = {
                     "incorrect apt/pip ordering",
                     "stale cache invalidation strategy",
                 ],
+                family_term_sets=[
+                    ["docker", "order"],
+                    ["apt", "pip"],
+                ],
                 true_cause="Docker install order mismatch creates unstable build layers",
                 hypothesis_terms=["docker", "order", "install"],
                 log_variants=[
@@ -245,6 +295,28 @@ SCENARIOS: Dict[str, ScenarioCard] = {
                 correct_fix_terms=["reorder", "docker", "install"],
                 partial_fix_terms=[],
                 partial_fix_reveal="",
+            ),
+        ],
+        variants=[
+            ScenarioVariant(
+                variant_id="medium_v1",
+                pipeline_alert_suffix="Build cache key changed after dependency lock update.",
+                extra_log_lines=[
+                    "resolver note: lockfile produced with legacy pip resolver mode",
+                ],
+                extra_config_clues=[
+                    "build metadata: previous green run used compatibility constraints file",
+                ],
+            ),
+            ScenarioVariant(
+                variant_id="medium_v2",
+                pipeline_alert_suffix="Intermittent wheel compile failures detected.",
+                extra_log_lines=[
+                    "pip output: dependency backtracking exceeded expected attempts",
+                ],
+                extra_config_clues=[
+                    "Docker diagnostics: system build tooling appears after Python dependency installation",
+                ],
             ),
         ],
     ),
@@ -272,6 +344,11 @@ SCENARIOS: Dict[str, ScenarioCard] = {
                 possible_causes=[
                     "registry write permission missing",
                     "network congestion causing push timeout",
+                ],
+                family_term_sets=[
+                    ["registry", "permission"],
+                    ["push", "denied"],
+                    ["timeout", "deploy"],
                 ],
                 true_cause="ci service account missing artifactregistry.writer role",
                 hypothesis_terms=["registry", "write", "permission"],
@@ -308,6 +385,10 @@ SCENARIOS: Dict[str, ScenarioCard] = {
                     "timeout still too low for current rollout profile",
                     "residual publish retry overhead",
                 ],
+                family_term_sets=[
+                    ["timeout", "rollout"],
+                    ["tune", "timeout"],
+                ],
                 true_cause="timeout needs retuning after auth recovery",
                 hypothesis_terms=["timeout", "rollout", "tune"],
                 log_variants=[
@@ -325,6 +406,28 @@ SCENARIOS: Dict[str, ScenarioCard] = {
                 correct_fix_terms=["timeout", "20m"],
                 partial_fix_terms=[],
                 partial_fix_reveal="",
+            ),
+        ],
+        variants=[
+            ScenarioVariant(
+                variant_id="hard_v1",
+                pipeline_alert_suffix="Deploy retry storm observed in last 15 minutes.",
+                extra_log_lines=[
+                    "authz monitor: repeated denied writes detected before timeout escalation",
+                ],
+                extra_config_clues=[
+                    "deploy policy: timeout extension allowed only after auth remediation",
+                ],
+            ),
+            ScenarioVariant(
+                variant_id="hard_v2",
+                pipeline_alert_suffix="Rollout health gates stalled after publish retries.",
+                extra_log_lines=[
+                    "registry event stream: push attempts queued while insufficient permissions persist",
+                ],
+                extra_config_clues=[
+                    "sre note: resolve write permissions before adjusting timeout budget",
+                ],
             ),
         ],
     ),

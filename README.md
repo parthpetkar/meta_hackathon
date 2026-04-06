@@ -19,6 +19,8 @@ Deterministic OpenEnv environment for CI/CD pipeline failure diagnosis and repai
 
 The agent investigates evidence, applies staged remediations, reruns pipeline stages, and finalizes only after full recovery.
 
+The benchmark now includes deterministic per-episode scenario variants to improve robustness and reduce memorization.
+
 ## Why this benchmark is useful
 
 This models a real DevOps workflow with measurable outcomes:
@@ -110,6 +112,12 @@ Terminal score (`grade_episode`) is deterministic in [0.0, 1.0] with correctness
 - efficiency (step economy and redundancy control)
 - health/destructive penalties for harmful trajectories
 
+Additional anti-gaming behavior:
+
+- penalties for blind fixes before evidence collection
+- penalties for premature `finalize` when unresolved stages remain
+- family-level partial credit when hypothesis matches failure family but not exact cause
+
 ## Quick Start
 
 ### 1) Install dependencies
@@ -130,17 +138,22 @@ uv run uvicorn server.app:app --host 0.0.0.0 --port 8000
 uv run python inference.py
 ```
 
+### 4) Run deterministic evaluation suite
+
+```bash
+uv run evaluate
+```
+
+Optional env vars:
+
+- `EVAL_EPISODES_PER_TASK` (default `3`)
+- `SUCCESS_SCORE_THRESHOLD` (default `0.20`)
+
 ## Baseline Results
 
-Reference deterministic baseline (golden policy from `README_UI_TESTING.md`) on local runs:
+`inference.py` evaluates one pass of easy -> medium -> hard using an LLM policy with deterministic rescue controls.
 
-| Task | Steps | Reward Sum | Final Score | Resolved |
-| --- | ---: | ---: | ---: | ---: |
-| easy_merge_conflict | 6 | 1.30 | 0.849 | true |
-| medium_docker_dep_failure | 6 | 1.30 | 0.822 | true |
-| hard_permission_timeout_chain | 7 | 1.40 | 0.870 | true |
-
-Reproduce with your model baseline via:
+Reproduce with:
 
 ```bash
 uv run python inference.py
@@ -150,6 +163,7 @@ Notes:
 
 - The environment is deterministic, so policy-level scores are stable across runs.
 - Inference stdout is restricted to structured `[START]`, `[STEP]`, and `[END]` lines.
+- Variant IDs are exposed in observation metadata (`metadata.variant_id`) for replayability.
 
 ## Environment Variables
 
@@ -186,13 +200,21 @@ That file includes:
 
 - `[START] task=<task> env=<benchmark> model=<model>`
 - `[STEP] step=<n> action=<operation|target|value> reward=<0.00> done=<true|false> error=<msg|null>`
-- `[END] success=<true|false> steps=<n> rewards=<r1,r2,...,rn>`
+- `[END] success=<true|false> steps=<n> score=<0.000> resolved=<true|false> rewards=<r1,r2,...,rn>`
+
+`evaluate` prints:
+
+- `[EVAL]` run configuration
+- `[EP]` per-episode task/variant/score/resolution lines
+- `[SUMMARY]` resolved rate, success rate, avg score, avg steps by task
+- `[TOP_FAILURE_REASONS]` for unresolved episodes
 
 ## Project Files
 
 - `models.py`
 - `client.py`
 - `inference.py`
+- `eval_runner.py`
 - `openenv.yaml`
 - `server/app.py`
 - `server/meta_hackathon_environment.py`

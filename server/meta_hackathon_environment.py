@@ -22,6 +22,7 @@ try:
         SUPPORTED_OPERATIONS,
         IncidentStep,
         ScenarioCard,
+        ScenarioVariant,
         canonical_operation,
         get_scenario,
         list_task_keys,
@@ -37,6 +38,7 @@ except ImportError:
         SUPPORTED_OPERATIONS,
         IncidentStep,
         ScenarioCard,
+        ScenarioVariant,
         canonical_operation,
         get_scenario,
         list_task_keys,
@@ -62,6 +64,7 @@ class MetaHackathonEnvironment(Environment):
 
         self._task_key = requested_task
         self._task_cursor = 0
+        self._variant_cursors: dict[str, int] = {key: 0 for key in self._task_order}
         initial_key = self._task_order[0] if self._task_key == "cycle" else self._task_key
 
         self._scenario: ScenarioCard = get_scenario(initial_key)
@@ -83,9 +86,11 @@ class MetaHackathonEnvironment(Environment):
         self._current_issue_index = 0
         self._solved_issues = 0
         self._hypothesis_hits = 0
+        self._family_hits = 0
         self._fix_hits = 0
         self._used_inspections: set[str] = set()
         self._hypothesis_hit_issues: set[int] = set()
+        self._family_hit_issues: set[int] = set()
         self._fix_hit_issues: set[int] = set()
 
         self._incident_resolved = False
@@ -99,6 +104,7 @@ class MetaHackathonEnvironment(Environment):
         self._wrong_fixes = 0
 
         self._variant_selector = 0
+        self._scenario_variant: ScenarioVariant | None = None
         self._config_files: dict[str, str] = {}
 
     def _current_issue(self) -> IncidentStep:
@@ -129,7 +135,9 @@ class MetaHackathonEnvironment(Environment):
             pipeline_stages=dict(self._pipeline_stages),
             available_stages=list(STAGE_ORDER),
             available_tools=list(CANONICAL_OPERATIONS),
-            visible_alerts=[self._scenario.pipeline_alert],
+            visible_alerts=[
+                f"{self._scenario.pipeline_alert} {self._current_variant().pipeline_alert_suffix}".strip()
+            ],
             visible_logs=self._visible_logs[-14:],
             logs_by_stage={stage: logs[-8:] for stage, logs in self._logs_by_stage.items()},
             visible_metrics=self._visible_metrics[-14:],
@@ -186,6 +194,11 @@ class MetaHackathonEnvironment(Environment):
         choice = self._variant_selector % len(issue.log_variants)
         return issue.log_variants[choice]
 
+    def _current_variant(self) -> ScenarioVariant:
+        if self._scenario_variant is None:
+            return self._scenario.variants[0]
+        return self._scenario_variant
+
     def _is_destructive_fix(self, value: str) -> bool:
         normalized = (value or "").strip().lower()
         if not normalized:
@@ -217,12 +230,19 @@ class MetaHackathonEnvironment(Environment):
             if revealed:
                 self._append_unique(self._findings, line)
         revealed = self._append_unique(self._surface_errors, issue.ambiguous_error) or revealed
+        for line in self._current_variant().extra_log_lines:
+            revealed = self._append_unique(self._visible_logs, line) or revealed
+            revealed = self._append_unique(self._logs_by_stage[issue.stage], line) or revealed
+            revealed = self._append_unique(self._findings, line) or revealed
         return revealed
 
     def _handle_inspect_config(self) -> bool:
         issue = self._current_issue()
         revealed = False
         for clue in issue.config_clues:
+            revealed = self._append_unique(self._visible_metrics, clue) or revealed
+            revealed = self._append_unique(self._findings, clue) or revealed
+        for clue in self._current_variant().extra_config_clues:
             revealed = self._append_unique(self._visible_metrics, clue) or revealed
             revealed = self._append_unique(self._findings, clue) or revealed
         for file_name, content in self._scenario.config_templates.items():
@@ -281,9 +301,11 @@ class MetaHackathonEnvironment(Environment):
         self._current_issue_index = 0
         self._solved_issues = 0
         self._hypothesis_hits = 0
+        self._family_hits = 0
         self._fix_hits = 0
         self._used_inspections = set()
         self._hypothesis_hit_issues = set()
+        self._family_hit_issues = set()
         self._fix_hit_issues = set()
 
         self._incident_resolved = False
@@ -296,7 +318,11 @@ class MetaHackathonEnvironment(Environment):
         self._destructive_actions = 0
         self._wrong_fixes = 0
 
-        self._variant_selector = sum(ord(char) for char in self._state.episode_id) % 7
+        current_variant_cursor = self._variant_cursors.get(selected_key, 0)
+        variant_index = current_variant_cursor % len(self._scenario.variants)
+        self._variant_cursors[selected_key] = current_variant_cursor + 1
+        self._variant_selector = variant_index
+        self._scenario_variant = self._scenario.variants[variant_index]
         self._config_files = {}
 
         self._set_stage_progress_after_advance()
@@ -308,6 +334,7 @@ class MetaHackathonEnvironment(Environment):
             metadata={
                 "task_key": selected_key,
                 "max_steps": self._scenario.max_steps,
+                "variant_id": self._current_variant().variant_id,
                 "supported_operations": SUPPORTED_OPERATIONS,
                 "canonical_operations": CANONICAL_OPERATIONS,
             },
@@ -350,6 +377,8 @@ class MetaHackathonEnvironment(Environment):
         is_destructive_fix = False
         finalized_success = False
         finalized_failure = False
+        blind_fix_attempt = False
+        premature_finalize = False
 
         issue = self._current_issue()
 
@@ -380,8 +409,18 @@ class MetaHackathonEnvironment(Environment):
             elif not hypothesis_correct_for_issue:
                 self._append_unique(self._findings, "Hypothesis does not explain all current clues yet.")
 
+            if not hypothesis_correct_for_issue and self._current_issue_index not in self._family_hit_issues:
+                family_hit = any(matches_terms(value, term_set) for term_set in issue.family_term_sets)
+                if family_hit:
+                    self._family_hits += 1
+                    self._family_hit_issues.add(self._current_issue_index)
+                    self._append_unique(self._findings, "Hypothesis captures failure family but lacks full root-cause precision.")
+
         elif operation in {"modify_config", "add_dependency"}:
             self._attempted_fix = value
+            if not self._used_inspections:
+                blind_fix_attempt = True
+                self._append_unique(self._findings, "Fix attempted before inspection evidence collection.")
             fix_assessment = self._assess_fix(issue, operation, value)
             if fix_assessment == "destructive":
                 is_destructive_fix = True
@@ -440,6 +479,8 @@ class MetaHackathonEnvironment(Environment):
                 self._append_unique(self._findings, "Rerun without remediation did not improve pipeline health.")
 
         elif operation == "finalize":
+            if self._solved_issues < len(self._scenario.incident_chain):
+                premature_finalize = True
             if self._incident_resolved:
                 finalized_success = True
                 self._append_unique(self._findings, self._scenario.final_success_message)
@@ -465,6 +506,8 @@ class MetaHackathonEnvironment(Environment):
             issue_advanced=issue_advanced,
             finalized_success=finalized_success,
             finalized_failure=finalized_failure,
+            blind_fix_attempt=blind_fix_attempt,
+            premature_finalize=premature_finalize,
         )
 
         self._action_keys.add(key)
@@ -489,6 +532,7 @@ class MetaHackathonEnvironment(Environment):
                 "expected_fixes": SAFE_FIXES,
                 "destructive_fixes": DESTRUCTIVE_FIXES,
                 "max_steps": self._scenario.max_steps,
+                "variant_id": self._current_variant().variant_id,
                 "active_issue_stage": self._current_issue().stage,
                 "supported_operations": SUPPORTED_OPERATIONS,
                 "canonical_operations": CANONICAL_OPERATIONS,
@@ -502,6 +546,7 @@ class MetaHackathonEnvironment(Environment):
                 required_inspection_actions=self._compute_required_inspections(),
                 used_inspection_actions=self._used_inspections,
                 hypothesis_hits=self._hypothesis_hits,
+                family_hits=self._family_hits,
                 fix_hits=self._fix_hits,
                 final_resolved=self._incident_resolved,
                 action_count=len(self._history),

@@ -55,6 +55,7 @@ def grade_episode(
     required_inspection_actions: Set[str],
     used_inspection_actions: Set[str],
     hypothesis_hits: int,
+    family_hits: int,
     fix_hits: int,
     final_resolved: bool,
     action_count: int,
@@ -75,7 +76,8 @@ def grade_episode(
 
     progression_score = min(solved_issues / safe_issue_count, 1.0)
     resolved_score = 1.0 if final_resolved else 0.0
-    correctness = (0.35 * progression_score) + (0.20 * resolved_score)
+    family_score = min(family_hits / safe_issue_count, 1.0)
+    correctness = (0.25 * progression_score) + (0.20 * resolved_score) + (0.10 * family_score)
 
     reasoning_coverage = 0.0
     if required_inspection_actions:
@@ -113,6 +115,8 @@ def step_reward(
     issue_advanced: bool,
     finalized_success: bool,
     finalized_failure: bool,
+    blind_fix_attempt: bool,
+    premature_finalize: bool,
 ) -> float:
     """Return deterministic per-step shaped reward."""
     reward = 0.0
@@ -127,6 +131,8 @@ def step_reward(
         reward += 0.22 if hypothesis_correct_for_issue else -0.10
 
     if operation in {"modify_config", "add_dependency"}:
+        if blind_fix_attempt:
+            reward -= 0.10
         if is_destructive_fix:
             reward -= 0.45
         elif fix_correct_for_issue:
@@ -145,6 +151,8 @@ def step_reward(
             reward -= 0.05
 
     if operation == "finalize":
+        if premature_finalize:
+            reward -= 0.10
         if finalized_success:
             reward += 0.25
         elif finalized_failure:
