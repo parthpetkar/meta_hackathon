@@ -1,5 +1,6 @@
 openenv-core[core]>=0.2.2
 python-dotenv>=1.2.2
+requests>=2.31.0
 
 [dev]
 pytest>=8.0.0

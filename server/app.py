@@ -43,9 +43,18 @@ except (ImportError, ModuleNotFoundError):
     from server.meta_hackathon_environment import MetaHackathonEnvironment
 
 
+_SHARED_REST_ENV = MetaHackathonEnvironment()
+
+
+def _shared_env_factory() -> MetaHackathonEnvironment:
+    # OpenEnv HTTP handlers instantiate env per request; sharing one instance preserves
+    # episode continuity for /reset + /step in REST mode.
+    return _SHARED_REST_ENV
+
+
 # Create the app with web interface and README integration
 app = create_app(
-    MetaHackathonEnvironment,
+    _shared_env_factory,
     MetaHackathonAction,
     MetaHackathonObservation,
     env_name="meta_hackathon",
