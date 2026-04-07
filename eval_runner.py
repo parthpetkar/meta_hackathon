@@ -101,6 +101,11 @@ def run_episode(task_name: str, env: MetaHackathonEnvironment) -> dict:
             break
 
     score = float(observation.final_score)
+    deterministic_score = float(observation.deterministic_score)
+    rubric_score = float(observation.rubric_score)
+    delayed_reward = float(observation.delayed_reward)
+    rubric_judge_used = bool(observation.rubric_judge_used)
+    rubric_judge_error = str(observation.rubric_judge_error or "")
     resolved = bool(observation.incident_resolved)
     success = resolved and score >= SUCCESS_SCORE_THRESHOLD
 
@@ -115,6 +120,11 @@ def run_episode(task_name: str, env: MetaHackathonEnvironment) -> dict:
         "steps": steps,
         "reward_sum": round(total_reward, 3),
         "score": score,
+        "deterministic_score": deterministic_score,
+        "rubric_score": rubric_score,
+        "delayed_reward": delayed_reward,
+        "rubric_judge_used": rubric_judge_used,
+        "rubric_judge_error": rubric_judge_error,
         "resolved": resolved,
         "success": success,
         "failure_reason": failure_reason,
@@ -135,7 +145,9 @@ def main() -> None:
                 "[EP] "
                 f"task={task_name} episode={episode + 1} variant={result['variant_id']} "
                 f"steps={result['steps']} resolved={str(result['resolved']).lower()} "
-                f"score={result['score']:.3f} success={str(result['success']).lower()}"
+                f"score={result['score']:.3f} det={result['deterministic_score']:.3f} "
+                f"rubric={result['rubric_score']:.3f} delayed={result['delayed_reward']:.3f} "
+                f"judge={str(result['rubric_judge_used']).lower()} success={str(result['success']).lower()}"
             )
 
     print("\n[SUMMARY]")
@@ -145,10 +157,20 @@ def main() -> None:
         resolved_rate = sum(1 for item in task_results if item["resolved"]) / max(count, 1)
         success_rate = sum(1 for item in task_results if item["success"]) / max(count, 1)
         avg_score = sum(item["score"] for item in task_results) / max(count, 1)
+        avg_det_score = sum(item["deterministic_score"] for item in task_results) / max(count, 1)
+        avg_rubric_score = sum(item["rubric_score"] for item in task_results) / max(count, 1)
+        avg_delayed_reward = sum(item["delayed_reward"] for item in task_results) / max(count, 1)
         avg_steps = sum(item["steps"] for item in task_results) / max(count, 1)
+        fallback_count = sum(
+            1
+            for item in task_results
+            if item["rubric_judge_error"] and item["rubric_judge_error"] != "rubric judging disabled"
+        )
         print(
             f"- task={task_name} resolved_rate={resolved_rate:.2%} "
-            f"success_rate={success_rate:.2%} avg_score={avg_score:.3f} avg_steps={avg_steps:.2f}"
+            f"success_rate={success_rate:.2%} avg_score={avg_score:.3f} det={avg_det_score:.3f} "
+            f"rubric={avg_rubric_score:.3f} delayed={avg_delayed_reward:.3f} "
+            f"avg_steps={avg_steps:.2f} rubric_fallbacks={fallback_count}"
         )
 
     unresolved = [item for item in all_results if not item["resolved"]]

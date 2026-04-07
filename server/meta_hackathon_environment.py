@@ -19,6 +19,7 @@ try:
         easy_finalize_ready,
         hard_modify_reward_for_issue,
     )
+    from .rubric_judge import OpenEnvLLMJudgeAdapter, RubricJudgeResult
     from .scenarios import (
         CANONICAL_OPERATIONS,
         DESTRUCTIVE_FIXES,
@@ -41,6 +42,7 @@ except ImportError:
         easy_finalize_ready,
         hard_modify_reward_for_issue,
     )
+    from server.rubric_judge import OpenEnvLLMJudgeAdapter, RubricJudgeResult
     from server.scenarios import (
         CANONICAL_OPERATIONS,
         DESTRUCTIVE_FIXES,
@@ -122,12 +124,82 @@ class MetaHackathonCICDRepairEnvironment(Environment):
         self._episode_seed = 0
         self._sampled_issue_logs: dict[int, list[str]] = {}
 
+        self._rubric_enabled = os.getenv("META_HACKATHON_RUBRIC_ENABLED", "false").strip().lower() == "true"
+        self._rubric_blend_weight = max(
+            0.0,
+            min(1.0, float(os.getenv("META_HACKATHON_RUBRIC_WEIGHT", "0.30"))),
+        )
+        self._rubric_timeout_seconds = int(os.getenv("META_HACKATHON_RUBRIC_TIMEOUT_SECONDS", "10"))
+        self._rubric_model_name = (
+            os.getenv("META_HACKATHON_RUBRIC_MODEL")
+            or os.getenv("MODEL_NAME")
+            or "Qwen/Qwen2.5-72B-Instruct"
+        )
+        self._rubric_judge = OpenEnvLLMJudgeAdapter(
+            enabled=self._rubric_enabled,
+            model_name=self._rubric_model_name,
+            timeout_seconds=self._rubric_timeout_seconds,
+        )
+
         self._easy_build_passing = False
         self._security_iam_fixed = False
         self._security_secret_fixed = False
         self._last_rerun_progressed = False
         self._verified_for_latest_rerun = False
         self._inspected_since_last_rerun = True
+
+    def _rubric_payload(self) -> dict:
+        issue_chain = [
+            {
+                "stage": issue.stage,
+                "true_cause": issue.true_cause,
+                "hypothesis_terms": list(issue.hypothesis_terms),
+                "family_term_sets": [list(term_set) for term_set in issue.family_term_sets],
+                "relevant_inspections": list(issue.relevant_inspections),
+            }
+            for issue in self._scenario.incident_chain
+        ]
+        evidence = {
+            "hypothesis_history": list(self._hypothesis_history[-8:]),
+            "findings": list(self._findings[-16:]),
+            "action_history": list(self._history[-16:]),
+            "active_issue_index": self._current_issue_index,
+            "solved_issues": self._solved_issues,
+            "issue_count": len(self._scenario.incident_chain),
+            "incident_resolved": self._incident_resolved,
+            "pipeline_health": round(self._pipeline_health, 3),
+        }
+        rubric = {
+            "semantic_correctness": "Does hypothesis semantically identify the root cause?",
+            "evidence_alignment": "Does hypothesis align with logs, clues, and surfaced errors?",
+            "completeness": "For chained incidents, are all active causes covered over the episode?",
+        }
+        return {
+            "task_id": self._scenario.task_id,
+            "difficulty": self._scenario.difficulty,
+            "incident_chain": issue_chain,
+            "evidence": evidence,
+            "rubric": rubric,
+        }
+
+    def _blend_terminal_scores(self, deterministic_score: float) -> tuple[float, float, RubricJudgeResult]:
+        if not self._rubric_enabled:
+            disabled_result = RubricJudgeResult(
+                score=0.0,
+                rationale="rubric disabled",
+                source="disabled",
+                used_fallback=True,
+                error="rubric judging disabled",
+            )
+            return deterministic_score, 0.0, disabled_result
+
+        judge_result = self._rubric_judge.evaluate_hypothesis_quality(self._rubric_payload())
+        rubric_score = max(0.0, min(1.0, float(judge_result.score)))
+        blended_score = ((1.0 - self._rubric_blend_weight) * deterministic_score) + (
+            self._rubric_blend_weight * rubric_score
+        )
+        delayed_reward = blended_score - deterministic_score
+        return round(blended_score, 3), round(delayed_reward, 3), judge_result
 
     def _current_issue(self) -> IncidentStep:
         index = min(self._current_issue_index, len(self._scenario.incident_chain) - 1)
@@ -186,6 +258,12 @@ class MetaHackathonCICDRepairEnvironment(Environment):
             destructive_actions=self._destructive_actions,
             incident_resolved=self._incident_resolved,
             final_score=0.0,
+            deterministic_score=0.0,
+            rubric_score=0.0,
+            delayed_reward=0.0,
+            rubric_blend_weight=self._rubric_blend_weight if self._rubric_enabled else 0.0,
+            rubric_judge_used=False,
+            rubric_judge_error="",
             reward=reward,
             done=done,
             metadata=metadata or {},
@@ -769,7 +847,7 @@ class MetaHackathonCICDRepairEnvironment(Environment):
         )
 
         if done:
-            final_score = grade_episode(
+            deterministic_score = grade_episode(
                 difficulty=self._scenario.difficulty,
                 issue_count=len(self._scenario.incident_chain),
                 solved_issues=self._solved_issues,
@@ -786,9 +864,27 @@ class MetaHackathonCICDRepairEnvironment(Environment):
                 pipeline_health=self._pipeline_health,
                 wrong_fixes=self._wrong_fixes,
             )
+            final_score, delayed_reward, judge_result = self._blend_terminal_scores(deterministic_score)
+
+            obs.deterministic_score = deterministic_score
+            obs.rubric_score = judge_result.score if self._rubric_enabled else 0.0
+            obs.rubric_blend_weight = self._rubric_blend_weight if self._rubric_enabled else 0.0
+            obs.delayed_reward = delayed_reward
+            obs.rubric_judge_used = self._rubric_enabled and (not judge_result.used_fallback)
+            obs.rubric_judge_error = judge_result.error
             obs.final_score = final_score
+            obs.reward = round(float(obs.reward or 0.0) + delayed_reward, 3)
+
             if obs.metadata is None:
                 obs.metadata = {}
+            obs.metadata["deterministic_score"] = deterministic_score
+            obs.metadata["rubric_score"] = obs.rubric_score
+            obs.metadata["rubric_blend_weight"] = obs.rubric_blend_weight
+            obs.metadata["delayed_reward"] = delayed_reward
+            obs.metadata["rubric_judge_used"] = obs.rubric_judge_used
+            obs.metadata["rubric_judge_error"] = obs.rubric_judge_error
+            obs.metadata["rubric_judge_source"] = judge_result.source
+            obs.metadata["rubric_judge_rationale"] = judge_result.rationale
             obs.metadata["final_score"] = final_score
 
         return obs
