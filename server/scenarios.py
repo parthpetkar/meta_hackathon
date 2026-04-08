@@ -48,7 +48,9 @@ SAFE_FIXES: List[str] = [
     "sync-branch-and-resolve-conflict",
     "rebase-feature-branch",
     "pin-compatible-requests-urllib3",
+    "add-flaky-test-retry-wrapper",
     "reorder-docker-install-steps",
+    "configure-artifact-upload-backoff",
     "grant-artifactregistry-writer",
     "tune-rollout-timeout-after-auth-fix",
 ]
@@ -316,6 +318,96 @@ SCENARIOS: Dict[str, ScenarioCard] = {
                 ],
                 extra_config_clues=[
                     "Docker diagnostics: system build tooling appears after Python dependency installation",
+                ],
+            ),
+        ],
+    ),
+    "flaky": ScenarioCard(
+        task_id="flaky_test",
+        task_title="Mitigate intermittent flaky test failure",
+        difficulty="easy",
+        benchmark="meta_hackathon",
+        pipeline_alert="Test stage is intermittently failing under CI load.",
+        initial_metrics=[
+            "test.failures_in_last_20_runs=3",
+            "test.retry_recoveries=2",
+            "pipeline.retry_count=1",
+        ],
+        max_steps=12,
+        config_templates={
+            "pytest.ini": "[pytest]\naddopts = -q --maxfail=1\n",
+            "tests/integration/test_checkout.py": (
+                "def test_checkout_async_completion(client):\n"
+                "    result = client.create_order()\n"
+                "    assert result.status == 'completed'\n"
+            ),
+        },
+        final_success_message="Pipeline stabilized after flaky-test isolation and retry-safe handling.",
+        incident_chain=[
+            IncidentStep(
+                stage="test",
+                ambiguous_error="integration test fails intermittently but passes on immediate retry",
+                possible_causes=[
+                    "timing-sensitive flaky test",
+                    "real regression in checkout path",
+                ],
+                family_term_sets=[
+                    ["flaky", "test"],
+                    ["timing", "race"],
+                ],
+                true_cause="timing-sensitive flaky integration test needs retry/isolation mitigation",
+                hypothesis_terms=["flaky", "test", "timing"],
+                log_variants=[
+                    [
+                        "test_checkout_async_completion failed: expected completed got pending",
+                        "rerun #2 passed with no code changes",
+                    ],
+                    [
+                        "pytest: intermittent failure detected in async checkout integration",
+                        "next retry passed in same commit SHA",
+                    ],
+                ],
+                pattern_buckets=["test_flaky"],
+                relevant_inspections=["view_logs", "inspect_config"],
+                config_clues=[
+                    "pytest.ini currently lacks flaky retry/isolation guidance for known async integration tests",
+                    "historical trend: failures are non-deterministic and recover under retry",
+                ],
+                docker_clues=[],
+                permission_clues=["No IAM or deploy permission failures are present for this incident."],
+                correct_operation="modify_config",
+                correct_fix_terms=["retry", "flaky", "test"],
+                partial_fix_terms=[
+                    ["quarantine", "test"],
+                    ["isolate", "flaky"],
+                ],
+                partial_fix_reveal="Flake impact reduced, but CI still needs explicit retry policy for stable test gate outcomes.",
+                red_herring_terms=[
+                    ["rewrite", "checkout", "logic"],
+                    ["disable", "all", "tests"],
+                ],
+                partial_advances=False,
+            ),
+        ],
+        variants=[
+            ScenarioVariant(
+                variant_id="flaky_v1",
+                pipeline_alert_suffix="Failure oscillates between pass/fail across reruns.",
+                extra_log_lines=[
+                    "ci note: same commit passed in isolated rerun worker",
+                ],
+                extra_config_clues=[
+                    "qa runbook: treat intermittent test failures as flake candidates before broad code rewrites",
+                ],
+            ),
+            ScenarioVariant(
+                variant_id="flaky_v2",
+                pipeline_alert_suffix="Intermittent async assertion failures detected.",
+                extra_log_lines=[
+                    "pytest-rerun summary: 1 flaky test recovered after retry",
+                ],
+                extra_config_clues=[
+                    "test analytics: checkout integration failure pattern matches known timing flake signature",
                 ],
             ),
         ],
@@ -620,7 +712,104 @@ SCENARIOS: Dict[str, ScenarioCard] = {
             ),
         ],
     ),
+    "network": ScenarioCard(
+        task_id="network_outage",
+        task_title="Recover from transient external dependency outage",
+        difficulty="medium",
+        benchmark="meta_hackathon",
+        pipeline_alert="Artifact upload failed while external dependency endpoint was unreachable.",
+        initial_metrics=[
+            "deploy.upload_retries=0",
+            "network.dns_failures=4",
+            "pipeline.external_dependency_errors=1",
+        ],
+        max_steps=14,
+        config_templates={
+            "deploy.yaml": (
+                "artifact_upload:\n"
+                "  endpoint: https://artifact-hub.example.com/upload\n"
+                "  max_retries: 1\n"
+                "  backoff_seconds: 0\n"
+            ),
+            "ci/network.env": "HTTP_PROXY=\nHTTPS_PROXY=\nNO_PROXY=localhost,127.0.0.1\n",
+        },
+        final_success_message="Pipeline recovered after handling transient network outage with resilient upload strategy.",
+        incident_chain=[
+            IncidentStep(
+                stage="deploy",
+                ambiguous_error="artifact upload failed due temporary DNS/network outage",
+                possible_causes=[
+                    "transient external DNS outage",
+                    "application upload logic bug",
+                ],
+                family_term_sets=[
+                    ["network", "dns", "outage"],
+                    ["timeout", "artifact", "upload"],
+                ],
+                true_cause="transient external dependency outage requires retry/backoff or proxy fallback",
+                hypothesis_terms=["network", "dns", "transient"],
+                log_variants=[
+                    [
+                        "artifact upload failed: dial tcp lookup artifact-hub.example.com: no such host",
+                        "retry budget exhausted after single immediate attempt",
+                    ],
+                    [
+                        "TLS handshake timeout during artifact upload",
+                        "external endpoint recovered in subsequent health probe",
+                    ],
+                ],
+                pattern_buckets=["network_dns"],
+                relevant_inspections=["view_logs", "inspect_config", "inspect_permissions"],
+                config_clues=[
+                    "deploy.yaml uses max_retries=1 and backoff_seconds=0 for artifact upload",
+                    "runbook recommends exponential backoff for transient dependency failures",
+                ],
+                docker_clues=[],
+                permission_clues=[
+                    "service account permissions for artifact upload are valid; failures are connectivity-related",
+                ],
+                correct_operation="modify_config",
+                correct_fix_terms=["retry", "backoff", "upload"],
+                partial_fix_terms=[
+                    ["configure", "proxy"],
+                    ["dns", "fallback"],
+                ],
+                partial_fix_reveal="Connectivity path improved, but resilient retry/backoff policy is still required for transient outages.",
+                red_herring_terms=[
+                    ["rewrite", "artifact", "client"],
+                    ["remove", "upload", "step"],
+                ],
+                partial_advances=False,
+            ),
+        ],
+        variants=[
+            ScenarioVariant(
+                variant_id="network_v1",
+                pipeline_alert_suffix="External registry endpoint instability detected.",
+                extra_log_lines=[
+                    "network probe: endpoint reachable after 90 seconds without code changes",
+                ],
+                extra_config_clues=[
+                    "sre guideline: classify this as transient dependency outage, not application logic regression",
+                ],
+            ),
+            ScenarioVariant(
+                variant_id="network_v2",
+                pipeline_alert_suffix="DNS failures spiked in artifact upload window.",
+                extra_log_lines=[
+                    "upload worker: name resolution recovered on later retry interval",
+                ],
+                extra_config_clues=[
+                    "incident note: use bounded exponential backoff for external dependency outages",
+                ],
+            ),
+        ],
+    ),
 }
+
+
+flaky_test_scenario: ScenarioCard = SCENARIOS["flaky"]
+network_outage_scenario: ScenarioCard = SCENARIOS["network"]
 
 
 def canonical_operation(operation: str) -> str:
@@ -638,7 +827,7 @@ def get_scenario(task_key: str) -> ScenarioCard:
 
 def list_task_keys() -> List[str]:
     """Return deterministic task order for baseline runs."""
-    return ["easy", "medium", "security", "hard"]
+    return ["easy", "flaky", "medium", "network", "security", "hard"]
 
 
 def sample_logs_for_issue(issue: IncidentStep, variant_selector: int, issue_seed: int) -> List[str]:

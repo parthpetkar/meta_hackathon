@@ -1,7 +1,7 @@
 """Tests for the Meta Hackathon CI/CD repair environment.
 
 Validates reset/step/state API behavior, grader output ranges, and
-full episode completion across all four tasks (easy/medium/security/hard).
+full episode completion across all supported tasks.
 """
 
 from __future__ import annotations
@@ -212,6 +212,15 @@ FALLBACK_TRAJECTORIES = {
         ("verify_fix", "", ""),
         ("finalize", "", ""),
     ],
+    "flaky": [
+        ("view_logs", "test", ""),
+        ("inspect_config", "test", ""),
+        ("set_hypothesis", "", "flaky timing-sensitive test is intermittently failing in CI"),
+        ("modify_config", "test", "add retry policy for flaky test isolation"),
+        ("rerun_pipeline", "", ""),
+        ("verify_fix", "", ""),
+        ("finalize", "", ""),
+    ],
     "medium": [
         ("view_logs", "build", ""),
         ("inspect_config", "build", ""),
@@ -221,6 +230,16 @@ FALLBACK_TRAJECTORIES = {
         ("rerun_pipeline", "", ""),
         ("set_hypothesis", "", "docker install order mismatch still causing flaky build"),
         ("modify_config", "build", "reorder docker install steps"),
+        ("rerun_pipeline", "", ""),
+        ("verify_fix", "", ""),
+        ("finalize", "", ""),
+    ],
+    "network": [
+        ("view_logs", "deploy", ""),
+        ("inspect_config", "deploy", ""),
+        ("inspect_permissions", "deploy", ""),
+        ("set_hypothesis", "", "transient network dns outage is blocking artifact upload"),
+        ("modify_config", "deploy", "configure retry backoff for artifact upload with dns fallback"),
         ("rerun_pipeline", "", ""),
         ("verify_fix", "", ""),
         ("finalize", "", ""),
@@ -491,10 +510,10 @@ class TestScenarios:
         scenario = get_scenario(task_key)
         assert len(scenario.variants) >= 1
 
-    def test_list_task_keys_has_four(self):
+    def test_list_task_keys_has_expected_catalog(self):
         keys = list_task_keys()
-        assert len(keys) == 4
-        assert set(keys) == {"easy", "medium", "security", "hard"}
+        assert len(keys) == 6
+        assert set(keys) == {"easy", "flaky", "medium", "network", "security", "hard"}
 
 
 # ---------------------------------------------------------------------------

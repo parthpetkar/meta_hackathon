@@ -15,7 +15,7 @@ except ImportError:
 
 SUCCESS_SCORE_THRESHOLD = float(os.getenv("SUCCESS_SCORE_THRESHOLD", "0.20"))
 EPISODES_PER_TASK = int(os.getenv("EVAL_EPISODES_PER_TASK", "3"))
-TASK_ORDER = ["easy", "medium", "security", "hard"]
+TASK_ORDER = ["easy", "flaky", "medium", "network", "security", "hard"]
 
 
 def scripted_action(task_name: str, step: int) -> Tuple[str, str, str]:
@@ -29,6 +29,15 @@ def scripted_action(task_name: str, step: int) -> Tuple[str, str, str]:
             ("verify_fix", "", ""),
             ("finalize", "", ""),
         ],
+        "flaky": [
+            ("view_logs", "test", ""),
+            ("inspect_config", "test", ""),
+            ("set_hypothesis", "", "flaky timing-sensitive test is intermittently failing in CI"),
+            ("modify_config", "test", "add retry policy for flaky test isolation"),
+            ("rerun_pipeline", "", ""),
+            ("verify_fix", "", ""),
+            ("finalize", "", ""),
+        ],
         "medium": [
             ("view_logs", "build", ""),
             ("inspect_config", "build", ""),
@@ -38,6 +47,16 @@ def scripted_action(task_name: str, step: int) -> Tuple[str, str, str]:
             ("rerun_pipeline", "", ""),
             ("set_hypothesis", "", "docker install order mismatch still causing flaky build"),
             ("modify_config", "build", "reorder docker install steps"),
+            ("rerun_pipeline", "", ""),
+            ("verify_fix", "", ""),
+            ("finalize", "", ""),
+        ],
+        "network": [
+            ("view_logs", "deploy", ""),
+            ("inspect_config", "deploy", ""),
+            ("inspect_permissions", "deploy", ""),
+            ("set_hypothesis", "", "transient network dns outage is blocking artifact upload"),
+            ("modify_config", "deploy", "configure retry backoff for artifact upload with dns fallback"),
             ("rerun_pipeline", "", ""),
             ("verify_fix", "", ""),
             ("finalize", "", ""),

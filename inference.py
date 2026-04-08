@@ -24,7 +24,7 @@ MAX_STEPS = 16
 TEMPERATURE = 0.1
 MAX_TOKENS = 128
 SUCCESS_SCORE_THRESHOLD = float(os.getenv("SUCCESS_SCORE_THRESHOLD", "0.20"))
-TASK_ORDER = ["easy", "medium", "security", "hard"]
+TASK_ORDER = ["easy", "flaky", "medium", "network", "security", "hard"]
 RESCUE_ON_NEGATIVE_REWARD = os.getenv("RESCUE_ON_NEGATIVE_REWARD", "false").lower() == "true"
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
 MESSAGE_WINDOW = 6
@@ -265,9 +265,17 @@ TASK_SKILL_CARDS: Dict[str, List[str]] = {
         "Focus on merge evidence: unresolved markers and strict merge policy clues.",
         "Use build-targeted modify_config to resolve conflict, then rerun, verify, finalize.",
     ],
+    "flaky": [
+        "Treat intermittent test failures as flaky/timing candidates when logs show pass-on-retry behavior.",
+        "Prefer retry policy or test isolation fixes over broad application logic rewrites.",
+    ],
     "medium": [
         "Solve dependency compatibility first (requests/urllib3), then Docker install order.",
         "Use add_dependency for version pinning and modify_config for Docker order corrections.",
+    ],
+    "network": [
+        "Classify DNS and timeout upload failures as transient external dependency outages when evidence supports it.",
+        "Use retry/backoff or proxy fallback mitigation; avoid rewriting application upload logic.",
     ],
     "security": [
         "Treat IAM writer permission and secret exposure as separate required remediations.",
@@ -756,6 +764,15 @@ def fallback_action(task_name: str, step: int) -> Tuple[str, str, str]:
             ("verify_fix", "", ""),
             ("finalize", "", ""),
         ],
+        "flaky": [
+            ("view_logs", "test", ""),
+            ("inspect_config", "test", ""),
+            ("set_hypothesis", "", "flaky timing-sensitive test is intermittently failing in CI"),
+            ("modify_config", "test", "add retry policy for flaky test isolation"),
+            ("rerun_pipeline", "", ""),
+            ("verify_fix", "", ""),
+            ("finalize", "", ""),
+        ],
         "medium": [
             ("view_logs", "build", ""),
             ("inspect_config", "build", ""),
@@ -765,6 +782,16 @@ def fallback_action(task_name: str, step: int) -> Tuple[str, str, str]:
             ("rerun_pipeline", "", ""),
             ("set_hypothesis", "", "docker install order mismatch still causing flaky build"),
             ("modify_config", "build", "reorder docker install steps"),
+            ("rerun_pipeline", "", ""),
+            ("verify_fix", "", ""),
+            ("finalize", "", ""),
+        ],
+        "network": [
+            ("view_logs", "deploy", ""),
+            ("inspect_config", "deploy", ""),
+            ("inspect_permissions", "deploy", ""),
+            ("set_hypothesis", "", "transient network dns outage is blocking artifact upload"),
+            ("modify_config", "deploy", "configure retry backoff for artifact upload with dns fallback"),
             ("rerun_pipeline", "", ""),
             ("verify_fix", "", ""),
             ("finalize", "", ""),
@@ -812,9 +839,23 @@ def fallback_action(task_name: str, step: int) -> Tuple[str, str, str]:
             ("verify_fix", "", ""),
             ("finalize", "", ""),
         ],
+        "flaky": [
+            ("set_hypothesis", "", "flaky test still needs retry-safe isolation"),
+            ("modify_config", "test", "add retry wrapper for flaky test"),
+            ("rerun_pipeline", "", ""),
+            ("verify_fix", "", ""),
+            ("finalize", "", ""),
+        ],
         "medium": [
             ("set_hypothesis", "", "dependency or docker order mismatch still active"),
             ("modify_config", "build", "reorder docker install steps"),
+            ("rerun_pipeline", "", ""),
+            ("verify_fix", "", ""),
+            ("finalize", "", ""),
+        ],
+        "network": [
+            ("set_hypothesis", "", "artifact upload outage still needs transient network handling"),
+            ("modify_config", "deploy", "configure retry backoff and proxy fallback for artifact upload"),
             ("rerun_pipeline", "", ""),
             ("verify_fix", "", ""),
             ("finalize", "", ""),

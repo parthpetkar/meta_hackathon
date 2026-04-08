@@ -20,6 +20,8 @@ except Exception:  # pragma: no cover - optional import safety
 try:
     from .graders import action_key, grade_episode, matches_terms, step_reward
     from .graders import (
+        classify_flaky_test_fix,
+        classify_network_outage_fix,
         classify_security_fix,
         easy_finalize_ready,
         hard_modify_reward_for_issue,
@@ -43,6 +45,8 @@ try:
 except ImportError:
     from server.graders import action_key, grade_episode, matches_terms, step_reward
     from server.graders import (
+        classify_flaky_test_fix,
+        classify_network_outage_fix,
         classify_security_fix,
         easy_finalize_ready,
         hard_modify_reward_for_issue,
@@ -368,6 +372,16 @@ class MetaHackathonCICDRepairEnvironment(Environment):
         if self._is_destructive_fix(value):
             return "destructive"
 
+        if self._scenario.task_id == "flaky_test" and operation == "modify_config":
+            flaky_fix_detected, _ = classify_flaky_test_fix(value)
+            if flaky_fix_detected:
+                return "correct"
+
+        if self._scenario.task_id == "network_outage" and operation == "modify_config":
+            network_fix_detected, _ = classify_network_outage_fix(value)
+            if network_fix_detected:
+                return "correct"
+
         if operation == issue.correct_operation and matches_terms(value, issue.correct_fix_terms):
             return "correct"
 
@@ -378,6 +392,16 @@ class MetaHackathonCICDRepairEnvironment(Environment):
         return "wrong"
 
     def _is_red_herring(self, issue: IncidentStep, value: str) -> bool:
+        if self._scenario.task_id == "flaky_test":
+            _, red_herring_detected = classify_flaky_test_fix(value)
+            if red_herring_detected:
+                return True
+
+        if self._scenario.task_id == "network_outage":
+            _, red_herring_detected = classify_network_outage_fix(value)
+            if red_herring_detected:
+                return True
+
         for terms in issue.red_herring_terms:
             if matches_terms(value, terms):
                 return True

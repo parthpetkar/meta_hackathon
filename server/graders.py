@@ -11,11 +11,20 @@ _NORMALIZE_REPLACEMENTS = {
     "old": "stale",
     "conflicting": "incompatible",
     "conflict": "incompatible",
+    "intermittent": "flaky",
+    "flake": "flaky",
     "permissions": "permission",
     "authorize": "permission",
     "authorisation": "permission",
     "authorization": "permission",
     "artifact registry": "artifactregistry",
+    "name resolution": "dns",
+    "no such host": "dns",
+    "back-off": "backoff",
+    "exponential backoff": "backoff",
+    "retries": "retry",
+    "retried": "retry",
+    "retrying": "retry",
     "writer role": "writer",
     "re-order": "reorder",
 }
@@ -61,6 +70,45 @@ def classify_security_fix(value: str) -> tuple[bool, bool]:
     iam_fix = contains_any_term(value, iam_terms)
     secret_fix = contains_any_term(value, secret_terms)
     return iam_fix, secret_fix
+
+
+def classify_flaky_test_fix(value: str) -> tuple[bool, bool]:
+    """Return (fix_detected, red_herring_detected) for flaky-test incidents."""
+    accepted_fix_sets = [
+        ["retry", "flaky", "test"],
+        ["isolate", "flaky", "test"],
+        ["quarantine", "flaky", "test"],
+    ]
+    red_herring_sets = [
+        ["rewrite", "checkout"],
+        ["remove", "assert"],
+        ["disable", "test"],
+        ["skip", "all", "test"],
+    ]
+
+    fix_detected = any(_contains_all(value, terms) for terms in accepted_fix_sets)
+    red_herring_detected = any(_contains_all(value, terms) for terms in red_herring_sets)
+    return fix_detected, red_herring_detected
+
+
+def classify_network_outage_fix(value: str) -> tuple[bool, bool]:
+    """Return (fix_detected, red_herring_detected) for network-outage incidents."""
+    accepted_fix_sets = [
+        ["retry", "backoff"],
+        ["retry", "upload"],
+        ["proxy", "artifact"],
+        ["dns", "fallback"],
+    ]
+    red_herring_sets = [
+        ["rewrite", "artifact", "client"],
+        ["remove", "upload", "step"],
+        ["hardcode", "ip"],
+        ["disable", "upload"],
+    ]
+
+    fix_detected = any(_contains_all(value, terms) for terms in accepted_fix_sets)
+    red_herring_detected = any(_contains_all(value, terms) for terms in red_herring_sets)
+    return fix_detected, red_herring_detected
 
 
 def easy_finalize_ready(history: List[Dict[str, str]], pipeline_stages: Dict[str, str]) -> bool:
