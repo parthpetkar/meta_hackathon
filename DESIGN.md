@@ -42,8 +42,10 @@ Deterministic score captures quality dimensions:
 - progression and resolution,
 - fix precision,
 - reasoning coverage,
-- efficiency,
+- efficiency (difficulty-aware action budgets),
 - penalties for redundancy/destructive actions.
+
+Hard-task calibration includes extra redundancy grace and a small cascade-completion bonus so multi-step service recovery is rewarded without collapsing the overall difficulty gradient.
 
 ### Optional rubric delayed reward
 

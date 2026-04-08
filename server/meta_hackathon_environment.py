@@ -216,7 +216,7 @@ class MetaHackathonCICDRepairEnvironment(Environment):
             "easy": 0.12,
             "medium": 0.11,
             "security": 0.10,
-            "hard": 0.06,
+            "hard": 0.08,
         }
         delayed_cap = delayed_cap_by_difficulty.get(self._scenario.difficulty, 0.10)
         delayed_reward = max(-delayed_cap, min(delayed_reward, delayed_cap))

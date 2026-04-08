@@ -118,6 +118,7 @@ def grade_episode(
     wrong_fixes: int,
 ) -> float:
     """Return deterministic final score in [0.0, 1.0] with difficulty calibration."""
+    difficulty_key = (difficulty or "").strip().lower()
     safe_max_steps = max(max_steps, 1)
     safe_issue_count = max(issue_count, 1)
 
@@ -136,8 +137,39 @@ def grade_episode(
     reasoning_quality = 0.55 * reasoning_coverage + 0.35 * reasoning_hypothesis + 0.10 * family_score
 
     action_count = max(action_count, 1)
-    efficiency_base = max(0.0, 1.0 - max(0, action_count - (safe_issue_count + 3)) / safe_max_steps)
-    redundancy_penalty = min(redundant_actions * 0.04, 0.25)
+    efficiency_targets = {
+        "easy": safe_issue_count + 4,
+        "medium": safe_issue_count + 7,
+        "security": safe_issue_count + 8,
+        "hard": safe_issue_count + 10,
+    }
+    efficiency_target = efficiency_targets.get(difficulty_key, safe_issue_count + 6)
+    efficiency_overrun = max(0, action_count - efficiency_target)
+    efficiency_base = max(0.0, 1.0 - (efficiency_overrun / safe_max_steps))
+
+    redundancy_grace = {
+        "easy": 0,
+        "medium": 0,
+        "security": 1,
+        "hard": 2,
+    }
+    redundancy_rates = {
+        "easy": 0.04,
+        "medium": 0.035,
+        "security": 0.03,
+        "hard": 0.02,
+    }
+    redundancy_caps = {
+        "easy": 0.25,
+        "medium": 0.22,
+        "security": 0.18,
+        "hard": 0.12,
+    }
+    effective_redundant_actions = max(0, redundant_actions - redundancy_grace.get(difficulty_key, 0))
+    redundancy_penalty = min(
+        effective_redundant_actions * redundancy_rates.get(difficulty_key, 0.03),
+        redundancy_caps.get(difficulty_key, 0.20),
+    )
     efficiency = max(0.0, efficiency_base - redundancy_penalty)
 
     quality = (
@@ -147,6 +179,12 @@ def grade_episode(
         + 0.24 * reasoning_quality
         + 0.16 * efficiency
     )
+
+    if difficulty_key == "hard":
+        # Hard scenarios require a longer cascade and should not over-penalize
+        # trajectories that complete all linked remediations with strong reasoning.
+        cascade_bonus = (0.05 * progression_score * fix_precision) + (0.03 * reasoning_quality)
+        quality = min(1.0, quality + cascade_bonus)
 
     behavior_penalty = min(destructive_actions * 0.08 + wrong_fixes * 0.02, 0.20)
     health_penalty = min(max(0.0, 1.0 - pipeline_health) * 0.10, 0.10)
@@ -158,9 +196,9 @@ def grade_episode(
         "easy": (0.34, 0.30),
         "medium": (0.28, 0.24),
         "security": (0.24, 0.22),
-        "hard": (0.18, 0.20),
+        "hard": (0.20, 0.22),
     }
-    base, scale = profile.get((difficulty or "").strip().lower(), (0.28, 0.24))
+    base, scale = profile.get(difficulty_key, (0.28, 0.24))
     score = base + (scale * quality)
 
     if not final_resolved:

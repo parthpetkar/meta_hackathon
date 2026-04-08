@@ -84,32 +84,39 @@ Per-step reward schema:
 | `set_hypothesis` (wrong) | `-0.10` |
 | `inspect_*` (relevant stage) | `+0.12` |
 | `inspect_*` (irrelevant stage) | `-0.05` |
-| `modify_config` (correct fix) | `+0.35` |
-| `modify_config` (wrong fix) | `-0.20` |
-| `add_dependency` (correct) | `+0.25` |
+| `modify_config` (correct fix, default path) | `+0.35` |
+| `modify_config` (partial fix, default path) | `+0.20` |
+| `modify_config` (wrong/destructive fix, default path) | `-0.20` |
+| `add_dependency` (correct and non-redundant) | `+0.25` |
 | `add_dependency` (wrong/redundant) | `-0.18` |
 | `rerun_pipeline` (after valid fix) | `+0.18` |
 | `rerun_pipeline` (premature) | `+0.05` |
 | `verify_fix` (valid post-rerun verification) | `+0.16` |
 | `verify_fix` (without valid rerun evidence) | `-0.06` |
 | `finalize` (correct) | `+0.25` |
+| `finalize` (security partial remediation) | `+0.20` |
 | `finalize` (incorrect state) | `-0.15` |
 
 Task-specific reward extensions:
 
+- Hard task `modify_config` override by cascade stage: issue 1 `+0.35`, issue 2 `+0.20`, issue 3 `+0.35`.
 - Hard task red herring action: additional `-0.15` when a plausible but incorrect shortcut is attempted.
 - Security task: finalizing after fixing exactly one of two required issues gives partial credit; finalizing after both issues are fixed gives the standard `+0.25` terminal finalize reward.
+
+Important runtime note:
+
+- At terminal step only, the emitted `reward` includes delayed rubric blending (`reward = step_reward + delayed_reward`). This is why final-step logs can be above base table values (for example, `finalize` can appear as `0.33` to `0.36` when rubric is enabled).
 
 Deterministic terminal score is clipped to `[0.0, 1.0]` and difficulty-calibrated to preserve the expected gradient:
 
 - Easy target: about `0.55` to `0.65`
 - Medium target: about `0.40` to `0.50`
 - Security target: between medium and hard
-- Hard target: about `0.25` to `0.38`
+- Hard target: about `0.30` to `0.44`
 
-When rubric scoring is enabled, delayed reward is blended at terminal step and capped by difficulty to preserve separation across tasks (`easy: 0.12`, `medium: 0.11`, `security: 0.10`, `hard: 0.06`). This keeps hard-task blended scores in-band while still letting semantic rubric quality matter on the multi-issue cascade.
+When rubric scoring is enabled, delayed reward is blended at terminal step and capped by difficulty to preserve separation across tasks (`easy: 0.12`, `medium: 0.11`, `security: 0.10`, `hard: 0.08`). This keeps hard-task blended scores in-band while still letting semantic rubric quality matter on the multi-issue cascade.
 
-Rubric delayed reward (optional):
+Rubric delayed reward:
 
 - When `META_HACKATHON_RUBRIC_ENABLED=true`, the environment computes an additional terminal semantic score for hypothesis quality.
 - The semantic score is produced by an OpenEnv `LLMJudge` adapter when available.
@@ -227,6 +234,8 @@ Optional local inference debug variables:
 - `INFERENCE_DETAIL_MAX_ITEMS` (default `3`, controls list preview size in `[DETAIL]` lines)
 - `MAX_MODEL_CALLS_PER_TASK` (defaults to task step budget; set `0` to force deterministic fallback for smoke tests)
 - `PREFER_DETERMINISTIC_ACTIONS` (`false` by default; set `true` only for scripted-regression comparisons)
+- `MAX_CONSECUTIVE_TOOL_CALL_MISSES` (default `4`; model tool-call misses tolerated before disabling model calls)
+- `MIN_MODEL_CALLS_BEFORE_FORCED_FALLBACK` (default `4`; minimum model-call attempts before miss-based fallback disable can trigger)
 
 ## Provenance Audit Trail
 
@@ -312,10 +321,10 @@ uv run evaluate
 
 Observed summary means:
 
-- easy: `avg_score=0.730`
-- medium: `avg_score=0.603`
-- security: `avg_score=0.529`
-- hard: `avg_score=0.417` (`det=0.357`, `redundant_actions=0` on the canonical hard baseline, with hard delayed-reward cap `0.06`)
+- easy: `avg_score=0.735`
+- medium: `avg_score=0.617`
+- security: `avg_score=0.542`
+- hard: `avg_score=0.500` (`det=0.420`, `redundant_actions=0` on the canonical hard baseline, with hard delayed-reward cap `0.08`)
 
 Notes:
 

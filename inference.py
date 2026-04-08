@@ -30,6 +30,11 @@ HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
 MESSAGE_WINDOW = 6
 MAX_MODEL_CALLS_PER_TASK = int(os.getenv("MAX_MODEL_CALLS_PER_TASK", str(MAX_STEPS)))
 PREFER_DETERMINISTIC_ACTIONS = os.getenv("PREFER_DETERMINISTIC_ACTIONS", "false").lower() == "true"
+MAX_CONSECUTIVE_TOOL_CALL_MISSES = max(1, int(os.getenv("MAX_CONSECUTIVE_TOOL_CALL_MISSES", "4")))
+MIN_MODEL_CALLS_BEFORE_FORCED_FALLBACK = max(
+    1,
+    int(os.getenv("MIN_MODEL_CALLS_BEFORE_FORCED_FALLBACK", "4")),
+)
 INFERENCE_VERBOSE = os.getenv("INFERENCE_VERBOSE", "false").strip().lower() == "true"
 INFERENCE_DETAIL_MAX_ITEMS = max(1, int(os.getenv("INFERENCE_DETAIL_MAX_ITEMS", "3")))
 VALID_OPERATIONS = {
@@ -673,6 +678,40 @@ def pre_finalize_guard_action(observation: MetaHackathonObservation) -> Tuple[st
     return "rerun_pipeline", "", ""
 
 
+def _last_operation(history: List[str]) -> str:
+    """Extract the previous operation from action history lines."""
+    if not history:
+        return ""
+    prior = history[-1].split("->", 1)[0].strip()
+    return prior.split("|", 1)[0].strip().lower()
+
+
+def progression_guard_action(
+    observation: MetaHackathonObservation,
+    history: List[str],
+    operation: str,
+) -> Tuple[str, str, str] | None:
+    """Force progression actions when the environment exposes strict next-step requirements."""
+    metadata = observation.metadata if isinstance(observation.metadata, dict) else {}
+    verification_required = bool(metadata.get("verification_required")) if metadata else False
+    verified_since_last_rerun = bool(metadata.get("verified_since_last_rerun")) if metadata else False
+
+    if verification_required and operation != "verify_fix":
+        return "verify_fix", "", ""
+
+    if ready_to_finalize(observation) and verified_since_last_rerun and operation != "finalize":
+        return "finalize", "", ""
+
+    previous_operation = _last_operation(history)
+    if (
+        previous_operation in {"modify_config", "add_dependency"}
+        and operation not in {"rerun_pipeline", "verify_fix", "finalize"}
+    ):
+        return "rerun_pipeline", "", ""
+
+    return None
+
+
 def should_force_fallback(
     *,
     step: int,
@@ -693,7 +732,8 @@ def should_force_fallback(
         if len(set(last_ops)) == 1 and last_ops[0] in {"set_hypothesis", "modify_config", "add_dependency"}:
             return True
 
-    if observation.redundant_actions >= 3 and not observation.incident_resolved:
+    redundancy_threshold = 4 if (observation.difficulty or "").strip().lower() == "hard" else 3
+    if observation.redundant_actions >= redundancy_threshold and not observation.incident_resolved:
         return True
 
     # Consecutive reruns without improvement generally indicate semantic drift.
@@ -920,7 +960,10 @@ def run_task(client: OpenAI, session: requests.Session, fallback_task_name: str)
 
                 if tool_call_id is None:
                     tool_call_misses += 1
-                    if tool_call_misses >= 2:
+                    if (
+                        tool_call_misses >= MAX_CONSECUTIVE_TOOL_CALL_MISSES
+                        and model_calls_used >= MIN_MODEL_CALLS_BEFORE_FORCED_FALLBACK
+                    ):
                         disable_model_calls = True
                 else:
                     tool_call_misses = 0
@@ -972,6 +1015,15 @@ def run_task(client: OpenAI, session: requests.Session, fallback_task_name: str)
                 assistant_message = {
                     "role": "assistant",
                     "content": f"Guarded action selected before finalize: {operation}|{target}|{value}",
+                }
+                tool_call_id = None
+
+            guarded_progression = progression_guard_action(observation, history, operation)
+            if guarded_progression is not None:
+                operation, target, value = guarded_progression
+                assistant_message = {
+                    "role": "assistant",
+                    "content": f"Progression guard action selected: {operation}|{target}|{value}",
                 }
                 tool_call_id = None
 
