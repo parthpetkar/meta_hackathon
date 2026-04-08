@@ -13,6 +13,9 @@ import pytest
 # Disable rubric during tests to avoid external API calls.
 os.environ["META_HACKATHON_RUBRIC_ENABLED"] = "false"
 
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from models import MetaHackathonAction, MetaHackathonObservation
 from server.meta_hackathon_environment import MetaHackathonCICDRepairEnvironment
 from server.graders import grade_episode, step_reward
@@ -161,6 +164,15 @@ class TestStep:
         easy_env.step(MetaHackathonAction(operation="view_logs", target="build"))
         obs2 = easy_env.step(MetaHackathonAction(operation="view_logs", target="build"))
         assert obs2.redundant_actions >= 1
+
+    def test_malformed_add_dependency_returns_structured_error(self, easy_env):
+        easy_env.reset()
+        obs = easy_env.step(MetaHackathonAction(operation="add_dependency", target="build", value=""))
+        
+        # It should return a structured error
+        assert "Malformed action: add_dependency requires a 'value' string" in obs.metadata.get("error", "")
+        # Reward should be partial penalty (-0.05) instead of full penalty (-0.18)
+        assert -0.06 <= obs.reward <= -0.04
 
 
 # ---------------------------------------------------------------------------
@@ -483,3 +495,37 @@ class TestScenarios:
         keys = list_task_keys()
         assert len(keys) == 4
         assert set(keys) == {"easy", "medium", "security", "hard"}
+
+
+# ---------------------------------------------------------------------------
+# Rubric Judge Caching tests
+# ---------------------------------------------------------------------------
+
+
+class TestRubricJudgeCaching:
+    """Verify rubric judge efficiently caches hypotheses."""
+
+    def test_rubric_judge_caches_hypothesis(self):
+        from server.rubric_judge import OpenEnvLLMJudgeAdapter, _JUDGE_CACHE
+        # Clear cache for isolated test
+        _JUDGE_CACHE.clear()
+
+        judge = OpenEnvLLMJudgeAdapter(enabled=False, model_name="test", timeout_seconds=1)
+        payload = {
+            "task_id": "caching_test",
+            "evidence": {"hypothesis_history": ["this is a test hypothesis"]}
+        }
+
+        # First call should miss cache and use heuristic fallback (since enabled=False)
+        result1 = judge.evaluate_hypothesis_quality(payload)
+        
+        # Manually alter the cached result string to prove the second call reads from cache
+        cache_key = judge._prompt_cache_key(payload)
+        assert cache_key in _JUDGE_CACHE
+        _JUDGE_CACHE[cache_key].rationale = "cached_rationale_string"
+
+        # Second call should hit the cache instead of computing fallback again
+        result2 = judge.evaluate_hypothesis_quality(payload)
+        assert result2.rationale == "cached_rationale_string"
+        assert result2.score == result1.score
+

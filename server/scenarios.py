@@ -124,7 +124,7 @@ SCENARIOS: Dict[str, ScenarioCard] = {
             "pipeline.retry_count=0",
             "merge.conflict_files=1",
         ],
-        max_steps=8,
+        max_steps=12,
         config_templates={
             "ci.yaml": "stages: [build, test, deploy]\nmerge_policy: strict\nbranch_sync: false\n",
             "services/api/routes.py": "<<<<<<< HEAD\nhandler_v1()\n=======\nhandler_v2()\n>>>>>>> feature",
@@ -207,7 +207,7 @@ SCENARIOS: Dict[str, ScenarioCard] = {
             "build.layer_cache_hit_ratio=0.19",
             "python.install_failures=1",
         ],
-        max_steps=11,
+        max_steps=15,
         config_templates={
             "requirements.txt": "requests==2.20.0\nurllib3==2.1.0\n",
             "Dockerfile": "FROM python:3.11-slim\nCOPY . /app\nRUN pip install -r requirements.txt\nRUN apt-get install -y build-essential\n",
@@ -331,7 +331,7 @@ SCENARIOS: Dict[str, ScenarioCard] = {
             "iam.denied_events=2",
             "secrets.scan_findings=1",
         ],
-        max_steps=13,
+        max_steps=16,
         config_templates={
             "deploy.yaml": "service_account: ci-deployer\nregistry_repo: team/secure-api\n",
             "iam.txt": "ci-deployer: artifactregistry.reader\n",
@@ -461,7 +461,7 @@ SCENARIOS: Dict[str, ScenarioCard] = {
             "deploy.error_rate=0.44",
             "iam.denied_events=4",
         ],
-        max_steps=14,
+        max_steps=16,
         config_templates={
             "deploy.yaml": (
                 "services:\n"

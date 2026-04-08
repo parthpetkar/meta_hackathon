@@ -225,6 +225,7 @@ def step_reward(
     finalize_correct: bool,
     finalize_partial: bool,
     finalize_incorrect: bool,
+    malformed_action_hint: bool = False,
     modify_reward_override: Optional[float] = None,
     finalize_reward_override: Optional[float] = None,
 ) -> float:
@@ -262,6 +263,8 @@ def step_reward(
     if operation == "add_dependency":
         if fix_correct_for_issue and not was_redundant:
             reward += 0.25
+        elif malformed_action_hint:
+            reward -= 0.05
         else:
             reward -= 0.18
 

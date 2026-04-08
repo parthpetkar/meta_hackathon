@@ -9,8 +9,8 @@
 import os
 from uuid import uuid4
 
-from openenv.core.env_server.interfaces import Environment
-from openenv.core.env_server.types import State
+from openenv.core.env_server.interfaces import Environment  # type: ignore
+from openenv.core.env_server.types import State  # type: ignore
 
 try:
     from dotenv import load_dotenv
@@ -568,6 +568,8 @@ class MetaHackathonCICDRepairEnvironment(Environment):
         finalize_correct = False
         finalize_partial = False
         finalize_incorrect = False
+        malformed_action_hint = False
+        step_error_message: str | None = None
         modify_reward_override: float | None = None
         finalize_reward_override: float | None = None
 
@@ -638,7 +640,14 @@ class MetaHackathonCICDRepairEnvironment(Environment):
             if not self._used_inspections:
                 self._append_unique(self._findings, "Fix attempted before inspection evidence collection.")
 
-            if self._scenario.difficulty == "hard" and operation == "modify_config":
+            if operation == "add_dependency" and not value:
+                fix_partial_for_issue = True
+                malformed_action_hint = True
+                self._pending_fix_outcome = "partial"
+                step_error_message = "Malformed action: add_dependency requires a 'value' string specifying the target version pin."
+                self._append_unique(self._findings, "add_dependency action received without a dependency value string to apply.")
+                self._recovery_cost += 1
+            elif self._scenario.difficulty == "hard" and operation == "modify_config":
                 red_herring_fix = False
                 hard_assessment, hard_reward = hard_modify_reward_for_issue(self._current_issue_index)
                 modify_reward_override = hard_reward
@@ -856,6 +865,7 @@ class MetaHackathonCICDRepairEnvironment(Environment):
             finalize_correct=finalize_correct,
             finalize_partial=finalize_partial,
             finalize_incorrect=finalize_incorrect,
+            malformed_action_hint=malformed_action_hint,
             modify_reward_override=modify_reward_override,
             finalize_reward_override=finalize_reward_override,
         )
@@ -895,6 +905,9 @@ class MetaHackathonCICDRepairEnvironment(Environment):
                 **self._audit_metadata_payload(),
             },
         )
+        
+        if step_error_message:
+            obs.metadata["error"] = step_error_message
 
         if done:
             deterministic_score = grade_episode(
