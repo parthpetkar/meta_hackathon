@@ -58,8 +58,8 @@ except ImportError:
     from models import MetaHackathonAction, MetaHackathonObservation
 
 
-class MetaHackathonEnvironment(Environment):
-    """CI/CD repair simulator with staged debugging and pattern-grounded variability."""
+class MetaHackathonCICDRepairEnvironment(Environment):
+    """Extensible CI/CD repair simulator with staged debugging and pattern-grounded variability."""
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
 
@@ -125,6 +125,9 @@ class MetaHackathonEnvironment(Environment):
         self._easy_build_passing = False
         self._security_iam_fixed = False
         self._security_secret_fixed = False
+        self._last_rerun_progressed = False
+        self._verified_for_latest_rerun = False
+        self._inspected_since_last_rerun = True
 
     def _current_issue(self) -> IncidentStep:
         index = min(self._current_issue_index, len(self._scenario.incident_chain) - 1)
@@ -135,6 +138,16 @@ class MetaHackathonEnvironment(Environment):
         for issue in self._scenario.incident_chain:
             required.update(issue.relevant_inspections)
         return required
+
+    def _can_finalize_now(self) -> bool:
+        if self._scenario.difficulty == "easy":
+            return easy_finalize_ready(self._history, self._pipeline_stages) and self._verified_for_latest_rerun
+
+        if self._scenario.difficulty == "security":
+            both_fixed = self._security_iam_fixed and self._security_secret_fixed
+            return both_fixed and self._incident_resolved and self._verified_for_latest_rerun
+
+        return self._incident_resolved and self._verified_for_latest_rerun
 
     def _base_observation(self, *, reward: float, done: bool, metadata: dict | None = None) -> MetaHackathonObservation:
         action_history = [
@@ -365,6 +378,9 @@ class MetaHackathonEnvironment(Environment):
         self._easy_build_passing = False
         self._security_iam_fixed = False
         self._security_secret_fixed = False
+        self._last_rerun_progressed = False
+        self._verified_for_latest_rerun = False
+        self._inspected_since_last_rerun = True
 
         self._set_stage_progress_after_advance()
         self._handle_view_logs()
@@ -376,6 +392,9 @@ class MetaHackathonEnvironment(Environment):
                 "task_key": selected_key,
                 "max_steps": self._scenario.max_steps,
                 "variant_id": self._current_variant().variant_id,
+                "ready_to_finalize": self._can_finalize_now(),
+                "verification_required": bool(self._incident_resolved and not self._verified_for_latest_rerun),
+                "verified_since_last_rerun": self._verified_for_latest_rerun,
                 "supported_operations": SUPPORTED_OPERATIONS,
                 "canonical_operations": CANONICAL_OPERATIONS,
             },
@@ -417,6 +436,8 @@ class MetaHackathonEnvironment(Environment):
         is_destructive_fix = False
         red_herring_fix = False
         rerun_after_valid_fix = False
+        verify_success = False
+        verify_failed = False
         finalize_correct = False
         finalize_partial = False
         finalize_incorrect = False
@@ -429,21 +450,25 @@ class MetaHackathonEnvironment(Environment):
             inspection_relevant = self._is_inspection_relevant(issue, operation)
             self._handle_view_logs()
             self._used_inspections.add(operation)
+            self._inspected_since_last_rerun = True
 
         elif operation == "inspect_config":
             inspection_relevant = self._is_inspection_relevant(issue, operation)
             self._handle_inspect_config()
             self._used_inspections.add(operation)
+            self._inspected_since_last_rerun = True
 
         elif operation == "inspect_dockerfile":
             inspection_relevant = self._is_inspection_relevant(issue, operation)
             self._handle_inspect_dockerfile()
             self._used_inspections.add(operation)
+            self._inspected_since_last_rerun = True
 
         elif operation == "inspect_permissions":
             inspection_relevant = self._is_inspection_relevant(issue, operation)
             self._handle_inspect_permissions()
             self._used_inspections.add(operation)
+            self._inspected_since_last_rerun = True
 
         elif operation == "set_hypothesis":
             self._current_hypothesis = value
@@ -451,7 +476,15 @@ class MetaHackathonEnvironment(Environment):
             prior_attempts = self._hypothesis_attempts_by_issue.get(self._current_issue_index, 0)
             self._hypothesis_attempts_by_issue[self._current_issue_index] = prior_attempts + 1
 
-            hypothesis_correct = matches_terms(value, issue.hypothesis_terms)
+            if self._scenario.difficulty == "hard" and self._current_issue_index >= 2 and not self._inspected_since_last_rerun:
+                self._append_unique(
+                    self._findings,
+                    "Hard-task hypothesis rejected: inspect evidence after rerun before asserting timeout diagnosis.",
+                )
+                hypothesis_correct = False
+            else:
+                hypothesis_correct = matches_terms(value, issue.hypothesis_terms)
+
             if hypothesis_correct:
                 if prior_attempts == 0:
                     hypothesis_correct_first_try = True
@@ -474,6 +507,7 @@ class MetaHackathonEnvironment(Environment):
 
         elif operation in {"modify_config", "add_dependency"}:
             self._attempted_fix = value
+            self._verified_for_latest_rerun = False
             if not self._used_inspections:
                 self._append_unique(self._findings, "Fix attempted before inspection evidence collection.")
 
@@ -544,6 +578,9 @@ class MetaHackathonEnvironment(Environment):
         elif operation == "rerun_pipeline":
             self._recovery_cost += 1
             rerun_after_valid_fix = self._pending_fix_outcome in {"correct", "partial"}
+            self._last_rerun_progressed = rerun_after_valid_fix
+            self._verified_for_latest_rerun = False
+            self._inspected_since_last_rerun = False
 
             if self._scenario.difficulty == "easy":
                 has_hypothesis = any(item.get("operation") == "set_hypothesis" for item in self._history)
@@ -585,12 +622,60 @@ class MetaHackathonEnvironment(Environment):
             else:
                 self._append_unique(self._findings, "Rerun without remediation did not improve pipeline health.")
 
+            if rerun_after_valid_fix or self._incident_resolved:
+                self._append_unique(
+                    self._findings,
+                    "Run verify_fix before finalize to confirm the failure signature is gone.",
+                )
+
+        elif operation == "verify_fix":
+            prior_actions = self._history[:-1]
+            last_rerun_index = max(
+                (index for index, item in enumerate(prior_actions) if item.get("operation") == "rerun_pipeline"),
+                default=-1,
+            )
+
+            if last_rerun_index < 0:
+                verify_failed = True
+                self._append_unique(self._findings, "Verification requires a rerun_pipeline action first.")
+            elif self._verified_for_latest_rerun:
+                verify_failed = True
+                self._append_unique(
+                    self._findings,
+                    "Latest rerun is already verified; apply a new fix before verifying again.",
+                )
+            elif any(
+                item.get("operation") in {"modify_config", "add_dependency"}
+                for item in prior_actions[last_rerun_index + 1 :]
+            ):
+                verify_failed = True
+                self._append_unique(
+                    self._findings,
+                    "Verification must be performed after rerun and before introducing another fix.",
+                )
+            elif self._last_rerun_progressed or self._incident_resolved:
+                verify_success = True
+                self._verified_for_latest_rerun = True
+                self._append_unique(
+                    self._findings,
+                    "Verification confirms the latest rerun addressed the active failure signal.",
+                )
+            else:
+                verify_failed = True
+                self._append_unique(
+                    self._findings,
+                    "Verification failed: rerun evidence still indicates unresolved failures.",
+                )
+
         elif operation == "finalize":
             if self._scenario.difficulty == "easy":
-                if easy_finalize_ready(self._history, self._pipeline_stages):
+                if easy_finalize_ready(self._history, self._pipeline_stages) and self._verified_for_latest_rerun:
                     self._incident_resolved = True
                     finalize_correct = True
                     self._append_unique(self._findings, self._scenario.final_success_message)
+                elif easy_finalize_ready(self._history, self._pipeline_stages):
+                    finalize_incorrect = True
+                    self._append_unique(self._findings, "Finalization rejected: run verify_fix after rerun_pipeline.")
                 else:
                     finalize_incorrect = True
                     self._append_unique(self._findings, "Finalization rejected: unresolved stages remain.")
@@ -598,10 +683,13 @@ class MetaHackathonEnvironment(Environment):
             elif self._scenario.difficulty == "security":
                 both_fixed = self._security_iam_fixed and self._security_secret_fixed
                 one_fixed = self._security_iam_fixed or self._security_secret_fixed
-                if both_fixed:
+                if both_fixed and self._incident_resolved and self._verified_for_latest_rerun:
                     self._incident_resolved = True
                     finalize_correct = True
                     self._append_unique(self._findings, self._scenario.final_success_message)
+                elif both_fixed and not self._verified_for_latest_rerun:
+                    finalize_incorrect = True
+                    self._append_unique(self._findings, "Finalization rejected: run verify_fix after rerun_pipeline.")
                 elif one_fixed:
                     finalize_partial = True
                     self._append_unique(
@@ -612,9 +700,12 @@ class MetaHackathonEnvironment(Environment):
                     finalize_incorrect = True
                     self._append_unique(self._findings, "Finalization rejected: unresolved stages remain.")
 
-            elif self._incident_resolved:
+            elif self._incident_resolved and self._verified_for_latest_rerun:
                 finalize_correct = True
                 self._append_unique(self._findings, self._scenario.final_success_message)
+            elif self._incident_resolved and not self._verified_for_latest_rerun:
+                finalize_incorrect = True
+                self._append_unique(self._findings, "Finalization rejected: run verify_fix after rerun_pipeline.")
             else:
                 finalize_incorrect = True
                 self._append_unique(self._findings, "Finalization rejected: unresolved stages remain.")
@@ -633,6 +724,8 @@ class MetaHackathonEnvironment(Environment):
             is_destructive_fix=is_destructive_fix,
             red_herring_fix=red_herring_fix,
             rerun_after_valid_fix=rerun_after_valid_fix,
+            verify_success=verify_success,
+            verify_failed=verify_failed,
             finalize_correct=finalize_correct,
             finalize_partial=finalize_partial,
             finalize_incorrect=finalize_incorrect,
@@ -647,7 +740,7 @@ class MetaHackathonEnvironment(Environment):
             done = True
         if self._state.step_count >= self._scenario.max_steps:
             done = True
-        if was_done_before_step and operation != "finalize":
+        if was_done_before_step and operation not in {"verify_fix", "finalize"}:
             done = True
 
         obs = self._base_observation(
@@ -667,6 +760,9 @@ class MetaHackathonEnvironment(Environment):
                 "active_issue_index": self._current_issue_index,
                 "resolved_issue_count": self._solved_issues,
                 "issue_count": len(self._scenario.incident_chain),
+                "ready_to_finalize": self._can_finalize_now(),
+                "verification_required": bool(self._incident_resolved and not self._verified_for_latest_rerun),
+                "verified_since_last_rerun": self._verified_for_latest_rerun,
                 "supported_operations": SUPPORTED_OPERATIONS,
                 "canonical_operations": CANONICAL_OPERATIONS,
             },
@@ -701,3 +797,7 @@ class MetaHackathonEnvironment(Environment):
     def state(self) -> State:
         """Get the current environment state."""
         return self._state
+
+
+# Backward-compatible alias used by existing clients and docs.
+MetaHackathonEnvironment = MetaHackathonCICDRepairEnvironment

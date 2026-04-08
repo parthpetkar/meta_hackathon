@@ -37,16 +37,16 @@ except Exception as e:  # pragma: no cover
 
 try:
     from ..models import MetaHackathonAction, MetaHackathonObservation
-    from .meta_hackathon_environment import MetaHackathonEnvironment
+    from .meta_hackathon_environment import MetaHackathonCICDRepairEnvironment
 except (ImportError, ModuleNotFoundError):
     from models import MetaHackathonAction, MetaHackathonObservation
-    from server.meta_hackathon_environment import MetaHackathonEnvironment
+    from server.meta_hackathon_environment import MetaHackathonCICDRepairEnvironment
 
 
-_SHARED_REST_ENV = MetaHackathonEnvironment()
+_SHARED_REST_ENV = MetaHackathonCICDRepairEnvironment()
 
 
-def _shared_env_factory() -> MetaHackathonEnvironment:
+def _shared_env_factory() -> MetaHackathonCICDRepairEnvironment:
     # OpenEnv HTTP handlers instantiate env per request; sharing one instance preserves
     # episode continuity for /reset + /step in REST mode.
     return _SHARED_REST_ENV

@@ -20,8 +20,8 @@ class MetaHackathonAction(Action):
         description=(
             "Operation name. Preferred values: view_logs, inspect_config, "
             "inspect_dockerfile, modify_config, add_dependency, rerun_pipeline, "
-            "finalize, inspect_permissions, set_hypothesis. Legacy aliases are accepted "
-            "for backward compatibility."
+            "verify_fix, finalize, inspect_permissions, set_hypothesis. "
+            "Legacy aliases are accepted for backward compatibility."
         ),
     )
     target: str = Field(

@@ -182,6 +182,8 @@ def step_reward(
     is_destructive_fix: bool,
     red_herring_fix: bool,
     rerun_after_valid_fix: bool,
+    verify_success: bool,
+    verify_failed: bool,
     finalize_correct: bool,
     finalize_partial: bool,
     finalize_incorrect: bool,
@@ -230,6 +232,12 @@ def step_reward(
             reward += 0.18
         else:
             reward += 0.05
+
+    if operation == "verify_fix":
+        if verify_success:
+            reward += 0.16
+        elif verify_failed:
+            reward -= 0.06
 
     if operation == "finalize":
         if finalize_reward_override is not None:

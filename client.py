@@ -32,7 +32,7 @@ class MetaHackathonEnv(
         ...     print(result.observation.task_id)
         ...
         ...     result = client.step(
-        ...         MetaHackathonAction(operation="inspect_pipeline", target="", value="")
+        ...         MetaHackathonAction(operation="view_logs", target="build", value="")
         ...     )
         ...     print(result.observation.pipeline_status)
 
@@ -42,7 +42,7 @@ class MetaHackathonEnv(
         >>> try:
         ...     result = client.reset()
         ...     result = client.step(
-        ...         MetaHackathonAction(operation="inspect_logs", target="", value="")
+        ...         MetaHackathonAction(operation="inspect_config", target="build", value="")
         ...     )
         ... finally:
         ...     client.close()

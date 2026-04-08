@@ -19,7 +19,7 @@ API_KEY = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or os.getenv("API
 API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
 MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
 BENCHMARK = os.getenv("META_HACKATHON_BENCHMARK", "meta_hackathon")
-MAX_STEPS = 12
+MAX_STEPS = 16
 TEMPERATURE = 0.1
 MAX_TOKENS = 128
 SUCCESS_SCORE_THRESHOLD = float(os.getenv("SUCCESS_SCORE_THRESHOLD", "0.20"))
@@ -36,6 +36,7 @@ VALID_OPERATIONS = {
     "modify_config",
     "add_dependency",
     "rerun_pipeline",
+    "verify_fix",
     "finalize",
     "inspect_permissions",
     "set_hypothesis",
@@ -189,6 +190,18 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "verify_fix",
+            "description": "Confirm that the latest rerun removed the target failure before finalization.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "finalize",
             "description": "End the episode and request final scoring.",
             "parameters": {
@@ -206,14 +219,16 @@ SYSTEM_PROMPT = textwrap.dedent(
 
         Rules:
         - Always set_hypothesis BEFORE applying any fix
+        - Gather evidence (view_logs/inspect_*) before setting a new hypothesis
         - Inspect only relevant stages (wrong stage = penalty)
         - Only rerun_pipeline AFTER applying a fix
-        - Only finalize when ALL issues are resolved
+        - Always run verify_fix after rerun_pipeline and before finalize
+        - Only finalize when ALL issues are resolved and verification has passed
         - Avoid redundant or repeated actions
 
         Tool sequence guidance:
         view_logs -> inspect relevant config/dockerfile/permissions -> set_hypothesis ->
-        apply fix (modify_config or add_dependency) -> rerun_pipeline -> finalize
+        apply fix (modify_config or add_dependency) -> rerun_pipeline -> verify_fix -> finalize
     """
 ).strip()
 
@@ -285,6 +300,8 @@ def _tool_call_to_action_parts(tool_name: str, tool_args: Dict[str, Any]) -> Tup
         )
     if name == "rerun_pipeline":
         return "rerun_pipeline", "", ""
+    if name == "verify_fix":
+        return "verify_fix", "", ""
     if name == "finalize":
         return "finalize", "", ""
     return name.lower(), "", ""
@@ -488,6 +505,22 @@ def normalize_model_action(
     return op, tgt, val
 
 
+def ready_to_finalize(observation: MetaHackathonObservation) -> bool:
+    metadata = observation.metadata if isinstance(observation.metadata, dict) else {}
+    if metadata and "ready_to_finalize" in metadata:
+        return bool(metadata.get("ready_to_finalize"))
+    return bool(observation.incident_resolved)
+
+
+def pre_finalize_guard_action(observation: MetaHackathonObservation) -> Tuple[str, str, str]:
+    metadata = observation.metadata if isinstance(observation.metadata, dict) else {}
+    if metadata and bool(metadata.get("verification_required")):
+        return "verify_fix", "", ""
+    if observation.incident_resolved:
+        return "verify_fix", "", ""
+    return "rerun_pipeline", "", ""
+
+
 def should_force_fallback(
     *,
     step: int,
@@ -525,8 +558,10 @@ def fallback_action(task_name: str, step: int) -> Tuple[str, str, str]:
         "easy": [
             ("view_logs", "build", ""),
             ("inspect_config", "build", ""),
+            ("set_hypothesis", "", "merge conflict markers are blocking build validation"),
             ("modify_config", "build", "sync branch and resolve merge conflict"),
             ("rerun_pipeline", "", ""),
+            ("verify_fix", "", ""),
             ("finalize", "", ""),
         ],
         "medium": [
@@ -539,17 +574,21 @@ def fallback_action(task_name: str, step: int) -> Tuple[str, str, str]:
             ("set_hypothesis", "", "docker install order mismatch still causing flaky build"),
             ("modify_config", "build", "reorder docker install steps"),
             ("rerun_pipeline", "", ""),
+            ("verify_fix", "", ""),
             ("finalize", "", ""),
         ],
         "security": [
             ("view_logs", "deploy", ""),
             ("inspect_permissions", "deploy", ""),
+            ("set_hypothesis", "", "artifact registry push fails because deployer lacks writer permissions"),
             ("modify_config", "deploy", "grant artifactregistry writer to ci-deployer"),
             ("rerun_pipeline", "", ""),
             ("view_logs", "deploy", ""),
             ("inspect_dockerfile", "build", ""),
+            ("set_hypothesis", "", "Dockerfile exposes API_KEY and must use secret manager reference"),
             ("modify_config", "deploy", "replace Dockerfile API_KEY with secret manager reference"),
             ("rerun_pipeline", "", ""),
+            ("verify_fix", "", ""),
             ("finalize", "", ""),
         ],
         "hard": [
@@ -561,9 +600,11 @@ def fallback_action(task_name: str, step: int) -> Tuple[str, str, str]:
             ("inspect_config", "deploy", ""),
             ("modify_config", "deploy", "rollback service-b to stable image revision"),
             ("rerun_pipeline", "", ""),
-            ("set_hypothesis", "", "service-b rollout timeout requires tuning after rollback"),
+            ("view_logs", "deploy", ""),
+            ("set_hypothesis", "", "service-b rollout timeout should be increased to 20m after rollback"),
             ("modify_config", "deploy", "increase rollout timeout to 20m"),
             ("rerun_pipeline", "", ""),
+            ("verify_fix", "", ""),
             ("finalize", "", ""),
         ],
     }
@@ -576,24 +617,28 @@ def fallback_action(task_name: str, step: int) -> Tuple[str, str, str]:
         "easy": [
             ("modify_config", "build", "sync branch and resolve merge conflict"),
             ("rerun_pipeline", "", ""),
+            ("verify_fix", "", ""),
             ("finalize", "", ""),
         ],
         "medium": [
             ("set_hypothesis", "", "dependency or docker order mismatch still active"),
             ("modify_config", "build", "reorder docker install steps"),
             ("rerun_pipeline", "", ""),
+            ("verify_fix", "", ""),
             ("finalize", "", ""),
         ],
         "security": [
             ("set_hypothesis", "", "iam role or secret manager mapping still incomplete"),
             ("modify_config", "deploy", "grant writer and use secret manager API_KEY"),
             ("rerun_pipeline", "", ""),
+            ("verify_fix", "", ""),
             ("finalize", "", ""),
         ],
         "hard": [
-            ("set_hypothesis", "", "service-a permission, rollback, or timeout tuning still incomplete"),
+            ("set_hypothesis", "", "service-b timeout likely still below 20m after rollback and needs tuning"),
             ("modify_config", "deploy", "grant service-a writer then rollback service-b and set timeout 20m"),
             ("rerun_pipeline", "", ""),
+            ("verify_fix", "", ""),
             ("finalize", "", ""),
         ],
     }
@@ -666,12 +711,15 @@ def run_task(client: OpenAI, session: requests.Session, fallback_task_name: str)
     disable_model_calls = MAX_MODEL_CALLS_PER_TASK <= 0
     observation: Optional[MetaHackathonObservation] = None
     messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    task_max_steps = MAX_STEPS
 
     try:
         observation = _reset_env(session)
         observed = observation.metadata or {}
         if isinstance(observed, dict) and observed.get("task_key"):
             task_name = str(observed.get("task_key"))
+        if isinstance(observed, dict) and observed.get("max_steps"):
+            task_max_steps = max(task_max_steps, int(observed.get("max_steps", MAX_STEPS)))
 
         log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
 
@@ -686,7 +734,7 @@ def run_task(client: OpenAI, session: requests.Session, fallback_task_name: str)
             }
         )
 
-        for step in range(1, MAX_STEPS + 1):
+        for step in range(1, task_max_steps + 1):
             if observation.done:
                 break
 
@@ -753,6 +801,14 @@ def run_task(client: OpenAI, session: requests.Session, fallback_task_name: str)
                 assistant_message = {
                     "role": "assistant",
                     "content": f"Fallback action selected: {operation}|{target}|{value}",
+                }
+                tool_call_id = None
+
+            if operation == "finalize" and not ready_to_finalize(observation):
+                operation, target, value = pre_finalize_guard_action(observation)
+                assistant_message = {
+                    "role": "assistant",
+                    "content": f"Guarded action selected before finalize: {operation}|{target}|{value}",
                 }
                 tool_call_id = None
 

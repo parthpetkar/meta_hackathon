@@ -21,6 +21,7 @@ CANONICAL_OPERATIONS: List[str] = [
     "modify_config",
     "add_dependency",
     "rerun_pipeline",
+    "verify_fix",
     "finalize",
     "inspect_permissions",
     "set_hypothesis",
@@ -36,7 +37,7 @@ LEGACY_OPERATION_ALIASES: Dict[str, str] = {
     "inspect_dependencies": "inspect_config",
     "inspect_docker": "inspect_dockerfile",
     "apply_fix": "modify_config",
-    "verify_fix": "finalize",
+    "verify_pipeline": "verify_fix",
 }
 
 
