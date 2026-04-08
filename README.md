@@ -64,6 +64,13 @@ At each step the agent receives structured state including:
 - Safety/cost signals: `pipeline_health`, `recovery_cost`, `redundant_actions`, `destructive_actions`.
 - Episode outputs: `reward`, `done`, `final_score` (terminal), and `metadata`.
 
+When `META_HACKATHON_AUDIT_TRAIL=true`, observation metadata also includes deterministic provenance fields:
+
+- `audit_enabled`, `episode_seed`, `variant_id`
+- `active_issue_pattern_buckets`
+- `sampled_pattern_event_count`
+- `sampled_pattern_events` (bucket + sampled line index + seed + sampled line text)
+
 ## Reward structure
 
 Per-step reward schema:
@@ -202,6 +209,23 @@ Optional rubric variables:
 - `META_HACKATHON_RUBRIC_TIMEOUT_SECONDS` (default `10`)
 - `META_HACKATHON_RUBRIC_MODEL` (optional override; defaults to `MODEL_NAME`)
 - `META_HACKATHON_RUBRIC_DEBUG` (`true`/`false`, default `false`)
+
+Optional audit variable:
+
+- `META_HACKATHON_AUDIT_TRAIL` (`true`/`false`, default `false`)
+
+Optional local inference debug variables:
+
+- `INFERENCE_VERBOSE` (`true`/`false`, default `false`)
+- `INFERENCE_DETAIL_MAX_ITEMS` (default `3`, controls list preview size in `[DETAIL]` lines)
+
+## Provenance Audit Trail
+
+The environment can emit a deterministic evidence lineage at runtime for judge-side realism auditing.
+
+- Audit trail is additive and backward-compatible (default off).
+- With audit trail enabled, every sampled pattern line is traceable to a pattern bucket, sampled line index, and issue seed.
+- This makes scenario evidence auditable without changing action schema or core scoring behavior.
 
 ## Hugging Face Space README
 

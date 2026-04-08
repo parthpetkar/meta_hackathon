@@ -30,6 +30,8 @@ HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
 MESSAGE_WINDOW = 6
 MAX_MODEL_CALLS_PER_TASK = int(os.getenv("MAX_MODEL_CALLS_PER_TASK", "1"))
 PREFER_DETERMINISTIC_ACTIONS = os.getenv("PREFER_DETERMINISTIC_ACTIONS", "true").lower() == "true"
+INFERENCE_VERBOSE = os.getenv("INFERENCE_VERBOSE", "false").strip().lower() == "true"
+INFERENCE_DETAIL_MAX_ITEMS = max(1, int(os.getenv("INFERENCE_DETAIL_MAX_ITEMS", "3")))
 VALID_OPERATIONS = {
     "view_logs",
     "inspect_config",
@@ -332,6 +334,77 @@ def log_end(success: bool, steps: int, score: float, resolved: bool, rewards: Li
         f"resolved={str(resolved).lower()} rewards={rewards_str}",
         flush=True,
     )
+
+
+def _compact_list(values: List[Any], limit: int = INFERENCE_DETAIL_MAX_ITEMS) -> str:
+    if not values:
+        return "none"
+    compact = [str(item).replace("\n", " ").strip() for item in values[-limit:]]
+    return " || ".join(compact)
+
+
+def _compact_stage_map(stage_map: Dict[str, Any]) -> str:
+    if not stage_map:
+        return "unknown"
+    return ",".join(f"{stage}:{status}" for stage, status in stage_map.items())
+
+
+def log_detail(
+    *,
+    step: int,
+    action: str,
+    observation: MetaHackathonObservation,
+    reward: float,
+    done: bool,
+    error: Optional[str],
+) -> None:
+    """Emit verbose trajectory diagnostics for local debugging without changing strict logs."""
+    metadata = observation.metadata if isinstance(observation.metadata, dict) else {}
+    error_val = error if error else "null"
+
+    print(
+        "[DETAIL] "
+        f"step={step} action={action} stage={observation.current_stage or '?'} "
+        f"status={observation.pipeline_status or '?'} issue_index={observation.active_issue_index} "
+        f"revealed={observation.revealed_issue_count} health={observation.pipeline_health:.2f} "
+        f"cost={observation.recovery_cost} redundant={observation.redundant_actions} "
+        f"destructive={observation.destructive_actions} reward={reward:.2f} "
+        f"done={str(done).lower()} error={error_val}",
+        flush=True,
+    )
+
+    print(
+        "[DETAIL] "
+        f"stages={_compact_stage_map(observation.pipeline_stages)} "
+        f"alerts={_compact_list(observation.visible_alerts)} "
+        f"errors={_compact_list(observation.surfaced_errors)} "
+        f"findings={_compact_list(observation.findings)}",
+        flush=True,
+    )
+
+    if metadata.get("audit_enabled"):
+        buckets = metadata.get("active_issue_pattern_buckets") or []
+        if not isinstance(buckets, list):
+            buckets = []
+
+        events = metadata.get("sampled_pattern_events") or []
+        event_preview: List[str] = []
+        if isinstance(events, list):
+            for event in events[:INFERENCE_DETAIL_MAX_ITEMS]:
+                if isinstance(event, dict):
+                    bucket = str(event.get("bucket", "?"))
+                    line_index = event.get("line_index", "?")
+                    event_preview.append(f"{bucket}[{line_index}]")
+
+        print(
+            "[DETAIL] "
+            f"audit variant={metadata.get('variant_id', '?')} "
+            f"seed={metadata.get('episode_seed', '?')} "
+            f"buckets={','.join(str(bucket) for bucket in buckets) if buckets else 'none'} "
+            f"events={metadata.get('sampled_pattern_event_count', 0)} "
+            f"event_preview={','.join(event_preview) if event_preview else 'none'}",
+            flush=True,
+        )
 
 
 def _endpoint(path: str) -> str:
@@ -803,6 +876,15 @@ def run_task(client: OpenAI, session: requests.Session, fallback_task_name: str)
         messages = [{"role": "system", "content": build_system_prompt(task_name)}]
 
         log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
+        if INFERENCE_VERBOSE:
+            log_detail(
+                step=0,
+                action="reset",
+                observation=observation,
+                reward=float(observation.reward or 0.0),
+                done=bool(observation.done),
+                error=None,
+            )
 
         task_title = observation.task_title or task_name
         messages.append(
@@ -911,6 +993,15 @@ def run_task(client: OpenAI, session: requests.Session, fallback_task_name: str)
 
             action_text = f"{operation}|{target}|{value}"
             log_step(step=step, action=action_text, reward=reward, done=done, error=error)
+            if INFERENCE_VERBOSE:
+                log_detail(
+                    step=step,
+                    action=action_text,
+                    observation=observation,
+                    reward=reward,
+                    done=done,
+                    error=error,
+                )
             history.append(f"{action_text} -> reward {reward:+.2f}")
 
             messages.append(assistant_message)
@@ -944,6 +1035,13 @@ def run_task(client: OpenAI, session: requests.Session, fallback_task_name: str)
         success = resolved and score >= SUCCESS_SCORE_THRESHOLD
     finally:
         log_end(success=success, steps=steps_taken, score=score, resolved=resolved, rewards=rewards)
+        if INFERENCE_VERBOSE:
+            print(
+                "[DETAIL] "
+                f"task={task_name} success={str(success).lower()} steps={steps_taken} "
+                f"final_score={score:.3f} resolved={str(resolved).lower()}",
+                flush=True,
+            )
 
     return task_name, success, steps_taken, score
 

@@ -74,6 +74,18 @@ The observation model surfaces both deterministic and rubric diagnostics:
 
 `eval_runner.py` prints per-episode and summary metrics including rubric fallback counts for quick reliability checks.
 
+### Provenance audit trail (runtime)
+
+The environment includes an opt-in runtime audit trail for evidence provenance.
+
+- Toggle with `META_HACKATHON_AUDIT_TRAIL=true`.
+- When enabled, reset/step metadata includes deterministic lineage fields:
+	- `episode_seed`, `variant_id`
+	- `active_issue_pattern_buckets`
+	- `sampled_pattern_events` (pattern bucket, sampled index, and line)
+- This allows external reviewers to verify that surfaced evidence lines came from declared pattern buckets.
+- Default behavior remains unchanged when the flag is disabled.
+
 ## Extensibility
 
 Add or change behavior in isolated modules:

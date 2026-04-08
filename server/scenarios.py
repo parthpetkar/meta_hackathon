@@ -6,9 +6,9 @@ from dataclasses import dataclass
 from typing import Dict, List
 
 try:
-    from .failure_patterns import sample_failure_lines
+    from .failure_patterns import sample_failure_lines_with_trace
 except ImportError:
-    from server.failure_patterns import sample_failure_lines
+    from server.failure_patterns import sample_failure_lines_with_trace
 
 
 STAGE_ORDER: List[str] = ["build", "test", "deploy"]
@@ -643,14 +643,38 @@ def list_task_keys() -> List[str]:
 
 def sample_logs_for_issue(issue: IncidentStep, variant_selector: int, issue_seed: int) -> List[str]:
     """Build issue logs with deterministic variant selection and sampled real-world patterns."""
+    logs, _ = sample_logs_for_issue_with_trace(issue, variant_selector, issue_seed)
+    return logs
+
+
+def sample_logs_for_issue_with_trace(
+    issue: IncidentStep,
+    variant_selector: int,
+    issue_seed: int,
+) -> tuple[List[str], List[Dict[str, object]]]:
+    """Build deterministic issue logs and include provenance trace events."""
     if not issue.log_variants:
         logs: List[str] = []
+        trace_events: List[Dict[str, object]] = []
     else:
         choice = variant_selector % len(issue.log_variants)
         logs = list(issue.log_variants[choice])
+        trace_events = [
+            {
+                "source": "scenario_variant",
+                "bucket": "scenario_log_variant",
+                "variant_choice": choice,
+                "line_index": index,
+                "issue_seed": issue_seed,
+                "line": line,
+            }
+            for index, line in enumerate(logs)
+        ]
 
     for bucket in issue.pattern_buckets:
         # issue_seed stabilizes repeated view_logs calls within a single episode.
-        logs.extend(sample_failure_lines(bucket, sample_size=1, issue_seed=issue_seed))
+        sampled_lines, sampled_events = sample_failure_lines_with_trace(bucket, sample_size=1, issue_seed=issue_seed)
+        logs.extend(sampled_lines)
+        trace_events.extend(sampled_events)
 
-    return logs
+    return logs, trace_events

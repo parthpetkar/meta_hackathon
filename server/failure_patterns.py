@@ -72,10 +72,32 @@ FAILURE_PATTERNS: Dict[str, List[str]] = {
 
 def sample_failure_lines(bucket: str, sample_size: int = 1, issue_seed: int = 0) -> List[str]:
     """Sample deterministic lines from a bucket using a per-issue seed."""
+    sampled_lines, _ = sample_failure_lines_with_trace(bucket, sample_size=sample_size, issue_seed=issue_seed)
+    return sampled_lines
+
+
+def sample_failure_lines_with_trace(
+    bucket: str,
+    sample_size: int = 1,
+    issue_seed: int = 0,
+) -> tuple[List[str], List[Dict[str, object]]]:
+    """Sample deterministic lines and include trace metadata for auditability."""
     lines = FAILURE_PATTERNS.get(bucket, [])
     if not lines or sample_size <= 0:
-        return []
+        return [], []
 
     rng = random.Random(f"{bucket}:{issue_seed}")
     k = min(sample_size, len(lines))
-    return rng.sample(lines, k=k)
+    sampled_indices = rng.sample(range(len(lines)), k=k)
+    sampled_lines = [lines[index] for index in sampled_indices]
+    trace_events: List[Dict[str, object]] = [
+        {
+            "source": "pattern_library",
+            "bucket": bucket,
+            "line_index": index,
+            "issue_seed": issue_seed,
+            "line": lines[index],
+        }
+        for index in sampled_indices
+    ]
+    return sampled_lines, trace_events

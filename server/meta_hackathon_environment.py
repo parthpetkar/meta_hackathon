@@ -37,7 +37,7 @@ try:
         canonical_operation,
         get_scenario,
         list_task_keys,
-        sample_logs_for_issue,
+        sample_logs_for_issue_with_trace,
     )
     from ..models import MetaHackathonAction, MetaHackathonObservation
 except ImportError:
@@ -60,7 +60,7 @@ except ImportError:
         canonical_operation,
         get_scenario,
         list_task_keys,
-        sample_logs_for_issue,
+        sample_logs_for_issue_with_trace,
     )
     from models import MetaHackathonAction, MetaHackathonObservation
 
@@ -131,6 +131,8 @@ class MetaHackathonCICDRepairEnvironment(Environment):
         self._config_files: dict[str, str] = {}
         self._episode_seed = 0
         self._sampled_issue_logs: dict[int, list[str]] = {}
+        self._sampled_issue_trace_events: dict[int, list[dict[str, object]]] = {}
+        self._audit_trail_enabled = os.getenv("META_HACKATHON_AUDIT_TRAIL", "false").strip().lower() == "true"
 
         self._rubric_enabled = os.getenv("META_HACKATHON_RUBRIC_ENABLED", "true").strip().lower() == "true"
         self._rubric_blend_weight = max(
@@ -325,8 +327,29 @@ class MetaHackathonCICDRepairEnvironment(Environment):
     def _variant_logs_for_issue(self, issue_index: int, issue: IncidentStep) -> list[str]:
         if issue_index not in self._sampled_issue_logs:
             issue_seed = self._episode_seed + issue_index
-            self._sampled_issue_logs[issue_index] = sample_logs_for_issue(issue, self._variant_selector, issue_seed)
+            sampled_logs, trace_events = sample_logs_for_issue_with_trace(issue, self._variant_selector, issue_seed)
+            self._sampled_issue_logs[issue_index] = sampled_logs
+            self._sampled_issue_trace_events[issue_index] = trace_events
         return self._sampled_issue_logs[issue_index]
+
+    def _audit_metadata_payload(self) -> dict[str, object]:
+        if not self._audit_trail_enabled:
+            return {}
+
+        issue_index = min(self._current_issue_index, len(self._scenario.incident_chain) - 1)
+        issue = self._scenario.incident_chain[issue_index]
+        trace_events = self._sampled_issue_trace_events.get(issue_index, [])
+        pattern_events = [event for event in trace_events if event.get("source") == "pattern_library"]
+
+        return {
+            "audit_enabled": True,
+            "episode_seed": self._episode_seed,
+            "variant_id": self._current_variant().variant_id,
+            "active_issue_index": issue_index,
+            "active_issue_pattern_buckets": list(issue.pattern_buckets),
+            "sampled_pattern_event_count": len(pattern_events),
+            "sampled_pattern_events": pattern_events[-6:],
+        }
 
     def _current_variant(self) -> ScenarioVariant:
         if self._scenario_variant is None:
@@ -472,6 +495,7 @@ class MetaHackathonCICDRepairEnvironment(Environment):
         self._scenario_variant = self._scenario.variants[variant_index]
         self._config_files = {}
         self._sampled_issue_logs = {}
+        self._sampled_issue_trace_events = {}
 
         self._easy_build_passing = False
         self._security_iam_fixed = False
@@ -495,6 +519,7 @@ class MetaHackathonCICDRepairEnvironment(Environment):
                 "verified_since_last_rerun": self._verified_for_latest_rerun,
                 "supported_operations": SUPPORTED_OPERATIONS,
                 "canonical_operations": CANONICAL_OPERATIONS,
+                **self._audit_metadata_payload(),
             },
         )
 
@@ -863,6 +888,7 @@ class MetaHackathonCICDRepairEnvironment(Environment):
                 "verified_since_last_rerun": self._verified_for_latest_rerun,
                 "supported_operations": SUPPORTED_OPERATIONS,
                 "canonical_operations": CANONICAL_OPERATIONS,
+                **self._audit_metadata_payload(),
             },
         )
 
