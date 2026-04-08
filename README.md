@@ -91,12 +91,14 @@ Task-specific reward extensions:
 - Hard task red herring action: additional `-0.15` when a plausible but incorrect shortcut is attempted.
 - Security task: finalizing after fixing exactly one of two required issues gives partial credit; finalizing after both issues are fixed gives the standard `+0.25` terminal finalize reward.
 
-Terminal score is clipped to `[0.0, 1.0]` and difficulty-calibrated to preserve the expected gradient:
+Deterministic terminal score is clipped to `[0.0, 1.0]` and difficulty-calibrated to preserve the expected gradient:
 
 - Easy target: about `0.55` to `0.65`
 - Medium target: about `0.40` to `0.50`
 - Security target: between medium and hard
 - Hard target: about `0.25` to `0.38`
+
+When rubric scoring is enabled, delayed reward is blended at terminal step and capped by difficulty to preserve separation across tasks (`easy: 0.12`, `medium: 0.11`, `security: 0.10`, `hard: 0.03`). This keeps hard-task blended scores in-band instead of collapsing toward medium.
 
 Rubric delayed reward (optional):
 
@@ -217,6 +219,68 @@ Run deterministic evaluation:
 ```bash
 uv run evaluate
 ```
+
+## Submission Gate Validation (2026-04-08)
+
+### OpenEnv spec validation
+
+```bash
+uv run openenv validate
+```
+
+Observed output:
+
+```text
+[OK] meta_hackathon: Ready for multi-mode deployment
+```
+
+### Docker build and runtime validation
+
+```bash
+docker build -t meta-hackathon-env .
+docker run --rm -p 8000:8000 meta-hackathon-env
+```
+
+Observed results:
+
+- Image build completed successfully.
+- Health check endpoint returned healthy: `GET /health -> {"status":"healthy"}`
+- OpenEnv endpoint responded correctly: `POST /reset -> 200` with structured observation payload.
+
+### External Hugging Face Space reset check
+
+```bash
+POST https://parthpetkar-metahackathon.hf.space/reset
+```
+
+Observed result:
+
+- External `POST /reset` returned `200` with a valid observation payload.
+
+### Inference runtime check (<20 min constraint)
+
+Runtime benchmark command (deterministic fallback mode to isolate environment runtime from external model latency):
+
+```bash
+MAX_MODEL_CALLS_PER_TASK=0 uv run python inference.py
+```
+
+Observed runtime:
+
+- `ELAPSED_SECONDS=29.58` (well below the 20-minute requirement on this machine).
+
+### Current score gradient evidence
+
+```bash
+uv run evaluate
+```
+
+Observed summary means:
+
+- easy: `avg_score=0.730`
+- medium: `avg_score=0.602`
+- security: `avg_score=0.526`
+- hard: `avg_score=0.372` (`det=0.342`, with hard delayed-reward cap `0.03`)
 
 ## Reproducibility artifacts
 

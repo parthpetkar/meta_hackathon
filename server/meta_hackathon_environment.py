@@ -132,7 +132,7 @@ class MetaHackathonCICDRepairEnvironment(Environment):
         self._episode_seed = 0
         self._sampled_issue_logs: dict[int, list[str]] = {}
 
-        self._rubric_enabled = os.getenv("META_HACKATHON_RUBRIC_ENABLED", "false").strip().lower() == "true"
+        self._rubric_enabled = os.getenv("META_HACKATHON_RUBRIC_ENABLED", "true").strip().lower() == "true"
         self._rubric_blend_weight = max(
             0.0,
             min(1.0, float(os.getenv("META_HACKATHON_RUBRIC_WEIGHT", "0.30"))),
@@ -207,6 +207,18 @@ class MetaHackathonCICDRepairEnvironment(Environment):
             self._rubric_blend_weight * rubric_score
         )
         delayed_reward = blended_score - deterministic_score
+
+        # Keep rubric contribution bounded by difficulty so blended scores preserve
+        # the intended easy -> medium -> security -> hard score separation.
+        delayed_cap_by_difficulty = {
+            "easy": 0.12,
+            "medium": 0.11,
+            "security": 0.10,
+            "hard": 0.03,
+        }
+        delayed_cap = delayed_cap_by_difficulty.get(self._scenario.difficulty, 0.10)
+        delayed_reward = max(-delayed_cap, min(delayed_reward, delayed_cap))
+        blended_score = deterministic_score + delayed_reward
         return round(blended_score, 3), round(delayed_reward, 3), judge_result
 
     def _current_issue(self) -> IncidentStep:
