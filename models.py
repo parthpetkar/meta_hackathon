@@ -134,3 +134,27 @@ class MetaHackathonObservation(Observation):
         default=0.0,
         description="Episode score in [0.0, 1.0] once done=True.",
     )
+    deterministic_score: float = Field(
+        default=0.0,
+        description="Baseline deterministic episode score before rubric blending.",
+    )
+    rubric_score: float = Field(
+        default=0.0,
+        description="Rubric judge score in [0.0, 1.0] for delayed semantic quality.",
+    )
+    delayed_reward: float = Field(
+        default=0.0,
+        description="Delayed reward delta added at terminal step from rubric blending.",
+    )
+    rubric_blend_weight: float = Field(
+        default=0.0,
+        description="Blend weight applied to rubric score when computing final_score.",
+    )
+    rubric_judge_used: bool = Field(
+        default=False,
+        description="Whether OpenEnv LLMJudge (not fallback heuristic) produced rubric_score.",
+    )
+    rubric_judge_error: str = Field(
+        default="",
+        description="Judge error/fallback reason when OpenEnv LLMJudge is unavailable or fails.",
+    )

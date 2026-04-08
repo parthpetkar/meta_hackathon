@@ -21,4 +21,5 @@ server/app.py
 server/failure_patterns.py
 server/graders.py
 server/meta_hackathon_environment.py
+server/rubric_judge.py
 server/scenarios.py
