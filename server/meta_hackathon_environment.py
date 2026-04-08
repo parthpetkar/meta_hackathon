@@ -13,6 +13,11 @@ from openenv.core.env_server.interfaces import Environment
 from openenv.core.env_server.types import State
 
 try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover - optional import safety
+    load_dotenv = None
+
+try:
     from .graders import action_key, grade_episode, matches_terms, step_reward
     from .graders import (
         classify_security_fix,
@@ -66,6 +71,9 @@ class MetaHackathonCICDRepairEnvironment(Environment):
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
 
     def __init__(self, task_key: str = ""):
+        if load_dotenv is not None:
+            load_dotenv()
+
         self._task_order = list_task_keys()
         requested_task = (
             task_key

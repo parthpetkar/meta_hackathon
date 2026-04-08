@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import importlib
 import inspect
 import json
@@ -84,6 +85,7 @@ class OpenEnvLLMJudgeAdapter:
         self._openenv_judge: Any = None
         self._openenv_client: Any = None
         self._openenv_init_error: str = ""
+        self._closed = False
         if enabled:
             self._openenv_judge, self._openenv_client, self._openenv_init_error = self._load_openenv_llmjudge()
             if self._openenv_judge is not None:
@@ -93,6 +95,8 @@ class OpenEnvLLMJudgeAdapter:
                     "judge_init path=openenv_llmjudge status=unavailable error=%s",
                     self._openenv_init_error or "unknown",
                 )
+        if self._openenv_client is not None:
+            atexit.register(self.close)
 
     class _DebugClientProxy:
         """Capture raw responses from OpenEnv client.complete()."""
@@ -106,11 +110,58 @@ class OpenEnvLLMJudgeAdapter:
             self.last_raw_response = str(response or "")
             return response
 
+        def close(self) -> None:
+            """Synchronous no-op; adapter-level close performs awaited shutdown."""
+            return None
+
+        async def aclose(self) -> None:
+            close_fn = getattr(self._inner, "close", None)
+            if callable(close_fn):
+                maybe_awaitable = close_fn()
+                if inspect.isawaitable(maybe_awaitable):
+                    await maybe_awaitable
+
         def __getattr__(self, name: str) -> Any:
             return getattr(self._inner, name)
 
     def is_active(self) -> bool:
         return self._enabled
+
+    def close(self) -> None:
+        """Release OpenEnv LLM client resources to avoid shutdown-loop warnings."""
+        if self._closed:
+            return
+
+        self._closed = True
+        if self._openenv_client is None:
+            return
+
+        try:
+            for target in (
+                getattr(getattr(self._openenv_client, "_inner", None), "_client", None),
+                getattr(self._openenv_client, "_inner", None),
+                self._openenv_client,
+            ):
+                if target is None:
+                    continue
+
+                aclose_fn = getattr(target, "aclose", None)
+                if callable(aclose_fn):
+                    self._run_async_with_timeout(aclose_fn(), timeout_seconds=self._timeout_seconds)
+                    break
+
+                close_fn = getattr(target, "close", None)
+                if callable(close_fn):
+                    maybe_awaitable = close_fn()
+                    if inspect.isawaitable(maybe_awaitable):
+                        self._run_async_with_timeout(maybe_awaitable, timeout_seconds=self._timeout_seconds)
+                    break
+        except Exception as exc:  # pragma: no cover - defensive cleanup
+            if "Event loop is closed" in str(exc):
+                return
+            self._debug_log("judge_close_failed error=%s", exc)
+        finally:
+            self._openenv_client = None
 
     def evaluate_hypothesis_quality(self, payload: dict[str, Any]) -> RubricJudgeResult:
         if not self._enabled:

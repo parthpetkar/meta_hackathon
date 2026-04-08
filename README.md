@@ -101,10 +101,18 @@ Terminal score is clipped to `[0.0, 1.0]` and difficulty-calibrated to preserve 
 Rubric delayed reward (optional):
 
 - When `META_HACKATHON_RUBRIC_ENABLED=true`, the environment computes an additional terminal semantic score for hypothesis quality.
-- The semantic score is produced by an OpenEnv `LLMJudge` adapter when available, with an automatic heuristic fallback when unavailable.
+- The semantic score is produced by an OpenEnv `LLMJudge` adapter when available.
+- Fallback order is deterministic: OpenEnv `LLMJudge` -> API LLM scoring -> heuristic semantic scorer.
 - Final score blending: `blended = (1 - w) * deterministic + w * rubric`, where `w = META_HACKATHON_RUBRIC_WEIGHT`.
 - Delayed reward contribution at terminal step: `delayed_reward = blended - deterministic`.
 - Observations expose `deterministic_score`, `rubric_score`, `delayed_reward`, `rubric_blend_weight`, `rubric_judge_used`, and `rubric_judge_error`.
+
+Rubric judge debug signals:
+
+- Set `META_HACKATHON_RUBRIC_DEBUG=true` to log judge initialization and scoring path decisions.
+- Per episode, use `eval_runner.py` output fields `det`, `rubric`, `delayed`, and `judge` to validate blending behavior.
+- `rubric_judge_used=true` indicates semantic (non-heuristic) judge output; inspect `rubric_judge_error` when fallback occurs.
+- `rubric_fallbacks` in eval summary counts episodes that required fallback due judge/API failures.
 
 ## Task descriptions
 
@@ -191,6 +199,12 @@ Optional rubric variables:
 - `META_HACKATHON_RUBRIC_WEIGHT` (`0.0` to `1.0`, default `0.30`)
 - `META_HACKATHON_RUBRIC_TIMEOUT_SECONDS` (default `10`)
 - `META_HACKATHON_RUBRIC_MODEL` (optional override; defaults to `MODEL_NAME`)
+- `META_HACKATHON_RUBRIC_DEBUG` (`true`/`false`, default `false`)
+
+## Hugging Face Space README
+
+- The root `README.md` in this repository is the canonical Space card README.
+- If your deployed Space repo is separate and missing docs, copy the content from `HF_SPACE_README.md` into that Space repo as `README.md`.
 
 Run inference:
 
