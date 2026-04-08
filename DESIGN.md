@@ -29,6 +29,23 @@ Each chain stage defines:
 - partial-fix behavior,
 - red-herring penalties.
 
+## Incident taxonomy mapping
+
+This environment maps incident patterns to widely recognized operational taxonomies so evaluator outcomes can be interpreted in production terms.
+
+- PagerDuty-style incident classes:
+  - Merge conflicts and dependency breaks map to change-failure/deployment incidents.
+  - IAM push denial maps to authorization/access-control incidents.
+  - Secret exposure maps to security/compliance incidents.
+  - Flaky test failures map to pipeline quality degradation incidents.
+  - DNS/timeout upload failures map to external dependency/network reliability incidents.
+- Google SRE-style categories:
+  - Build/test regressions and flakes align to release-engineering and CI reliability classes.
+  - Permission and secret failures align to security and policy-enforcement classes.
+  - Rollout timeout and registry outages align to dependency and production rollout stability classes.
+
+Because every episode surfaces logs, stage context, and remediation decisions in a deterministic schema, the environment can also serve as diagnostic middleware: a reusable evaluation layer that sits between real production-style telemetry and agent policies to benchmark triage quality, remediation safety, and verification discipline.
+
 ## Scoring model
 
 ### Step rewards
@@ -82,9 +99,9 @@ The environment includes an opt-in runtime audit trail for evidence provenance.
 
 - Toggle with `META_HACKATHON_AUDIT_TRAIL=true`.
 - When enabled, reset/step metadata includes deterministic lineage fields:
-	- `episode_seed`, `variant_id`
-	- `active_issue_pattern_buckets`
-	- `sampled_pattern_events` (pattern bucket, sampled index, and line)
+  - `episode_seed`, `variant_id`
+  - `active_issue_pattern_buckets`
+  - `sampled_pattern_events` (pattern bucket, sampled index, and line)
 - This allows external reviewers to verify that surfaced evidence lines came from declared pattern buckets.
 - Default behavior remains unchanged when the flag is disabled.
 

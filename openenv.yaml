@@ -10,9 +10,17 @@ tasks:
     key: easy
     title: Resolve failing merge stage
     difficulty: easy
+  - task_id: flaky_test
+    key: flaky
+    title: Stabilize intermittent flaky test failures
+    difficulty: easy
   - task_id: medium_docker_dep_failure
     key: medium
     title: Repair docker build dependency failure
+    difficulty: medium
+  - task_id: network_outage
+    key: network
+    title: Recover from transient external dependency outage
     difficulty: medium
   - task_id: security_secrets_iam_misconfig
     key: security

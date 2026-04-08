@@ -140,11 +140,23 @@ Rubric judge debug signals:
 - One inspect pass reveals the issue.
 - One config fix resolves it, then rerun, verify, and finalize.
 
+`flaky` - Flaky test tolerance (timing-sensitive CI instability)
+
+- Test stage intermittently fails, then passes on immediate retry.
+- Agent must diagnose this as a flaky/timing issue rather than a true product-code regression.
+- Correct remediation is retry/isolation-safe test policy updates (not broad code rewrites or disabling tests).
+
 `medium` - Dependency + Docker ordering chain
 
 - Build fails due to `requests`/`urllib3` incompatibility.
 - After dependency remediation, Docker install-order instability may remain.
 - Agent must perform dependency fix and Docker order correction.
+
+`network` - External dependency outage (transient DNS/network failure)
+
+- Artifact upload fails because an external endpoint is temporarily unreachable.
+- Agent must classify the failure as transient external/network, not an internal logic bug.
+- Correct remediation is resilient retry/backoff and/or proxy fallback configuration instead of rewriting application code.
 
 `security` - IAM + secret exposure misconfiguration
 
