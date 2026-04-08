@@ -38,18 +38,18 @@ OpenEnv API compliance:
 
 All actions use the schema: `operation | target | value`
 
-| Operation | Target (arg) | Value (arg) | Description |
-| --- | --- | --- | --- |
-| `view_logs` | optional stage (`build/test/deploy`) | optional | Read pipeline/runtime logs for the active failure context. |
-| `inspect_config` | optional stage/component | optional | Inspect CI/deploy config clues and surfaced config files. |
-| `inspect_dockerfile` | optional component | optional | Inspect Dockerfile/security build clues. |
-| `inspect_permissions` | optional component | optional | Inspect IAM/service-account permission clues. |
-| `set_hypothesis` | must be empty | hypothesis text | Declare current root-cause hypothesis. |
-| `modify_config` | optional stage/component | fix text | Apply config/deploy/rollback/security fix candidate. |
-| `add_dependency` | optional stage/component | dependency fix text | Apply dependency pin/compatibility fix. |
-| `rerun_pipeline` | empty | empty | Re-run pipeline after fix attempts to validate progression. |
-| `verify_fix` | empty | empty | Confirm rerun evidence indicates the active failure was removed. |
-| `finalize` | empty | empty | End episode and request final scoring. |
+| Operation             | Target (arg)                         | Value (arg)         | Description                                                      |
+| --------------------- | ------------------------------------ | ------------------- | ---------------------------------------------------------------- |
+| `view_logs`           | optional stage (`build/test/deploy`) | optional            | Read pipeline/runtime logs for the active failure context.       |
+| `inspect_config`      | optional stage/component             | optional            | Inspect CI/deploy config clues and surfaced config files.        |
+| `inspect_dockerfile`  | optional component                   | optional            | Inspect Dockerfile/security build clues.                         |
+| `inspect_permissions` | optional component                   | optional            | Inspect IAM/service-account permission clues.                    |
+| `set_hypothesis`      | must be empty                        | hypothesis text     | Declare current root-cause hypothesis.                           |
+| `modify_config`       | optional stage/component             | fix text            | Apply config/deploy/rollback/security fix candidate.             |
+| `add_dependency`      | optional stage/component             | dependency fix text | Apply dependency pin/compatibility fix.                          |
+| `rerun_pipeline`      | empty                                | empty               | Re-run pipeline after fix attempts to validate progression.      |
+| `verify_fix`          | empty                                | empty               | Confirm rerun evidence indicates the active failure was removed. |
+| `finalize`            | empty                                | empty               | End episode and request final scoring.                           |
 
 ## Observation space
 
@@ -77,25 +77,25 @@ When `META_HACKATHON_AUDIT_TRAIL=true`, observation metadata also includes deter
 
 Per-step reward schema:
 
-| Action type | Reward |
-| --- | --- |
-| `set_hypothesis` (correct, first try) | `+0.22` |
-| `set_hypothesis` (correct, retry) | `+0.10` |
-| `set_hypothesis` (wrong) | `-0.10` |
-| `inspect_*` (relevant stage) | `+0.12` |
-| `inspect_*` (irrelevant stage) | `-0.05` |
-| `modify_config` (correct fix, default path) | `+0.35` |
-| `modify_config` (partial fix, default path) | `+0.20` |
+| Action type                                           | Reward  |
+| ----------------------------------------------------- | ------- |
+| `set_hypothesis` (correct, first try)                 | `+0.22` |
+| `set_hypothesis` (correct, retry)                     | `+0.10` |
+| `set_hypothesis` (wrong)                              | `-0.10` |
+| `inspect_*` (relevant stage)                          | `+0.12` |
+| `inspect_*` (irrelevant stage)                        | `-0.05` |
+| `modify_config` (correct fix, default path)           | `+0.35` |
+| `modify_config` (partial fix, default path)           | `+0.20` |
 | `modify_config` (wrong/destructive fix, default path) | `-0.20` |
-| `add_dependency` (correct and non-redundant) | `+0.25` |
-| `add_dependency` (wrong/redundant) | `-0.18` |
-| `rerun_pipeline` (after valid fix) | `+0.18` |
-| `rerun_pipeline` (premature) | `+0.05` |
-| `verify_fix` (valid post-rerun verification) | `+0.16` |
-| `verify_fix` (without valid rerun evidence) | `-0.06` |
-| `finalize` (correct) | `+0.25` |
-| `finalize` (security partial remediation) | `+0.20` |
-| `finalize` (incorrect state) | `-0.15` |
+| `add_dependency` (correct and non-redundant)          | `+0.25` |
+| `add_dependency` (wrong/redundant)                    | `-0.18` |
+| `rerun_pipeline` (after valid fix)                    | `+0.18` |
+| `rerun_pipeline` (premature)                          | `+0.05` |
+| `verify_fix` (valid post-rerun verification)          | `+0.16` |
+| `verify_fix` (without valid rerun evidence)           | `-0.06` |
+| `finalize` (correct)                                  | `+0.25` |
+| `finalize` (security partial remediation)             | `+0.20` |
+| `finalize` (incorrect state)                          | `-0.15` |
 
 Task-specific reward extensions:
 
@@ -210,14 +210,21 @@ For a deeper narrative of intended upstream value and extension strategy, see `D
 - `[STEP] step=... action=operation|target|value reward=... done=... error=...`
 - `[END] success=... steps=... score=... resolved=... rewards=...`
 
-Set model/client environment variables:
+### 2. Configure environment variables
 
-- `API_BASE_URL`
-- `MODEL_NAME`
-- `HF_TOKEN` (or `OPENAI_API_KEY`)
+Duplicate `.env.example` (or set these directly) to configure inference and grading features:
 
-Optional rubric variables:
+````bash
+# Model for the inference agent (you must be logged into Hugging Face)
+MODEL_NAME=Qwen/Qwen2.5-72B-Instruct
+API_BASE_URL=https://router.huggingface.co/v1
+HF_TOKEN=your_hf_token_here
 
+# (Optional) Provide a separate token for the Rubric Judge to avoid rate-limiting
+# If empty, falls back to HF_TOKEN or OPENAI_API_KEY
+META_HACKATHON_RUBRIC_API_KEY=your_rubric_api_key_here
+
+# Enable semantic rubric blending for evaluation
 - `META_HACKATHON_RUBRIC_ENABLED` (`true`/`false`)
 - `META_HACKATHON_RUBRIC_WEIGHT` (`0.0` to `1.0`, default `0.30`)
 - `META_HACKATHON_RUBRIC_TIMEOUT_SECONDS` (default `10`)
@@ -254,7 +261,7 @@ Run inference:
 
 ```bash
 uv run python inference.py
-```
+````
 
 Run deterministic evaluation:
 

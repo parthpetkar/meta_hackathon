@@ -1,3 +1,4 @@
+LICENSE
 README.md
 __init__.py
 client.py
@@ -10,6 +11,7 @@ pyproject.toml
 ./eval_runner.py
 ./inference.py
 ./models.py
+./test_environment.py
 openenv_meta_hackathon.egg-info/PKG-INFO
 openenv_meta_hackathon.egg-info/SOURCES.txt
 openenv_meta_hackathon.egg-info/dependency_links.txt

@@ -1604,6 +1604,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "openenv-core", extra = ["core"] },
+    { name = "pytest" },
     { name = "python-dotenv" },
     { name = "requests" },
 ]
@@ -1617,6 +1618,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "openenv-core", extras = ["core"], specifier = ">=0.2.2" },
+    { name = "pytest", specifier = ">=9.0.2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0.0" },
     { name = "python-dotenv", specifier = ">=1.2.2" },

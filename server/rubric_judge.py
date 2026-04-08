@@ -24,6 +24,8 @@ except Exception:  # pragma: no cover - optional import safety
 
 LOGGER = logging.getLogger(__name__)
 
+_JUDGE_CACHE: dict[str, RubricJudgeResult] = {}
+
 
 def _normalize(text: str) -> str:
     cleaned = (text or "").strip().lower()
@@ -75,7 +77,8 @@ class OpenEnvLLMJudgeAdapter:
         self._timeout_seconds = max(1, int(timeout_seconds))
         self._api_base_url = os.getenv("API_BASE_URL", "https://api.openai.com/v1").strip()
         self._api_key = (
-            os.getenv("HF_TOKEN")
+            os.getenv("META_HACKATHON_RUBRIC_API_KEY")
+            or os.getenv("HF_TOKEN")
             or os.getenv("OPENAI_API_KEY")
             or os.getenv("API_KEY")
             or ""
@@ -164,9 +167,15 @@ class OpenEnvLLMJudgeAdapter:
             self._openenv_client = None
 
     def evaluate_hypothesis_quality(self, payload: dict[str, Any]) -> RubricJudgeResult:
+        cache_key = self._prompt_cache_key(payload)
+        if cache_key in _JUDGE_CACHE:
+            self._debug_log("judge_path=cache hit")
+            return _JUDGE_CACHE[cache_key]
+
         if not self._enabled:
             fallback = self._heuristic_score(payload)
             fallback.error = "rubric judging disabled"
+            _JUDGE_CACHE[cache_key] = fallback
             return fallback
 
         prompt = self._build_prompt(payload)
@@ -180,12 +189,14 @@ class OpenEnvLLMJudgeAdapter:
                     "judge_path=openenv_llmjudge raw_response=%s",
                     self._truncate(raw),
                 )
-                return RubricJudgeResult(
+                result = RubricJudgeResult(
                     score=score,
                     rationale="OpenEnv LLMJudge semantic score",
                     source="openenv_llmjudge",
                     used_fallback=False,
                 )
+                _JUDGE_CACHE[cache_key] = result
+                return result
             except Exception as exc:  # pragma: no cover - defensive runtime path
                 openenv_error = f"OpenEnv LLMJudge call failed: {exc}"
                 self._debug_log("judge_path=openenv_llmjudge failed error=%s", openenv_error)
@@ -198,17 +209,20 @@ class OpenEnvLLMJudgeAdapter:
                 "judge_path=api_fallback raw_response=%s",
                 self._truncate(raw),
             )
-            return RubricJudgeResult(
+            result = RubricJudgeResult(
                 score=score,
                 rationale=rationale,
                 source="api_fallback",
                 used_fallback=False,
             )
+            _JUDGE_CACHE[cache_key] = result
+            return result
         except Exception as api_exc:  # pragma: no cover - defensive runtime path
             fallback = self._heuristic_score(payload)
             parts = [openenv_error, f"API LLM fallback failed: {api_exc}"]
             fallback.error = " | ".join(part for part in parts if part)
             self._debug_log("judge_path=heuristic_fallback error=%s", fallback.error)
+            _JUDGE_CACHE[cache_key] = fallback
             return fallback
 
     def _load_openenv_llmjudge(self) -> tuple[Any | None, Any | None, str]:
@@ -243,7 +257,9 @@ class OpenEnvLLMJudgeAdapter:
 
             prompt_template = (
                 "You are an evaluator for CI/CD debugging hypotheses. "
-                "Return only JSON: {{\"score\": number in [0,1], \"rationale\": string}}.\\n"
+                "Score each hypothesis on how well it addresses the active issue at the time it was made. "
+                "Do not penalize a hypothesis for omitting a subsequent issue that had not yet been revealed. "
+                "Return only JSON: {{\\\"score\\\": number in [0,1], \\\"rationale\\\": string}}.\\n"
                 "Action:\\n{action}\\n\\nObservation:\\n{observation}"
             )
 
@@ -303,7 +319,9 @@ class OpenEnvLLMJudgeAdapter:
                     "role": "system",
                     "content": (
                         "You are a strict JSON scorer. Return only JSON with keys score and rationale. "
-                        "Score must be in [0,1]."
+                        "Score must be in [0,1]. "
+                        "Score each hypothesis on how well it addresses the active issue at the time it was made. "
+                        "Do not penalize a hypothesis for omitting a subsequent issue that had not yet been revealed."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -377,6 +395,7 @@ class OpenEnvLLMJudgeAdapter:
         return (
             "Score the agent hypothesis quality from 0.0 to 1.0. "
             "Use semantic correctness, evidence alignment, and completeness. "
+            "Do not penalize a hypothesis for omitting a subsequent issue that had not yet been revealed. "
             "Return only JSON: {\"score\": float in [0,1], \"rationale\": string}. "
             f"Rubric: {json.dumps(rubric, ensure_ascii=True)} "
             f"Evidence: {json.dumps(evidence, ensure_ascii=True)}"
@@ -448,3 +467,9 @@ class OpenEnvLLMJudgeAdapter:
             source="heuristic_fallback",
             used_fallback=True,
         )
+
+    def _prompt_cache_key(self, payload: dict[str, Any]) -> str:
+        evidence = payload.get("evidence", {})
+        hypotheses = tuple(str(x) for x in evidence.get("hypothesis_history", []))
+        task_id = str(payload.get("task_id", ""))
+        return f"{task_id}::" + "::".join(hypotheses)
