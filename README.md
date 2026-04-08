@@ -64,6 +64,8 @@ At each step the agent receives structured state including:
 - Safety/cost signals: `pipeline_health`, `recovery_cost`, `redundant_actions`, `destructive_actions`.
 - Episode outputs: `reward`, `done`, `final_score` (terminal), and `metadata`.
 
+Reset observations already include the initial alert and a first batch of sampled failure logs, so agents can begin reasoning from step 0 before choosing whether to call `view_logs` again.
+
 When `META_HACKATHON_AUDIT_TRAIL=true`, observation metadata also includes deterministic provenance fields:
 
 - `audit_enabled`, `episode_seed`, `variant_id`
@@ -105,7 +107,7 @@ Deterministic terminal score is clipped to `[0.0, 1.0]` and difficulty-calibrate
 - Security target: between medium and hard
 - Hard target: about `0.25` to `0.38`
 
-When rubric scoring is enabled, delayed reward is blended at terminal step and capped by difficulty to preserve separation across tasks (`easy: 0.12`, `medium: 0.11`, `security: 0.10`, `hard: 0.03`). This keeps hard-task blended scores in-band instead of collapsing toward medium.
+When rubric scoring is enabled, delayed reward is blended at terminal step and capped by difficulty to preserve separation across tasks (`easy: 0.12`, `medium: 0.11`, `security: 0.10`, `hard: 0.06`). This keeps hard-task blended scores in-band while still letting semantic rubric quality matter on the multi-issue cascade.
 
 Rubric delayed reward (optional):
 
@@ -149,6 +151,7 @@ Rubric judge debug signals:
 - Service B deploy then fails due image unavailability and timeout pressure.
 - Correct sequence is: fix Service A permissions -> rollback Service B to stable revision -> tune rollout timeout.
 - Includes a red-herring shortcut action that is penalized.
+- Expected difficulty: highest. The task requires three linked remediations within a 14-step budget and is intentionally more tolerant of repeated tool usage across issue transitions than within a single issue phase.
 
 ## Setup instructions
 
@@ -190,6 +193,10 @@ For a deeper narrative of intended upstream value and extension strategy, see `D
 
 ## Inference
 
+`inference.py` is the agentic baseline runner. By default it now keeps the model in the loop across the task budget (`MAX_MODEL_CALLS_PER_TASK` defaults to the per-task step ceiling, `PREFER_DETERMINISTIC_ACTIONS=false`), and only falls back to the scripted policy when tool-calling repeatedly fails or the trajectory clearly stalls.
+
+`eval_runner.py` is separate: it is a deterministic regression baseline for score calibration and reproducibility, not a claim that the environment itself is solved by hardcoded control flow.
+
 `inference.py` stays at repo root and prints strict structured logs:
 
 - `[START] task=... env=... model=...`
@@ -218,6 +225,8 @@ Optional local inference debug variables:
 
 - `INFERENCE_VERBOSE` (`true`/`false`, default `false`)
 - `INFERENCE_DETAIL_MAX_ITEMS` (default `3`, controls list preview size in `[DETAIL]` lines)
+- `MAX_MODEL_CALLS_PER_TASK` (defaults to task step budget; set `0` to force deterministic fallback for smoke tests)
+- `PREFER_DETERMINISTIC_ACTIONS` (`false` by default; set `true` only for scripted-regression comparisons)
 
 ## Provenance Audit Trail
 
@@ -257,6 +266,8 @@ Observed output:
 ```text
 [OK] meta_hackathon: Ready for multi-mode deployment
 ```
+
+The validation run confirms the required `/state` endpoint is implemented and discoverable by the OpenEnv validator even though the baseline agent loop does not need to call it directly.
 
 ### Docker build and runtime validation
 
@@ -302,9 +313,14 @@ uv run evaluate
 Observed summary means:
 
 - easy: `avg_score=0.730`
-- medium: `avg_score=0.602`
-- security: `avg_score=0.526`
-- hard: `avg_score=0.372` (`det=0.342`, with hard delayed-reward cap `0.03`)
+- medium: `avg_score=0.603`
+- security: `avg_score=0.529`
+- hard: `avg_score=0.417` (`det=0.357`, `redundant_actions=0` on the canonical hard baseline, with hard delayed-reward cap `0.06`)
+
+Notes:
+
+- `eval_runner.py` uses the deterministic regression policy, not the agentic `inference.py` loop.
+- Rubric-dependent fields can vary if the external semantic judge is unavailable; check `rubric_judge_used` and `rubric_judge_error` in eval output when reproducing blended scores.
 
 ## Reproducibility artifacts
 

@@ -216,7 +216,7 @@ class MetaHackathonCICDRepairEnvironment(Environment):
             "easy": 0.12,
             "medium": 0.11,
             "security": 0.10,
-            "hard": 0.03,
+            "hard": 0.06,
         }
         delayed_cap = delayed_cap_by_difficulty.get(self._scenario.difficulty, 0.10)
         delayed_reward = max(-delayed_cap, min(delayed_reward, delayed_cap))
@@ -387,6 +387,10 @@ class MetaHackathonCICDRepairEnvironment(Environment):
     def _is_inspection_relevant(self, issue: IncidentStep, operation: str) -> bool:
         return operation in set(issue.relevant_inspections)
 
+    def _redundancy_key(self, history_entry: dict[str, str]) -> str:
+        """Track repeated low-value actions within the current issue phase only."""
+        return f"{self._current_issue_index}:{action_key(history_entry)}"
+
     def _handle_view_logs(self) -> bool:
         issue_index = self._current_issue_index
         issue = self._current_issue()
@@ -472,7 +476,7 @@ class MetaHackathonCICDRepairEnvironment(Environment):
         self._hypothesis_hits = 0
         self._family_hits = 0
         self._fix_hits = 0
-        self._used_inspections = set()
+        self._used_inspections = {"view_logs"}
         self._hypothesis_hit_issues = set()
         self._family_hit_issues = set()
         self._fix_hit_issues = set()
@@ -545,7 +549,7 @@ class MetaHackathonCICDRepairEnvironment(Environment):
         was_done_before_step = self._incident_resolved
         history_entry = {"operation": operation, "target": target, "value": value}
         self._history.append(history_entry)
-        key = action_key(history_entry)
+        key = self._redundancy_key(history_entry)
         was_redundant = key in self._action_keys
         if was_redundant:
             self._redundant_actions += 1

@@ -25,11 +25,11 @@ TEMPERATURE = 0.1
 MAX_TOKENS = 128
 SUCCESS_SCORE_THRESHOLD = float(os.getenv("SUCCESS_SCORE_THRESHOLD", "0.20"))
 TASK_ORDER = ["easy", "medium", "security", "hard"]
-RESCUE_ON_NEGATIVE_REWARD = os.getenv("RESCUE_ON_NEGATIVE_REWARD", "true").lower() == "true"
+RESCUE_ON_NEGATIVE_REWARD = os.getenv("RESCUE_ON_NEGATIVE_REWARD", "false").lower() == "true"
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
 MESSAGE_WINDOW = 6
-MAX_MODEL_CALLS_PER_TASK = int(os.getenv("MAX_MODEL_CALLS_PER_TASK", "1"))
-PREFER_DETERMINISTIC_ACTIONS = os.getenv("PREFER_DETERMINISTIC_ACTIONS", "true").lower() == "true"
+MAX_MODEL_CALLS_PER_TASK = int(os.getenv("MAX_MODEL_CALLS_PER_TASK", str(MAX_STEPS)))
+PREFER_DETERMINISTIC_ACTIONS = os.getenv("PREFER_DETERMINISTIC_ACTIONS", "false").lower() == "true"
 INFERENCE_VERBOSE = os.getenv("INFERENCE_VERBOSE", "false").strip().lower() == "true"
 INFERENCE_DETAIL_MAX_ITEMS = max(1, int(os.getenv("INFERENCE_DETAIL_MAX_ITEMS", "3")))
 VALID_OPERATIONS = {
@@ -681,11 +681,11 @@ def should_force_fallback(
     observation,
 ) -> bool:
     """Enter deterministic fallback when trajectory stalls."""
-    if step <= 2:
+    if step <= 3:
         return False
 
-    recent_rewards = rewards[-2:]
-    if len(recent_rewards) == 2 and all(value <= 0.0 for value in recent_rewards):
+    recent_rewards = rewards[-3:]
+    if len(recent_rewards) == 3 and all(value <= 0.0 for value in recent_rewards):
         return True
 
     if len(history) >= 3:
@@ -693,7 +693,7 @@ def should_force_fallback(
         if len(set(last_ops)) == 1 and last_ops[0] in {"set_hypothesis", "modify_config", "add_dependency"}:
             return True
 
-    if observation.redundant_actions >= 2 and not observation.incident_resolved:
+    if observation.redundant_actions >= 3 and not observation.incident_resolved:
         return True
 
     # Consecutive reruns without improvement generally indicate semantic drift.
@@ -744,12 +744,12 @@ def fallback_action(task_name: str, step: int) -> Tuple[str, str, str]:
             ("finalize", "", ""),
         ],
         "hard": [
-            ("view_logs", "build", ""),
             ("inspect_permissions", "build", ""),
+            ("set_hypothesis", "", "service-a publish is failing because artifactregistry writer permission is missing"),
             ("modify_config", "build", "grant artifactregistry writer to service-a publisher"),
             ("rerun_pipeline", "", ""),
-            ("view_logs", "deploy", ""),
             ("inspect_config", "deploy", ""),
+            ("set_hypothesis", "", "service-b should rollback to the last stable image revision"),
             ("modify_config", "deploy", "rollback service-b to stable image revision"),
             ("rerun_pipeline", "", ""),
             ("view_logs", "deploy", ""),
