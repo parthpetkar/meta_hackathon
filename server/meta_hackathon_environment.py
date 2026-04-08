@@ -143,7 +143,6 @@ class MetaHackathonCICDRepairEnvironment(Environment):
         self._rubric_model_name = (
             os.getenv("META_HACKATHON_RUBRIC_MODEL")
             or os.getenv("MODEL_NAME")
-            or "Qwen/Qwen2.5-72B-Instruct"
         )
         self._rubric_judge = OpenEnvLLMJudgeAdapter(
             enabled=self._rubric_enabled,

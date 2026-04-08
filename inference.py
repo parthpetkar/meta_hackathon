@@ -18,7 +18,7 @@ BASE_URL = os.getenv("ENV_BASE_URL", "http://localhost:8000")
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY")
 
 API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
-MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
+MODEL_NAME = os.getenv("MODEL_NAME")
 BENCHMARK = os.getenv("META_HACKATHON_BENCHMARK", "meta_hackathon")
 MAX_STEPS = 16
 TEMPERATURE = 0.1
