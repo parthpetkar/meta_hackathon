@@ -113,5 +113,6 @@ Add or change behavior in isolated modules:
 - transitions/runtime: `server/meta_hackathon_environment.py`
 - deterministic rewards/grade: `server/graders.py`
 - rubric adapter: `server/rubric_judge.py`
+- agentic inference baseline: `agent/`
 
 This separation keeps task authoring, runtime logic, and evaluation policy modular for upstream OpenEnv contribution.
