@@ -206,13 +206,23 @@ uv run uvicorn server.app:app --host 0.0.0.0 --port 8000
 - Real-world abstraction: models staged CI/CD incidents where upstream build failures create downstream deploy symptoms.
 - Why RL over rules: agents must sequence information-gathering and interventions under partial observability, with delayed reward and penalties for unsafe shortcuts.
 - Open-source contribution value: includes deterministic scenario cards, reproducible variant sampling, and transparent reward shaping intended for extension in the wider OpenEnv benchmark ecosystem.
-- Extensibility entry points: task cards live in `server/scenarios.py`, step/grader logic lives in `server/meta_hackathon_environment.py` and `server/graders.py`, and deterministic regression eval lives in `eval_runner.py`.
+- Extensibility entry points: task cards live in `server/scenarios.py`, step/grader logic lives in `server/meta_hackathon_environment.py` and `server/graders.py`, deterministic regression eval lives in `eval_runner.py`, and the agentic baseline is split across `agent/`.
 
 For a deeper narrative of intended upstream value and extension strategy, see `DESIGN.md`.
 
+## Project layout
+
+- `models.py` and `client.py`: OpenEnv action/observation models and client adapter.
+- `server/`: environment runtime, scenarios, graders, failure patterns, and rubric judge adapter.
+- `agent/`: modular inference baseline (`config`, `prompts`, `tool_schemas`, action guards, fallback plans, HTTP environment helpers, model tool-call translation, and runner).
+- `inference.py`: thin compatibility entry point for the agentic baseline.
+- `eval_runner.py`: deterministic regression evaluator for calibration and smoke tests.
+- `tests/`: environment regression tests.
+- `results/`: generated evaluation artifacts and logs.
+
 ## Inference
 
-`inference.py` is the agentic baseline runner. By default it now keeps the model in the loop across the task budget (`MAX_MODEL_CALLS_PER_TASK` defaults to the per-task step ceiling, `PREFER_DETERMINISTIC_ACTIONS=false`), and only falls back to the scripted policy when tool-calling repeatedly fails or the trajectory clearly stalls.
+`inference.py` is the agentic baseline entry point. The implementation lives in `agent/` so prompts, tool schemas, action guards, fallback plans, HTTP calls, logging, and orchestration can be debugged independently. By default it keeps the model in the loop across the task budget (`MAX_MODEL_CALLS_PER_TASK` defaults to the per-task step ceiling, `PREFER_DETERMINISTIC_ACTIONS=false`), and only falls back to the scripted policy when tool-calling repeatedly fails or the trajectory clearly stalls.
 
 `eval_runner.py` is separate: it is a deterministic regression baseline for score calibration and reproducibility, not a claim that the environment itself is solved by hardcoded control flow.
 
@@ -273,6 +283,8 @@ Run inference:
 
 ```bash
 uv run python inference.py
+# or, after installing the project scripts:
+uv run inference
 ````
 
 Run deterministic evaluation:

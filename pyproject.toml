@@ -42,8 +42,17 @@ dev = [
 # or: python -m meta_hackathon.server.app
 server = "meta_hackathon.server.app:main"
 evaluate = "meta_hackathon.eval_runner:main"
+inference = "meta_hackathon.inference:main"
 
 [tool.setuptools]
 include-package-data = true
-packages = ["meta_hackathon", "meta_hackathon.server"]
-package-dir = { "meta_hackathon" = ".", "meta_hackathon.server" = "server" }
+packages = [
+    "meta_hackathon",
+    "meta_hackathon.server",
+    "meta_hackathon.agent",
+]
+
+[tool.setuptools.package-dir]
+meta_hackathon = "."
+"meta_hackathon.server" = "server"
+"meta_hackathon.agent" = "agent"
