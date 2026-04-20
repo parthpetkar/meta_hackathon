@@ -99,18 +99,21 @@ def step_env(
 
 def format_obs_for_llm(observation: MetaHackathonObservation, step_num: int) -> str:
     parts: List[str] = []
-    parts.append(
-        f"Step {step_num} | Status: {observation.pipeline_status or '?'} | "
-        f"Stage: {observation.current_stage or '?'}"
-    )
+    errors = observation.surfaced_errors or []
+    if errors:
+        parts.append("⚠️  ACTIVE ERRORS (start here):")
+        for item in errors[:5]:
+            parts.append(f"  - {item}")
+        parts.append("")
+
+    status = observation.pipeline_status or "?"
+    stage = observation.current_stage or "?"
+    parts.append(f"Pipeline status: {status} at stage: {stage}")
+    parts.append(f"Step {step_num}")
 
     alerts = observation.visible_alerts or []
     if alerts:
         parts.append("Alerts: " + "; ".join(str(item) for item in alerts[:3]))
-
-    errors = observation.surfaced_errors or []
-    if errors:
-        parts.append("Errors: " + "; ".join(str(item) for item in errors[:3]))
 
     logs = "\n".join(str(line) for line in (observation.visible_logs or [])[-6:])
     if logs and len(logs) < 800:

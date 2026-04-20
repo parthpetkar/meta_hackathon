@@ -38,7 +38,7 @@ def _tool_call_to_action_parts(tool_name: str, tool_args: Dict[str, Any]) -> Tup
         return (
             "modify_config",
             str(tool_args.get("component", "") or ""),
-            str(tool_args.get("fix", "") or ""),
+            str(tool_args.get("value", tool_args.get("fix", "")) or ""),
         )
     if name == "add_dependency":
         return (

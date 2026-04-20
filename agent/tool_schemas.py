@@ -118,12 +118,20 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "type": "string",
                         "description": "Stage or component to fix",
                     },
-                    "fix": {
+                    "value": {
                         "type": "string",
-                        "description": "The fix to apply",
+                        "description": (
+                            "A JSON string with the fix to apply. Required fields: "
+                            "'file' (path to file), 'action' (one of replace/delete_lines/insert), "
+                            "'old' (exact text to replace for replace), and 'new' "
+                            "(replacement text for replace; omit for delete_lines). "
+                            "Example: {\"file\":\"services/api/routes.py\",\"action\":\"replace\","
+                            "\"old\":\"<<<<<<< HEAD\\n    return jsonify({\\\"status\\\": \\\"ok\\\"})\\n=======\\n    return jsonify({\\\"status\\\": \\\"healthy\\\", \\\"version\\\": \\\"2.0\\\"})\\n>>>>>>> feature/new-health-check\","
+                            "\"new\":\"    return jsonify({\\\"status\\\": \\\"healthy\\\", \\\"version\\\": \\\"2.0\\\"})\"}"
+                        ),
                     },
                 },
-                "required": ["fix"],
+                "required": ["value"],
             },
         },
     },

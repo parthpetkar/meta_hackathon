@@ -1,5 +1,6 @@
 """Orchestration loop for the agentic inference baseline."""
 
+import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import requests
@@ -37,9 +38,47 @@ if TYPE_CHECKING:
     from openai import OpenAI
 
 
+def _normalize_hypothesis(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
+def _extract_primary_surfaced_error_file(observation: MetaHackathonObservation) -> str:
+    for err in observation.surfaced_errors or []:
+        text = str(err)
+        match = re.search(r" in ([^:]+):\d+:", text)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def _select_fallback_action(
+    observation: MetaHackathonObservation,
+    action_history: List[Tuple[str, str, str]],
+) -> Tuple[str, str, str]:
+    surfaced_file = _extract_primary_surfaced_error_file(observation)
+    stage = observation.current_stage or "build"
+    candidates: List[Tuple[str, str, str]] = [
+        ("inspect_config", surfaced_file or stage, ""),
+        ("view_logs", stage, ""),
+        ("inspect_dockerfile", "build", ""),
+        ("inspect_permissions", stage, ""),
+        ("rerun_pipeline", "", ""),
+        ("verify_fix", "", ""),
+    ]
+    for candidate in candidates:
+        if candidate not in action_history:
+            return candidate
+    # Keep tuple uniqueness even when all standard candidates were already used.
+    return ("view_logs", stage, f"detail-{len(action_history) + 1}")
+
+
 def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: str) -> Tuple[str, bool, int, float]:
     history: List[str] = []
     rewards: List[float] = []
+    action_history: List[Tuple[str, str, str]] = []
+    attempted_hypotheses: set[str] = set()
+    forced_messages: List[str] = []
+    inspected_config_targets: set[str] = set()
     steps_taken = 0
     score = 0.0
     success = False
@@ -88,55 +127,148 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
             if observation.done:
                 break
 
-            if disable_model_calls:
-                assistant_message = {
-                    "role": "assistant",
-                    "content": "Model tool-calling disabled after repeated misses; using deterministic fallback.",
-                }
-                tool_call_id = None
-            else:
-                operation, target, value, assistant_message, tool_call_id = get_model_action(
-                    client=client,
-                    step=step,
-                    messages=messages,
-                )
-                model_calls_used += 1
-                if model_calls_used >= MAX_MODEL_CALLS_PER_TASK:
-                    disable_model_calls = True
+            if forced_messages:
+                for reminder in forced_messages:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": f"Guardrail: {reminder}",
+                        }
+                    )
+                forced_messages.clear()
+                messages = trim_messages(messages)
 
-                if tool_call_id is None:
-                    tool_call_misses += 1
-                    if (
-                        tool_call_misses >= MAX_CONSECUTIVE_TOOL_CALL_MISSES
-                        and model_calls_used >= MIN_MODEL_CALLS_BEFORE_FORCED_FALLBACK
-                    ):
-                        disable_model_calls = True
+            operation = ""
+            target = ""
+            value = ""
+            assistant_message: Dict[str, Any] = {
+                "role": "assistant",
+                "content": "",
+            }
+            tool_call_id: Optional[str] = None
+
+            guard_attempts = 0
+            while True:
+                guard_attempts += 1
+
+                if disable_model_calls:
+                    assistant_message = {
+                        "role": "assistant",
+                        "content": "Model tool-calling disabled after repeated misses; using deterministic fallback.",
+                    }
+                    tool_call_id = None
+                    operation, target, value = _select_fallback_action(observation, action_history)
                 else:
-                    tool_call_misses = 0
+                    operation, target, value, assistant_message, tool_call_id = get_model_action(
+                        client=client,
+                        step=step,
+                        messages=messages,
+                    )
+                    model_calls_used += 1
+                    if model_calls_used >= MAX_MODEL_CALLS_PER_TASK:
+                        disable_model_calls = True
 
-            operation, target, value = normalize_model_action(
-                operation=operation,
-                target=target,
-                value=value,
-                step=step,
-            )
+                    if tool_call_id is None:
+                        tool_call_misses += 1
+                        if (
+                            tool_call_misses >= MAX_CONSECUTIVE_TOOL_CALL_MISSES
+                            and model_calls_used >= MIN_MODEL_CALLS_BEFORE_FORCED_FALLBACK
+                        ):
+                            disable_model_calls = True
+                    else:
+                        tool_call_misses = 0
 
-            if operation == "finalize" and not ready_to_finalize(observation):
-                operation, target, value = pre_finalize_guard_action(observation)
-                assistant_message = {
-                    "role": "assistant",
-                    "content": f"Guarded action selected before finalize: {operation}|{target}|{value}",
-                }
-                tool_call_id = None
+                operation, target, value = normalize_model_action(
+                    operation=operation,
+                    target=target,
+                    value=value,
+                    step=step,
+                )
 
-            guarded_progression = progression_guard_action(observation, history, operation)
-            if guarded_progression is not None:
-                operation, target, value = guarded_progression
-                assistant_message = {
-                    "role": "assistant",
-                    "content": f"Progression guard action selected: {operation}|{target}|{value}",
-                }
-                tool_call_id = None
+                if operation == "finalize" and not ready_to_finalize(observation):
+                    operation, target, value = pre_finalize_guard_action(observation)
+                    assistant_message = {
+                        "role": "assistant",
+                        "content": f"Guarded action selected before finalize: {operation}|{target}|{value}",
+                    }
+                    tool_call_id = None
+
+                guarded_progression = progression_guard_action(observation, history, operation)
+                if guarded_progression is not None:
+                    operation, target, value = guarded_progression
+                    assistant_message = {
+                        "role": "assistant",
+                        "content": f"Progression guard action selected: {operation}|{target}|{value}",
+                    }
+                    tool_call_id = None
+
+                should_resample = False
+                surfaced_file = _extract_primary_surfaced_error_file(observation)
+                if (
+                    surfaced_file
+                    and surfaced_file not in inspected_config_targets
+                    and (operation != "inspect_config" or target != surfaced_file)
+                ):
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "surfaced_errors names a primary file. Your next action must be "
+                                f"inspect_config on '{surfaced_file}' before any other operation."
+                            ),
+                        }
+                    )
+                    should_resample = True
+
+                if operation == "set_hypothesis" and surfaced_file and surfaced_file not in inspected_config_targets:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Before set_hypothesis, call inspect_config on the surfaced_errors file "
+                                f"'{surfaced_file}'."
+                            ),
+                        }
+                    )
+                    should_resample = True
+
+                if operation == "set_hypothesis":
+                    normalized_hypothesis = _normalize_hypothesis(value)
+                    if normalized_hypothesis and normalized_hypothesis in attempted_hypotheses:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "You already tried this exact hypothesis and it scored negatively. "
+                                    "Choose a different root cause and different hypothesis text."
+                                ),
+                            }
+                        )
+                        should_resample = True
+
+                action_tuple = (operation, target, value)
+                if action_tuple in action_history:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "You already tried this exact action and it failed. "
+                                "Choose a different operation, target, or value."
+                            ),
+                        }
+                    )
+                    should_resample = True
+
+                if should_resample and disable_model_calls:
+                    operation, target, value = _select_fallback_action(observation, action_history)
+                    action_tuple = (operation, target, value)
+                    should_resample = False
+
+                if should_resample and (not disable_model_calls) and guard_attempts < 4:
+                    messages = trim_messages(messages)
+                    continue
+
+                break
 
             try:
                 observation, reward, done, error = step_env(
@@ -167,6 +299,19 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                     error=error,
                 )
             history.append(f"{action_text} -> reward {reward:+.2f}")
+            action_history.append((operation, target, value))
+            if operation == "inspect_config" and target:
+                inspected_config_targets.add(target)
+            if operation == "set_hypothesis":
+                normalized_hypothesis = _normalize_hypothesis(value)
+                if normalized_hypothesis:
+                    attempted_hypotheses.add(normalized_hypothesis)
+                if reward < 0:
+                    forced_messages.append(
+                        "Your last hypothesis was incorrect (negative reward). "
+                        "You must NOT repeat it. Re-read surfaced_errors and form a new hypothesis "
+                        "targeting a different file or root cause."
+                    )
 
             messages.append(assistant_message)
             tool_result = format_obs_for_llm(observation, step)
