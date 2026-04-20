@@ -220,10 +220,10 @@ For a deeper narrative of intended upstream value and extension strategy, see `D
 Duplicate `.env.example` (or set these directly) to configure inference and grading features:
 
 ```bash
-# Inference model endpoint
-MODEL_NAME=Qwen/Qwen2.5-72B-Instruct
-API_BASE_URL=https://router.huggingface.co/v1
-HF_TOKEN=your_hf_token_here
+# Inference and rubric model endpoint (Groq)
+MODEL_NAME=llama-3.3-70b-versatile
+API_BASE_URL=https://api.groq.com/openai/v1
+GROQ_API_KEY=your_groq_api_key_here
 
 # OpenEnv server base URL used by the agent
 ENV_BASE_URL=http://localhost:8000
@@ -239,6 +239,13 @@ INFERENCE_VERBOSE=true
 
 # Server/runtime controls
 META_HACKATHON_PIPELINE_TIMEOUT_SECONDS=300
+
+# Rubric delayed-reward controls
+META_HACKATHON_RUBRIC_ENABLED=true
+META_HACKATHON_RUBRIC_WEIGHT=0.30
+META_HACKATHON_RUBRIC_TIMEOUT_SECONDS=10
+META_HACKATHON_RUBRIC_MODEL=llama-3.3-70b-versatile
+META_HACKATHON_RUBRIC_DEBUG=false
 ```
 
 Optional local inference debug variables:

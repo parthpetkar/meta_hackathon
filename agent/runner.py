@@ -34,6 +34,16 @@ try:
 except ImportError:  # pragma: no cover - direct script execution
     from models import MetaHackathonObservation
 
+try:
+    from server.agent_memory import fingerprint, recall, remember
+except ImportError:  # pragma: no cover - direct script execution
+    try:
+        from .server.agent_memory import fingerprint, recall, remember  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover - memory is optional
+        fingerprint = None  # type: ignore[assignment]
+        recall = None  # type: ignore[assignment]
+        remember = None  # type: ignore[assignment]
+
 if TYPE_CHECKING:
     from openai import OpenAI
 
@@ -72,6 +82,23 @@ def _select_fallback_action(
     return ("view_logs", stage, f"detail-{len(action_history) + 1}")
 
 
+def _memory_hint(errors: List[str]) -> str:
+    if not errors or recall is None:
+        return ""
+    suggestion = recall(errors)
+    if not suggestion.get("suggested_fix"):
+        return ""
+    confidence = float(suggestion.get("confidence", 0.0) or 0.0)
+    times_seen = int(suggestion.get("times_seen", 0) or 0)
+    fix_text = str(suggestion.get("suggested_fix", "")).strip()
+    return (
+        "Persistent memory hint from prior episodes:\n"
+        f"- confidence: {confidence:.3f}\n"
+        f"- times_seen: {times_seen}\n"
+        f"- suggested_fix: {fix_text}"
+    )
+
+
 def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: str) -> Tuple[str, bool, int, float]:
     history: List[str] = []
     rewards: List[float] = []
@@ -90,6 +117,9 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
     observation: Optional[MetaHackathonObservation] = None
     messages: List[Dict[str, Any]] = []
     task_max_steps = MAX_STEPS
+    initial_surfaced_errors: List[str] = []
+    last_fix_value: str = ""
+    last_memory_key: str = ""
 
     try:
         observation = reset_env(session)
@@ -98,6 +128,8 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
             task_name = str(observed.get("task_key"))
         if isinstance(observed, dict) and observed.get("max_steps"):
             task_max_steps = max(task_max_steps, int(observed.get("max_steps", MAX_STEPS)))
+        initial_surfaced_errors = [str(item) for item in (observation.surfaced_errors or [])]
+        last_memory_key = fingerprint(initial_surfaced_errors) if fingerprint is not None else ""
 
         messages = [{"role": "system", "content": build_system_prompt(task_name)}]
 
@@ -113,13 +145,14 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
             )
 
         task_title = observation.task_title or task_name
+        memory_hint = _memory_hint(initial_surfaced_errors)
+        task_intro = f"Task: {task_title}\n\n{format_obs_for_llm(observation, 0)}"
+        if memory_hint:
+            task_intro += f"\n\n{memory_hint}"
         messages.append(
             {
                 "role": "user",
-                "content": (
-                    f"Task: {task_title}\n\n{format_obs_for_llm(observation, 0)}\n\n"
-                    "Begin debugging."
-                ),
+                "content": task_intro + "\n\nBegin debugging.",
             }
         )
 
@@ -286,6 +319,8 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
             rewards.append(reward)
             steps_taken = step
             llm_thought = assistant_message.get("content", "") if assistant_message else ""
+            if operation in {"modify_config", "add_dependency"} and value:
+                last_fix_value = value
             
             action_text = f"{operation}|{target}|{value}"
             log_step(step=step, action=action_text, reward=reward, done=done, error=error, llm_thought=llm_thought)
@@ -315,6 +350,12 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
 
             messages.append(assistant_message)
             tool_result = format_obs_for_llm(observation, step)
+            observation_errors = [str(item) for item in (observation.surfaced_errors or [])]
+            current_memory_key = fingerprint(observation_errors) if fingerprint is not None else ""
+            memory_hint = _memory_hint(observation_errors) if current_memory_key != last_memory_key else ""
+            if memory_hint:
+                tool_result = f"{tool_result}\n\n{memory_hint}"
+                last_memory_key = current_memory_key
             if tool_call_id:
                 messages.append(
                     {
@@ -342,6 +383,11 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
             score = float(observation.final_score)
             resolved = bool(observation.incident_resolved)
         success = resolved and score >= SUCCESS_SCORE_THRESHOLD
+        if remember is not None and initial_surfaced_errors and last_fix_value:
+            try:
+                remember(initial_surfaced_errors, last_fix_value, success)
+            except Exception:
+                pass
     finally:
         log_end(success=success, steps=steps_taken, score=score, resolved=resolved, rewards=rewards)
         if INFERENCE_VERBOSE:
