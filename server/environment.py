@@ -51,6 +51,10 @@ from cicd.observation_builder import (
     read_workspace_file,
 )
 from cicd.fix_applier import apply_fix, FixResult
+try:
+    from .rubric_judge import DEFAULT_GROQ_MODEL, OpenEnvLLMJudgeAdapter
+except (ImportError, ModuleNotFoundError):
+    from rubric_judge import DEFAULT_GROQ_MODEL, OpenEnvLLMJudgeAdapter
 
 
 # ── Constants ──────────────────────────────────────────────────────────────
@@ -132,6 +136,13 @@ class EpisodeState:
     inspected_since_last_rerun: bool = True
     fix_hits: int = 0
 
+    # Rubric scoring
+    deterministic_score: float = 0.0
+    rubric_score: float = 0.0
+    delayed_reward: float = 0.0
+    rubric_judge_used: bool = False
+    rubric_judge_error: str = ""
+
     # Inspections
     used_inspections: Set[str] = field(default_factory=set)
 
@@ -191,6 +202,22 @@ class RealCICDRepairEnvironment(Environment):
 
         self._pipeline_timeout = int(
             os.getenv("META_HACKATHON_PIPELINE_TIMEOUT_SECONDS", "300")
+        )
+        self._rubric_enabled = os.getenv("META_HACKATHON_RUBRIC_ENABLED", "false").strip().lower() == "true"
+        self._rubric_weight = max(
+            0.0,
+            min(1.0, float(os.getenv("META_HACKATHON_RUBRIC_WEIGHT", "0.30"))),
+        )
+        self._rubric_timeout = int(os.getenv("META_HACKATHON_RUBRIC_TIMEOUT_SECONDS", "10"))
+        self._rubric_model = (
+            os.getenv("META_HACKATHON_RUBRIC_MODEL")
+            or os.getenv("MODEL_NAME")
+            or DEFAULT_GROQ_MODEL
+        )
+        self._rubric_judge = OpenEnvLLMJudgeAdapter(
+            enabled=self._rubric_enabled,
+            model_name=self._rubric_model,
+            timeout_seconds=self._rubric_timeout,
         )
 
         # Cleanup thread
@@ -680,10 +707,39 @@ class RealCICDRepairEnvironment(Environment):
             for e in ep.history[-16:]
         ]
 
-        # Compute final score on done
+        # Compute terminal scoring on done
         final_score = 0.0
+        deterministic_score = 0.0
+        rubric_score = 0.0
+        delayed_reward = 0.0
+        rubric_judge_used = False
+        rubric_judge_error = ""
         if done:
-            final_score = self._compute_final_score(ep)
+            deterministic_score = self._compute_final_score(ep)
+            final_score = deterministic_score
+            if self._rubric_judge.is_active():
+                try:
+                    judge_result = self._rubric_judge.evaluate_hypothesis_quality(
+                        self._build_rubric_payload(ep, fault_type, difficulty)
+                    )
+                    rubric_score = float(judge_result.score)
+                    final_score = round(
+                        ((1.0 - self._rubric_weight) * deterministic_score)
+                        + (self._rubric_weight * rubric_score),
+                        3,
+                    )
+                    delayed_reward = round(final_score - deterministic_score, 3)
+                    reward = round(reward + delayed_reward, 3)
+                    rubric_judge_used = not judge_result.used_fallback
+                    rubric_judge_error = str(judge_result.error or "")
+                except Exception as exc:
+                    rubric_judge_error = f"Rubric judge failed: {exc}"
+
+            ep.deterministic_score = deterministic_score
+            ep.rubric_score = rubric_score
+            ep.delayed_reward = delayed_reward
+            ep.rubric_judge_used = rubric_judge_used
+            ep.rubric_judge_error = rubric_judge_error
 
         pipeline_result = ep.pipeline_result or PipelineResult()
 
@@ -705,6 +761,12 @@ class RealCICDRepairEnvironment(Environment):
             redundant_actions=ep.redundant_actions,
             destructive_actions=ep.destructive_actions,
             final_score=final_score,
+            deterministic_score=deterministic_score,
+            rubric_score=rubric_score,
+            delayed_reward=delayed_reward,
+            rubric_blend_weight=self._rubric_weight if self._rubric_judge.is_active() else 0.0,
+            rubric_judge_used=rubric_judge_used,
+            rubric_judge_error=rubric_judge_error,
             findings=ep.findings[-16:],
             metadata={
                 "task_key": fault_type,
@@ -715,8 +777,35 @@ class RealCICDRepairEnvironment(Environment):
                 "verified_since_last_rerun": ep.verified_for_latest_rerun,
                 "supported_operations": CANONICAL_OPERATIONS,
                 "canonical_operations": CANONICAL_OPERATIONS,
+                "rubric_enabled": self._rubric_judge.is_active(),
             },
         )
+
+    def _build_rubric_payload(self, ep: EpisodeState, fault_type: str, difficulty: str) -> Dict[str, Any]:
+        keywords = ep.fault_metadata.keywords if ep.fault_metadata else []
+        return {
+            "task_id": f"real_{fault_type}",
+            "difficulty": difficulty,
+            "evidence": {
+                "hypothesis_history": ep.hypothesis_history[-8:],
+                "current_hypothesis": ep.current_hypothesis,
+                "findings": ep.findings[-16:],
+                "surfaced_errors": build_surfaced_errors(ep.pipeline_result or PipelineResult(), ep.workspace_dir),
+                "incident_resolved": ep.incident_resolved,
+            },
+            "incident_chain": [
+                {
+                    "true_cause": fault_type.replace("_", " "),
+                    "hypothesis_terms": keywords,
+                    "family_term_sets": [keywords[:2], keywords[2:4]] if len(keywords) >= 4 else [keywords],
+                }
+            ],
+            "rubric": {
+                "semantic_correctness": "Hypothesis should match the real fault category",
+                "evidence_alignment": "Hypothesis should align with surfaced errors and logs",
+                "completeness": "Hypothesis should reference core affected component/file",
+            },
+        }
 
     def _compute_final_score(self, ep: EpisodeState) -> float:
         """Compute final episode score from real outcomes."""
