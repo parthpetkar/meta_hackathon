@@ -1,3 +1,4 @@
 [console_scripts]
 evaluate = meta_hackathon.eval_runner:main
+inference = meta_hackathon.inference:main
 server = meta_hackathon.server.app:main

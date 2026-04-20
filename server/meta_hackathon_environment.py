@@ -18,6 +18,7 @@ except Exception:  # pragma: no cover - optional import safety
     load_dotenv = None
 
 try:
+    from .agent_memory import recall as _recall, remember as _remember
     from .graders import action_key, grade_episode, matches_terms, step_reward
     from .graders import (
         classify_flaky_test_fix,
@@ -43,6 +44,7 @@ try:
     )
     from ..models import MetaHackathonAction, MetaHackathonObservation
 except ImportError:
+    from server.agent_memory import recall as _recall, remember as _remember
     from server.graders import action_key, grade_episode, matches_terms, step_reward
     from server.graders import (
         classify_flaky_test_fix,
@@ -160,6 +162,10 @@ class MetaHackathonCICDRepairEnvironment(Environment):
         self._last_rerun_progressed = False
         self._verified_for_latest_rerun = False
         self._inspected_since_last_rerun = True
+
+        self._episode_last_fix_attempt: str = ""
+        self._memory_recorded_this_episode: bool = False
+        self._memory_hints: dict = {}
 
     def _rubric_payload(self) -> dict:
         issue_chain = [
@@ -534,6 +540,13 @@ class MetaHackathonCICDRepairEnvironment(Environment):
         self._set_stage_progress_after_advance()
         self._handle_view_logs()
 
+        self._episode_last_fix_attempt = ""
+        self._memory_recorded_this_episode = False
+        try:
+            self._memory_hints = _recall(self._surface_errors[-6:])
+        except Exception:
+            self._memory_hints = {}
+
         return self._base_observation(
             reward=0.0,
             done=False,
@@ -546,6 +559,7 @@ class MetaHackathonCICDRepairEnvironment(Environment):
                 "verified_since_last_rerun": self._verified_for_latest_rerun,
                 "supported_operations": SUPPORTED_OPERATIONS,
                 "canonical_operations": CANONICAL_OPERATIONS,
+                "memory_hints": self._memory_hints,
                 **self._audit_metadata_payload(),
             },
         )
@@ -659,6 +673,8 @@ class MetaHackathonCICDRepairEnvironment(Environment):
 
         elif operation in {"modify_config", "add_dependency"}:
             self._attempted_fix = value
+            if value:
+                self._episode_last_fix_attempt = value
             self._verified_for_latest_rerun = False
             if not self._used_inspections:
                 self._append_unique(self._findings, "Fix attempted before inspection evidence collection.")
@@ -933,6 +949,17 @@ class MetaHackathonCICDRepairEnvironment(Environment):
             obs.metadata["error"] = step_error_message
 
         if done:
+            if not self._memory_recorded_this_episode and self._episode_last_fix_attempt:
+                self._memory_recorded_this_episode = True
+                try:
+                    _remember(
+                        self._surface_errors[-6:],
+                        self._episode_last_fix_attempt,
+                        self._incident_resolved,
+                    )
+                except Exception:
+                    pass
+
             deterministic_score = grade_episode(
                 difficulty=self._scenario.difficulty,
                 issue_count=len(self._scenario.incident_chain),
