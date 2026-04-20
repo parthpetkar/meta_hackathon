@@ -41,7 +41,6 @@ dev = [
 # Server entry point - enables running via: uv run --project . server
 # or: python -m meta_hackathon.server.app
 server = "meta_hackathon.server.app:main"
-evaluate = "meta_hackathon.eval_runner:main"
 inference = "meta_hackathon.inference:main"
 
 [tool.setuptools]
@@ -50,9 +49,11 @@ packages = [
     "meta_hackathon",
     "meta_hackathon.server",
     "meta_hackathon.agent",
+    "meta_hackathon.cicd",
 ]
 
 [tool.setuptools.package-dir]
 meta_hackathon = "."
 "meta_hackathon.server" = "server"
 "meta_hackathon.agent" = "agent"
+"meta_hackathon.cicd" = "cicd"

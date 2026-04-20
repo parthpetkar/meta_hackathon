@@ -60,46 +60,43 @@ def get_model_action(
     step: int,
     messages: list[Dict[str, Any]],
 ) -> Tuple[str, str, str, Dict[str, Any], Optional[str]]:
-    try:
-        completion = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=messages,
-            tools=TOOL_SCHEMAS,
-            tool_choice="auto",
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
-            stream=False,
-        )
+    completion = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+        tools=TOOL_SCHEMAS,
+        tool_choice="auto",
+        temperature=TEMPERATURE,
+        max_tokens=MAX_TOKENS,
+        stream=False,
+    )
 
-        message = completion.choices[0].message
-        if message.tool_calls:
-            tool_call = message.tool_calls[0]
-            tool_name = (tool_call.function.name or "").strip()
-            tool_args = _parse_tool_arguments(tool_call.function.arguments)
-            operation, target, value = _tool_call_to_action_parts(tool_name, tool_args)
-            tool_call_id = tool_call.id or f"call_{step}"
-            assistant_message: Dict[str, Any] = {
-                "role": "assistant",
-                "content": message.content,
-                "tool_calls": [
-                    {
-                        "id": tool_call_id,
-                        "type": "function",
-                        "function": {
-                            "name": tool_name,
-                            "arguments": json.dumps(tool_args, ensure_ascii=True, separators=(",", ":")),
-                        },
-                    }
-                ],
-            }
-            return operation, target, value, assistant_message, tool_call_id
-
-        text = (message.content or "").strip()
-        assistant_message = {
+    message = completion.choices[0].message
+    if message.tool_calls:
+        tool_call = message.tool_calls[0]
+        tool_name = (tool_call.function.name or "").strip()
+        tool_args = _parse_tool_arguments(tool_call.function.arguments)
+        operation, target, value = _tool_call_to_action_parts(tool_name, tool_args)
+        tool_call_id = tool_call.id or f"call_{step}"
+        assistant_message: Dict[str, Any] = {
             "role": "assistant",
-            "content": text,
+            "content": message.content,
+            "tool_calls": [
+                {
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": json.dumps(tool_args, ensure_ascii=True, separators=(",", ":")),
+                    },
+                }
+            ],
         }
-        # Strict mode: require native tool call structure. If absent, fallback logic handles actioning.
-        return "", "", "", assistant_message, None
-    except Exception:
-        return "", "", "", {"role": "assistant", "content": "Model call failed."}, None
+        return operation, target, value, assistant_message, tool_call_id
+
+    text = (message.content or "").strip()
+    assistant_message = {
+        "role": "assistant",
+        "content": text,
+    }
+    # Strict mode: require native tool call structure.
+    return "", "", "", assistant_message, None

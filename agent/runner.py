@@ -5,12 +5,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import requests
 
 from .actions import (
-    action_matches_expected_plan,
     normalize_model_action,
     pre_finalize_guard_action,
     progression_guard_action,
     ready_to_finalize,
-    should_force_fallback,
 )
 from .config import (
     API_BASE_URL,
@@ -22,12 +20,9 @@ from .config import (
     MAX_STEPS,
     MIN_MODEL_CALLS_BEFORE_FORCED_FALLBACK,
     MODEL_NAME,
-    PREFER_DETERMINISTIC_ACTIONS,
-    RESCUE_ON_NEGATIVE_REWARD,
     SUCCESS_SCORE_THRESHOLD,
     TASK_ORDER,
 )
-from .fallback import fallback_action
 from .http_environment import format_obs_for_llm, reset_env, step_env, trim_messages
 from .model_client import get_model_action
 from .prompts import build_system_prompt
@@ -50,7 +45,6 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
     success = False
     resolved = False
     task_name = fallback_task_name
-    fallback_window = 0
     tool_call_misses = 0
     model_calls_used = 0
     disable_model_calls = MAX_MODEL_CALLS_PER_TASK <= 0
@@ -95,7 +89,6 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                 break
 
             if disable_model_calls:
-                operation, target, value = fallback_action(task_name, step)
                 assistant_message = {
                     "role": "assistant",
                     "content": "Model tool-calling disabled after repeated misses; using deterministic fallback.",
@@ -127,41 +120,6 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                 value=value,
                 step=step,
             )
-
-            use_fallback = False
-            if fallback_window > 0:
-                use_fallback = True
-                fallback_window -= 1
-            elif RESCUE_ON_NEGATIVE_REWARD and rewards and rewards[-1] < 0.0:
-                use_fallback = True
-                fallback_window = 3
-            elif not operation:
-                use_fallback = True
-                fallback_window = 2
-            elif should_force_fallback(
-                step=step,
-                rewards=rewards,
-                history=history,
-                observation=observation,
-            ):
-                use_fallback = True
-                fallback_window = 2
-            elif PREFER_DETERMINISTIC_ACTIONS and not action_matches_expected_plan(
-                task_name,
-                step,
-                operation,
-                target,
-                value,
-            ):
-                use_fallback = True
-
-            if use_fallback:
-                operation, target, value = fallback_action(task_name, step)
-                assistant_message = {
-                    "role": "assistant",
-                    "content": f"Fallback action selected: {operation}|{target}|{value}",
-                }
-                tool_call_id = None
 
             if operation == "finalize" and not ready_to_finalize(observation):
                 operation, target, value = pre_finalize_guard_action(observation)
@@ -195,9 +153,10 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
 
             rewards.append(reward)
             steps_taken = step
-
+            llm_thought = assistant_message.get("content", "") if assistant_message else ""
+            
             action_text = f"{operation}|{target}|{value}"
-            log_step(step=step, action=action_text, reward=reward, done=done, error=error)
+            log_step(step=step, action=action_text, reward=reward, done=done, error=error, llm_thought=llm_thought)
             if INFERENCE_VERBOSE:
                 log_detail(
                     step=step,

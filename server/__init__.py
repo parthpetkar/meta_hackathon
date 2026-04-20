@@ -6,6 +6,6 @@
 
 """Meta Hackathon environment server components."""
 
-from .meta_hackathon_environment import MetaHackathonEnvironment
+from .environment import RealCICDRepairEnvironment
 
-__all__ = ["MetaHackathonEnvironment"]
+__all__ = ["RealCICDRepairEnvironment"]

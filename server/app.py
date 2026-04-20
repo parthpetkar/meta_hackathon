@@ -37,18 +37,19 @@ except Exception as e:  # pragma: no cover
 
 try:
     from ..models import MetaHackathonAction, MetaHackathonObservation
-    from .meta_hackathon_environment import MetaHackathonCICDRepairEnvironment
+    from .environment import RealCICDRepairEnvironment
 except (ImportError, ModuleNotFoundError):
     from models import MetaHackathonAction, MetaHackathonObservation
-    from server.meta_hackathon_environment import MetaHackathonCICDRepairEnvironment
+    from server.environment import RealCICDRepairEnvironment
 
 
-_SHARED_REST_ENV = MetaHackathonCICDRepairEnvironment()
+_SHARED_REST_ENV = RealCICDRepairEnvironment()
+_SHARED_REST_ENV.close = lambda: None  # prevent REST handlers from nuking _episode between requests
 
 
-def _shared_env_factory() -> MetaHackathonCICDRepairEnvironment:
-    # OpenEnv HTTP handlers instantiate env per request; sharing one instance preserves
-    # episode continuity for /reset + /step in REST mode.
+def _shared_env_factory() -> RealCICDRepairEnvironment:
+    # OpenEnv HTTP handlers call close() after every request; the no-op close above
+    # preserves episode state across /reset and /step calls on the shared instance.
     return _SHARED_REST_ENV
 
 

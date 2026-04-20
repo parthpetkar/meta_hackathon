@@ -16,7 +16,9 @@ MAX_STEPS = 16
 TEMPERATURE = 0.1
 MAX_TOKENS = 128
 SUCCESS_SCORE_THRESHOLD = float(os.getenv("SUCCESS_SCORE_THRESHOLD", "0.20"))
-TASK_ORDER = ["easy", "flaky", "medium", "network", "security", "hard"]
+_TASK_MODE = os.getenv("META_HACKATHON_TASK_MODE", "").strip().lower()
+_ALL_TASKS = ["easy", "flaky", "medium", "network", "security", "hard"]
+TASK_ORDER = [_TASK_MODE] if _TASK_MODE and _TASK_MODE in _ALL_TASKS else _ALL_TASKS
 
 RESCUE_ON_NEGATIVE_REWARD = os.getenv("RESCUE_ON_NEGATIVE_REWARD", "false").lower() == "true"
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))

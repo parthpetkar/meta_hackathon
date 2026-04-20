@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import openenv; print\\(openenv.__file__\\)\")",
+      "Bash(uv run *)",
+      "Bash(python -c \"from cicd.pipeline_runner import PipelineRunner; from cicd.fault_injector import FAULT_TYPES; from cicd.observation_builder import build_observation; from cicd.fix_applier import apply_fix; print\\('cicd imports OK'\\)\")",
+      "Bash(python -c \"from server.environment import RealCICDRepairEnvironment; print\\('server.environment imports OK'\\)\")"
+    ]
+  }
+}

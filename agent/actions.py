@@ -3,7 +3,6 @@
 import re
 from typing import List, Tuple
 
-from .fallback import fallback_action
 from .tool_schemas import VALID_OPERATIONS
 
 try:
@@ -14,15 +13,6 @@ except ImportError:  # pragma: no cover - direct script execution
 
 def _normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").strip().lower())
-
-
-def action_matches_expected_plan(task_name: str, step: int, operation: str, target: str, value: str) -> bool:
-    expected_op, expected_target, expected_value = fallback_action(task_name, step)
-    if _normalize_text(operation) != _normalize_text(expected_op):
-        return False
-    if _normalize_text(target) != _normalize_text(expected_target):
-        return False
-    return _normalize_text(value) == _normalize_text(expected_value)
 
 
 def parse_model_action(raw_text: str) -> Tuple[str, str, str]:

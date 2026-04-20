@@ -1,0 +1,40 @@
+services:
+  env-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: meta-hackathon-env:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - pipeline-workspaces:/tmp/workspaces
+    environment:
+      - PIPELINE_WORKSPACES_ROOT=/tmp/workspaces
+      - ENABLE_WEB_INTERFACE=true
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  agent:
+    build:
+      context: .
+      dockerfile: agent/Dockerfile
+    image: meta-hackathon-agent:latest
+    depends_on:
+      env-server:
+        condition: service_healthy
+    environment:
+      - ENV_BASE_URL=http://env-server:8000
+      - MODEL_NAME=${MODEL_NAME:-}
+      - API_BASE_URL=${API_BASE_URL:-https://router.huggingface.co/v1}
+      - HF_TOKEN=${HF_TOKEN:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - INFERENCE_VERBOSE=${INFERENCE_VERBOSE:-false}
+    command: ["python", "-m", "agent.runner"]
+
+volumes:
+  pipeline-workspaces:
