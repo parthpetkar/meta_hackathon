@@ -6,10 +6,45 @@
 
 """Data models for the Meta Hackathon CI/CD repair environment."""
 
+from dataclasses import dataclass, field
 from typing import Dict, List
 
 from openenv.core.env_server.types import Action, Observation
 from pydantic import Field
+
+
+@dataclass
+class IncidentStep:
+    """One fault in a multi-fault cascading CI/CD incident."""
+    fault_type: str
+    effect: str
+    order: int
+    is_root_cause: bool
+    depends_on: List[int] = field(default_factory=list)
+
+
+@dataclass
+class AdversarialCICDScenario:
+    """Multi-fault incident designed by the adversarial Groq judge."""
+    title: str
+    narrative: str
+    steps: List[IncidentStep]
+    expected_triage: List[str]
+    expected_investigation: List[str]
+    expected_hypothesis_terms: List[str]
+    expected_fix_sequence: List[str]
+    expected_verification: List[str]
+    red_herrings: List[str]
+    root_cause_explanation: str
+    difficulty: float = 0.5
+    alert_message: str = ""
+
+    def __post_init__(self) -> None:
+        # Deserialize nested IncidentStep dicts when loaded from JSON
+        self.steps = [
+            IncidentStep(**s) if isinstance(s, dict) else s
+            for s in self.steps
+        ]
 
 
 class MetaHackathonAction(Action):

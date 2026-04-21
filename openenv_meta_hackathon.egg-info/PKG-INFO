@@ -8,6 +8,7 @@ Requires-Dist: openenv-core[core]>=0.2.2
 Requires-Dist: pytest>=9.0.2
 Requires-Dist: python-dotenv>=1.2.2
 Requires-Dist: requests>=2.31.0
+Requires-Dist: openai>=1.30.0
 Provides-Extra: dev
 Requires-Dist: pytest>=8.0.0; extra == "dev"
 Requires-Dist: pytest-cov>=4.0.0; extra == "dev"

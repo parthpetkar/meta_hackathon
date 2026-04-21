@@ -53,8 +53,14 @@ from cicd.observation_builder import (
 from cicd.fix_applier import apply_fix, FixResult
 try:
     from .rubric_judge import DEFAULT_GROQ_MODEL, OpenEnvLLMJudgeAdapter
+    from .curriculum import CurriculumController
+    from .adversarial_designer import AdversarialDesigner
+    from .adversarial_judge import AdversarialJudge
 except (ImportError, ModuleNotFoundError):
     from rubric_judge import DEFAULT_GROQ_MODEL, OpenEnvLLMJudgeAdapter
+    from curriculum import CurriculumController
+    from adversarial_designer import AdversarialDesigner
+    from adversarial_judge import AdversarialJudge
 
 
 # ── Constants ──────────────────────────────────────────────────────────────
@@ -135,6 +141,11 @@ class EpisodeState:
     verified_for_latest_rerun: bool = False
     inspected_since_last_rerun: bool = True
     fix_hits: int = 0
+
+    # Adversarial mode
+    adversarial_scenario: Optional[Any] = None
+    cascading_faults: List[Any] = field(default_factory=list)
+    curriculum_difficulty: float = 0.5
 
     # Rubric scoring
     deterministic_score: float = 0.0
@@ -220,6 +231,13 @@ class RealCICDRepairEnvironment(Environment):
             timeout_seconds=self._rubric_timeout,
         )
 
+        # Curriculum + adversarial always active together
+        self._curriculum = CurriculumController()
+        self._adv_designer = AdversarialDesigner(
+            api_key=os.getenv("OPENROUTER_API_KEY") or os.getenv("API_KEY"),
+        )
+        self._adv_judge = AdversarialJudge()
+
         # Cleanup thread
         self._cleanup_lock = threading.Lock()
         self._stale_workspaces: List[tuple[str, float]] = []
@@ -253,14 +271,12 @@ class RealCICDRepairEnvironment(Environment):
 
         eff_task_key = task_key or self._task_key
 
-        # Choose fault type
+        # Choose fault type — curriculum UCB1 for "cycle", explicit otherwise
         if eff_task_key == "cycle":
-            fault_type = self._task_order[self._task_cursor % len(self._task_order)]
-            self._task_cursor += 1
+            fault_type = self._curriculum.select_fault_type()
         elif eff_task_key in FAULT_TYPES:
             fault_type = eff_task_key
         else:
-            # Map old task keys to fault types
             key_map = {
                 "easy": "merge_conflict",
                 "medium": "dependency_conflict",
@@ -271,6 +287,9 @@ class RealCICDRepairEnvironment(Environment):
             }
             fault_type = key_map.get(eff_task_key, "merge_conflict")
 
+        curriculum_difficulty = self._curriculum.get_difficulty()
+        skill_profile = self._curriculum.get_skill_profile()
+
         # Set up workspace
         workspace_base = tempfile.mkdtemp(prefix="cicd-episode-")
         repo_dir = os.path.join(workspace_base, "repo")
@@ -278,8 +297,15 @@ class RealCICDRepairEnvironment(Environment):
         # Initialize git repo from template
         setup_repo_from_template(self._template_dir, repo_dir)
 
-        # Inject the fault
-        fault_metadata = inject_fault(repo_dir, fault_type)
+        # Curriculum selects root cause; designer builds full scenario around it
+        adversarial_scenario = self._adv_designer.design(
+            root_cause_fault=fault_type,
+            difficulty=curriculum_difficulty,
+            skill_profile=skill_profile,
+        )
+        injected = self._adv_designer.inject(repo_dir, adversarial_scenario)
+        fault_metadata = injected[0] if injected else inject_fault(repo_dir, fault_type)
+        cascading_faults: list = injected[1:] if len(injected) > 1 else []
 
         # Run the pipeline (should fail)
         runner = PipelineRunner(
@@ -300,6 +326,9 @@ class RealCICDRepairEnvironment(Environment):
             all_pipeline_results=[pipeline_result],
             findings=["Incident acknowledged. Investigate before changing configuration."],
             created_at=time.time(),
+            adversarial_scenario=adversarial_scenario,
+            cascading_faults=cascading_faults,
+            curriculum_difficulty=curriculum_difficulty,
         )
         self._episode = episode
 
@@ -400,6 +429,18 @@ class RealCICDRepairEnvironment(Environment):
         elif operation == "finalize":
             reward = self._handle_finalize(episode)
 
+        # Phase-aware bonus from adversarial judge (always active)
+        if episode.adversarial_scenario is not None:
+            phase_bonus, phase_note = self._adv_judge.score_step(
+                operation=operation,
+                value=value,
+                scenario=episode.adversarial_scenario,
+                history=episode.history,
+            )
+            reward += phase_bonus
+            if phase_note:
+                episode.findings.append(f"[Judge] {phase_note}")
+
         # Apply redundancy penalty
         if was_redundant:
             reward = min(reward, -0.08)
@@ -459,19 +500,40 @@ class RealCICDRepairEnvironment(Environment):
         ep.used_inspections.add("inspect_config")
         ep.inspected_since_last_rerun = True
 
-        configs = read_config_files(ep.workspace_dir)
+        # If target specified, only read that file; otherwise read all
+        if target:
+            # Try the target as-is, then search in standard config paths
+            filepath = target
+            if not os.path.exists(os.path.join(ep.workspace_dir, filepath)):
+                for cfg in ["Dockerfile", "docker-compose.yml", "services/api/requirements.txt",
+                           "services/api/routes.py", "services/api/app.py", ".github/ci.yml"]:
+                    if target.lower() in cfg.lower():
+                        filepath = cfg
+                        break
+            content = read_workspace_file(ep.workspace_dir, filepath)
+            configs = {filepath: content}
+        else:
+            configs = read_config_files(ep.workspace_dir)
+
         for filename, content in configs.items():
-            # Surface conflict markers explicitly before truncating
-            conflict_lines = [
-                f"  line {i}: {line.rstrip()}"
-                for i, line in enumerate(content.splitlines(), 1)
-                if line.startswith(("<<<<<<<", "=======", ">>>>>>>"))
-            ]
-            if conflict_lines:
-                ep.findings.append(
-                    f"⚠ MERGE CONFLICT in '{filename}':\n" + "\n".join(conflict_lines)
+            # Extract conflict markers and surrounding lines for clarity
+            lines = content.splitlines()
+            conflict_indices = []
+            for i, line in enumerate(lines):
+                if line.startswith(("<<<<<<<", "=======", ">>>>>>>")):
+                    conflict_indices.append(i)
+
+            if conflict_indices:
+                # Show conflict with context (±2 lines)
+                start_ctx = max(0, conflict_indices[0] - 2)
+                end_ctx = min(len(lines), conflict_indices[-1] + 3)
+                conflict_section = "\n".join(
+                    f"  {i:3d}: {line}" for i, line in enumerate(lines[start_ctx:end_ctx], start_ctx + 1)
                 )
-            ep.findings.append(f"Config file '{filename}':\n{content[:500]}")
+                ep.findings.append(f"⚠ MERGE CONFLICT in '{filename}':\n{conflict_section}")
+            else:
+                # No conflict — show first portion
+                ep.findings.append(f"Config file '{filename}':\n{content[:600]}")
 
         # Relevant if fault is in a config file
         if ep.fault_metadata:
@@ -531,9 +593,17 @@ class RealCICDRepairEnvironment(Environment):
         if not ep.fault_metadata:
             return -0.10
 
-        # Score by comparing key terms against real fault type and affected files
+        # Build keyword pool from all injected faults (adversarial = multiple faults)
         hypothesis_lower = value.lower()
-        keywords = ep.fault_metadata.keywords or FAULT_KEYWORDS.get(ep.fault_metadata.fault_type, [])
+        if ep.adversarial_scenario is not None:
+            # Adversarial: accept match against expected terms OR any injected fault's keywords
+            keywords = list(ep.adversarial_scenario.expected_hypothesis_terms)
+            for step in ep.adversarial_scenario.steps:
+                keywords += FAULT_KEYWORDS.get(step.fault_type, [])
+            keywords = list(dict.fromkeys(keywords))  # deduplicate
+        else:
+            keywords = ep.fault_metadata.keywords or FAULT_KEYWORDS.get(ep.fault_metadata.fault_type, [])
+
         match_count = sum(1 for kw in keywords if kw.lower() in hypothesis_lower)
         match_ratio = match_count / max(len(keywords), 1)
 
@@ -543,14 +613,18 @@ class RealCICDRepairEnvironment(Environment):
             for f in ep.fault_metadata.affected_files
         )
 
-        if match_ratio >= 0.4 or (match_ratio >= 0.2 and file_mentioned):
+        # 1+ keyword OR file mentioned = correct (lenient to avoid misleading the agent)
+        if match_count >= 1 or file_mentioned:
             ep.hypothesis_correct = True
-            ep.findings.append("Hypothesis aligns with current failure evidence.")
+            ep.findings.append(f"Hypothesis partially aligns (matched {match_count}/{len(keywords)} keywords). Apply the fix.")
             if ep.hypothesis_attempts == 1:
-                return 0.22  # First try
-            return 0.10  # Retry
+                return 0.18 if match_ratio >= 0.4 else 0.12
+            return 0.08 if match_ratio >= 0.4 else 0.05
         else:
-            ep.findings.append("Hypothesis does not explain all current clues yet.")
+            # Give a hint using the ROOT CAUSE fault's keywords (not cascading fault's)
+            root_fault = ep.fault_metadata.fault_type
+            hint_keywords = FAULT_KEYWORDS.get(root_fault, keywords)[:3]
+            ep.findings.append("Hypothesis does not match current evidence. Try mentioning: " + ", ".join(hint_keywords))
             return -0.10
 
     def _handle_modify(self, ep: EpisodeState, operation: str, target: str, value: str) -> float:
@@ -664,19 +738,19 @@ class RealCICDRepairEnvironment(Environment):
             return -0.06
 
     def _handle_finalize(self, ep: EpisodeState) -> float:
-        """Compute final score from real pipeline outcome."""
-        if ep.incident_resolved and ep.verified_for_latest_rerun:
-            ep.findings.append("CI/CD incident fully resolved. Pipeline healthy.")
-            return 0.25
-        elif ep.incident_resolved and not ep.verified_for_latest_rerun:
-            ep.findings.append("Finalization rejected: run verify_fix after rerun_pipeline.")
-            return -0.15
-        elif ep.last_rerun_progressed:
-            ep.findings.append("Partial resolution — some stages still failing.")
-            return 0.20
-        else:
-            ep.findings.append("Finalization rejected: unresolved stages remain.")
-            return -0.15
+        """Compute final score — adversarial terminal scorer always used."""
+        pipeline_passed = (
+            ep.pipeline_result is not None
+            and ep.pipeline_result.status == PipelineStatus.PASSED
+        )
+        bonus, note = self._adv_judge.score_terminal(
+            incident_resolved=ep.incident_resolved,
+            verified=ep.verified_for_latest_rerun,
+            pipeline_passed=pipeline_passed,
+            cascading_fault_count=len(ep.cascading_faults),
+        )
+        ep.findings.append(f"[Judge] terminal: {note}")
+        return bonus
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -740,6 +814,15 @@ class RealCICDRepairEnvironment(Environment):
             ep.delayed_reward = delayed_reward
             ep.rubric_judge_used = rubric_judge_used
             ep.rubric_judge_error = rubric_judge_error
+
+            # Record outcome in curriculum for next episode scheduling
+            self._curriculum.record_episode(
+                fault_type=fault_type,
+                difficulty=ep.curriculum_difficulty,
+                final_score=final_score,
+                resolved=ep.incident_resolved,
+                steps_used=self._state.step_count,
+            )
 
         pipeline_result = ep.pipeline_result or PipelineResult()
 

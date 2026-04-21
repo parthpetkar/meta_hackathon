@@ -31,6 +31,8 @@ _ERROR_PATTERNS = [
     re.compile(r"(?i)\btimeout\b"),
     re.compile(r"(?i)\bsecret\b.*\bdetect"),
     re.compile(r"(?i)plaintext\s+credential"),
+    re.compile(r"(?i)(requires|conflicts with|incompatible)"),
+    re.compile(r"(?i)(urllib3|requests|flask|gunicorn).*version"),
 ]
 
 
@@ -125,8 +127,14 @@ def build_stage_log_response(pipeline_result: PipelineResult, stage_name: str) -
     )
 
     combined = ((stage.stdout or "") + "\n" + (stage.stderr or "")).strip()
-    error_lines = extract_error_lines(combined, max_lines=15)
-    tail_lines = combined.splitlines()[-30:] if combined else []
+    all_lines = combined.splitlines() if combined else []
+
+    # Filter out noisy import-machinery lines that obscure the real error location
+    _noise = ("<frozen importlib", "_bootstrap", "importlib._")
+    meaningful = [l for l in all_lines if not any(n in l for n in _noise)]
+
+    error_lines = extract_error_lines("\n".join(meaningful), max_lines=15)
+    tail_lines = meaningful[-30:]
 
     parts = []
     if error_lines:
@@ -140,13 +148,15 @@ def build_stage_log_response(pipeline_result: PipelineResult, stage_name: str) -
 
 
 def build_surfaced_errors(pipeline_result: PipelineResult, workspace_dir: str = "") -> List[str]:
-    """Extract errors from failed stage logs and scan source files for conflict markers."""
-    errors = []
-    for stage_name in STAGE_ORDER:
-        stage = pipeline_result.stages.get(stage_name)
-        if stage and stage.status == StageStatus.FAILED:
-            errors.extend(extract_error_lines(stage.stdout + "\n" + stage.stderr))
+    """Extract errors from failed stage logs and scan source files for conflict markers.
 
+    Conflict markers are surfaced FIRST so the LLM anchors on the real root cause,
+    not on downstream ImportError/SyntaxError symptoms in the test stage.
+    """
+    conflict_errors: List[str] = []
+    stage_errors: List[str] = []
+
+    # 1. Scan source files for merge conflict markers (primary — shown first)
     if workspace_dir:
         for rel_path in ["services/api/routes.py", "services/api/app.py",
                           "services/api/requirements.txt", "Dockerfile", "docker-compose.yml"]:
@@ -157,13 +167,27 @@ def build_surfaced_errors(pipeline_result: PipelineResult, workspace_dir: str = 
                 if "<<<<<<< " in content:
                     for i, line in enumerate(content.splitlines(), 1):
                         if line.startswith(("<<<<<<<", "=======", ">>>>>>>")):
-                            errors.append(f"MERGE CONFLICT in {rel_path}:{i}: {line.strip()}")
-                            if len(errors) >= 10:
-                                return errors
+                            conflict_errors.append(f"MERGE CONFLICT in {rel_path}:{i}: {line.strip()}")
             except OSError:
                 continue
 
-    return errors[:10]
+    # 2. Extract error lines from failed stage logs (secondary)
+    for stage_name in STAGE_ORDER:
+        stage = pipeline_result.stages.get(stage_name)
+        if not stage or stage.status != StageStatus.FAILED:
+            continue
+        combined = (stage.stdout or "") + "\n" + (stage.stderr or "")
+        for line in extract_error_lines(combined, max_lines=8):
+            # Skip generic import-machinery lines that obscure the real cause
+            if any(skip in line for skip in ["<frozen importlib", "_bootstrap", "importlib._"]):
+                continue
+            # If there are conflict errors, skip generic SyntaxError/IndentationError lines
+            # since they are downstream symptoms of the conflict, not root causes
+            if conflict_errors and any(skip in line for skip in ["SyntaxError", "IndentationError"]):
+                continue
+            stage_errors.append(line)
+
+    return (conflict_errors + stage_errors)[:10]
 
 
 def build_visible_alerts(pipeline_result: PipelineResult) -> List[str]:

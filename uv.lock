@@ -1603,6 +1603,7 @@ name = "openenv-meta-hackathon"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "openai" },
     { name = "openenv-core", extra = ["core"] },
     { name = "pytest" },
     { name = "python-dotenv" },
@@ -1617,6 +1618,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "openai", specifier = ">=1.30.0" },
     { name = "openenv-core", extras = ["core"], specifier = ">=0.2.2" },
     { name = "pytest", specifier = ">=9.0.2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },

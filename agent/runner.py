@@ -23,6 +23,7 @@ from .config import (
     MODEL_NAME,
     SUCCESS_SCORE_THRESHOLD,
     TASK_ORDER,
+    get_openai_client_kwargs,
 )
 from .http_environment import format_obs_for_llm, reset_env, step_env, trim_messages
 from .model_client import get_model_action
@@ -52,6 +53,27 @@ def _normalize_hypothesis(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").strip().lower())
 
 
+# Maps error signatures → canonical fix phrases that fix_applier.py recognizes
+_FIX_PHRASE_RULES: List[Tuple[List[str], str]] = [
+    (["merge conflict", "<<<<<<<", "conflict marker", "<<<", "⚠ merge"], "resolve merge conflict markers"),
+    (["requests", "urllib3", "dependency", "version conflict", "incompatible", "resolutionimpossible"], "pin compatible requests urllib3 versions"),
+    (["dockerfile", "install order", "layer order", "copy before install"], "reorder dockerfile install steps"),
+    (["flaky", "timing", "intermittent", "response_time", "test_response_time"], "add flaky test retry wrapper"),
+    (["permission", "network", "compose network", "volume"], "fix docker compose network permission"),
+    (["secret", "credential", "api_key", "hardcoded", "plaintext"], "remove hardcoded secrets from source"),
+]
+
+
+def _infer_fix_phrase(surfaced_errors: List[str], hypothesis: str = "", findings: List[str] | None = None) -> str:
+    """Return a fix phrase matching the failure signature, or 'auto' for generic repair."""
+    combined = " ".join(surfaced_errors + [hypothesis] + (findings or [])).lower()
+    for keywords, phrase in _FIX_PHRASE_RULES:
+        if any(kw in combined for kw in keywords):
+            return phrase
+    # Unknown fault type — signal the generic auto-repair strategy
+    return "auto" if combined.strip() else ""
+
+
 def _extract_primary_surfaced_error_file(observation: MetaHackathonObservation) -> str:
     for err in observation.surfaced_errors or []:
         text = str(err)
@@ -64,21 +86,43 @@ def _extract_primary_surfaced_error_file(observation: MetaHackathonObservation) 
 def _select_fallback_action(
     observation: MetaHackathonObservation,
     action_history: List[Tuple[str, str, str]],
+    fix_phrase: str = "",
+    fix_applied_since_rerun: bool = False,
 ) -> Tuple[str, str, str]:
     surfaced_file = _extract_primary_surfaced_error_file(observation)
     stage = observation.current_stage or "build"
+
     candidates: List[Tuple[str, str, str]] = [
         ("inspect_config", surfaced_file or stage, ""),
         ("view_logs", stage, ""),
         ("inspect_dockerfile", "build", ""),
         ("inspect_permissions", stage, ""),
+    ]
+
+    # Inject fix candidates when we know what fix to apply
+    if fix_phrase:
+        is_dep_fix = any(kw in fix_phrase for kw in ["pin", "dependency", "urllib3", "requests"])
+        fix_op = "add_dependency" if is_dep_fix else "modify_config"
+        fix_candidate = (fix_op, stage, fix_phrase)
+        if fix_candidate not in action_history:
+            candidates.insert(0, fix_candidate)
+        elif fix_phrase == "auto":
+            # Retry auto-repair with fresh hint from latest stage
+            alt = (fix_op, stage, f"auto-{len(action_history)}")
+            candidates.insert(0, alt)
+
+    candidates += [
         ("rerun_pipeline", "", ""),
         ("verify_fix", "", ""),
     ]
+
     for candidate in candidates:
+        # Allow rerun_pipeline if a new fix was applied since the last one
+        if candidate[0] == "rerun_pipeline" and fix_applied_since_rerun:
+            return candidate
         if candidate not in action_history:
             return candidate
-    # Keep tuple uniqueness even when all standard candidates were already used.
+
     return ("view_logs", stage, f"detail-{len(action_history) + 1}")
 
 
@@ -106,6 +150,10 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
     attempted_hypotheses: set[str] = set()
     forced_messages: List[str] = []
     inspected_config_targets: set[str] = set()
+    injected_guardrails: set[str] = set()  # deduplicate guardrail messages
+    fix_applied_since_rerun: bool = False   # allow rerun after a new fix
+    fix_phrase: str = ""                    # canonical phrase inferred from errors
+    hypothesis_accepted: bool = False       # True once set_hypothesis scores > 0
     steps_taken = 0
     score = 0.0
     success = False
@@ -130,6 +178,7 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
             task_max_steps = max(task_max_steps, int(observed.get("max_steps", MAX_STEPS)))
         initial_surfaced_errors = [str(item) for item in (observation.surfaced_errors or [])]
         last_memory_key = fingerprint(initial_surfaced_errors) if fingerprint is not None else ""
+        fix_phrase = _infer_fix_phrase(initial_surfaced_errors, findings=list(observation.findings or []))
 
         messages = [{"role": "system", "content": build_system_prompt(task_name)}]
 
@@ -190,7 +239,9 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                         "content": "Model tool-calling disabled after repeated misses; using deterministic fallback.",
                     }
                     tool_call_id = None
-                    operation, target, value = _select_fallback_action(observation, action_history)
+                    operation, target, value = _select_fallback_action(
+                        observation, action_history, fix_phrase, fix_applied_since_rerun
+                    )
                 else:
                     operation, target, value, assistant_message, tool_call_id = get_model_action(
                         client=client,
@@ -237,11 +288,16 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
 
                 should_resample = False
                 surfaced_file = _extract_primary_surfaced_error_file(observation)
+
+                # Inject surfaced-file guardrail at most once per unique file
+                _sf_key = f"sf:{surfaced_file}"
                 if (
                     surfaced_file
                     and surfaced_file not in inspected_config_targets
                     and (operation != "inspect_config" or target != surfaced_file)
+                    and _sf_key not in injected_guardrails
                 ):
+                    injected_guardrails.add(_sf_key)
                     messages.append(
                         {
                             "role": "user",
@@ -253,7 +309,14 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                     )
                     should_resample = True
 
-                if operation == "set_hypothesis" and surfaced_file and surfaced_file not in inspected_config_targets:
+                _hyp_sf_key = f"hyp_sf:{surfaced_file}"
+                if (
+                    operation == "set_hypothesis"
+                    and surfaced_file
+                    and surfaced_file not in inspected_config_targets
+                    and _hyp_sf_key not in injected_guardrails
+                ):
+                    injected_guardrails.add(_hyp_sf_key)
                     messages.append(
                         {
                             "role": "user",
@@ -268,32 +331,45 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                 if operation == "set_hypothesis":
                     normalized_hypothesis = _normalize_hypothesis(value)
                     if normalized_hypothesis and normalized_hypothesis in attempted_hypotheses:
+                        _dup_hyp_key = f"dup_hyp:{normalized_hypothesis}"
+                        if _dup_hyp_key not in injected_guardrails:
+                            injected_guardrails.add(_dup_hyp_key)
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "You already tried this exact hypothesis and it scored negatively. "
+                                        "Choose a different root cause and different hypothesis text."
+                                    ),
+                                }
+                            )
+                        should_resample = True
+
+                action_tuple = (operation, target, value)
+                # Allow rerun_pipeline again if a new fix was applied since the last rerun
+                rerun_blocked = (
+                    action_tuple in action_history
+                    and not (operation == "rerun_pipeline" and fix_applied_since_rerun)
+                )
+                if rerun_blocked:
+                    _dup_act_key = f"dup_act:{operation}:{target}"
+                    if _dup_act_key not in injected_guardrails:
+                        injected_guardrails.add(_dup_act_key)
                         messages.append(
                             {
                                 "role": "user",
                                 "content": (
-                                    "You already tried this exact hypothesis and it scored negatively. "
-                                    "Choose a different root cause and different hypothesis text."
+                                    "You already tried this exact action and it failed. "
+                                    "Choose a different operation, target, or value."
                                 ),
                             }
                         )
-                        should_resample = True
-
-                action_tuple = (operation, target, value)
-                if action_tuple in action_history:
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "You already tried this exact action and it failed. "
-                                "Choose a different operation, target, or value."
-                            ),
-                        }
-                    )
                     should_resample = True
 
                 if should_resample and disable_model_calls:
-                    operation, target, value = _select_fallback_action(observation, action_history)
+                    operation, target, value = _select_fallback_action(
+                        observation, action_history, fix_phrase, fix_applied_since_rerun
+                    )
                     action_tuple = (operation, target, value)
                     should_resample = False
 
@@ -337,11 +413,43 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
             action_history.append((operation, target, value))
             if operation == "inspect_config" and target:
                 inspected_config_targets.add(target)
+                # Re-enable surfaced-file guardrail if a new file appears later
+                injected_guardrails.discard(f"sf:{target}")
+                injected_guardrails.discard(f"hyp_sf:{target}")
+            if operation in {"modify_config", "add_dependency"} and value:
+                fix_applied_since_rerun = True
+            if operation == "rerun_pipeline":
+                fix_applied_since_rerun = False
             if operation == "set_hypothesis":
                 normalized_hypothesis = _normalize_hypothesis(value)
                 if normalized_hypothesis:
                     attempted_hypotheses.add(normalized_hypothesis)
-                if reward < 0:
+                if reward > 0:
+                    hypothesis_accepted = True
+                    # Refresh fix phrase using the accepted hypothesis text + current errors
+                    obs_errors = [str(e) for e in (observation.surfaced_errors or [])]
+                    obs_findings = [str(f) for f in (observation.findings or [])]
+                    inferred = _infer_fix_phrase(obs_errors, hypothesis=value, findings=obs_findings)
+                    if inferred:
+                        fix_phrase = inferred
+                    if fix_phrase and f"fix_hint:{fix_phrase}" not in injected_guardrails:
+                        injected_guardrails.add(f"fix_hint:{fix_phrase}")
+                        is_dep = any(kw in fix_phrase for kw in ["pin", "dependency", "urllib3", "requests"])
+                        fix_op = "add_dependency" if is_dep else "modify_config"
+                        if fix_phrase == "auto":
+                            forced_messages.append(
+                                "Hypothesis accepted. The fault type is unknown — apply a structured JSON fix. "
+                                "Call 'modify_config' with a JSON value like: "
+                                '{"file": "<path>", "action": "replace", "old": "<broken code>", "new": "<fixed code>"}. '
+                                "Use the file content you inspected to fill in the exact old/new strings."
+                            )
+                        else:
+                            forced_messages.append(
+                                f"Hypothesis accepted. Now apply the fix immediately. "
+                                f"Call tool '{fix_op}' with value='{fix_phrase}'. "
+                                f"Do not inspect or view_logs again — go straight to the fix."
+                            )
+                elif reward < 0:
                     forced_messages.append(
                         "Your last hypothesis was incorrect (negative reward). "
                         "You must NOT repeat it. Re-read surfaced_errors and form a new hypothesis "
@@ -351,6 +459,12 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
             messages.append(assistant_message)
             tool_result = format_obs_for_llm(observation, step)
             observation_errors = [str(item) for item in (observation.surfaced_errors or [])]
+            # Refresh fix_phrase from latest observation if not yet determined
+            if not fix_phrase or not hypothesis_accepted:
+                obs_findings = [str(f) for f in (observation.findings or [])]
+                inferred = _infer_fix_phrase(observation_errors, findings=obs_findings)
+                if inferred:
+                    fix_phrase = inferred
             current_memory_key = fingerprint(observation_errors) if fingerprint is not None else ""
             memory_hint = _memory_hint(observation_errors) if current_memory_key != last_memory_key else ""
             if memory_hint:
@@ -403,11 +517,14 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
 
 def main() -> None:
     if not API_KEY:
-        raise RuntimeError("Missing HF_TOKEN or OPENAI_API_KEY for OpenAI client authentication.")
+        raise RuntimeError(
+            "Missing API credentials. Set provider-specific key: "
+            "HF_TOKEN (hf), OPENROUTER_API_KEY (openrouter), or GROQ_API_KEY (groq)."
+        )
 
     from openai import OpenAI
 
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    client = OpenAI(**get_openai_client_kwargs())
 
     with requests.Session() as session:
         session.headers.update({"Accept": "application/json"})

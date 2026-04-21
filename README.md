@@ -220,10 +220,16 @@ For a deeper narrative of intended upstream value and extension strategy, see `D
 Duplicate `.env.example` (or set these directly) to configure inference and grading features:
 
 ```bash
-# Inference and rubric model endpoint (Groq)
-MODEL_NAME=llama-3.3-70b-versatile
-API_BASE_URL=https://api.groq.com/openai/v1
-GROQ_API_KEY=your_groq_api_key_here
+# Provider mode:
+# - hf (hackathon-compatible)
+# - openrouter (testing)
+# - groq (testing)
+LLM_PROVIDER=hf
+
+# Model endpoint
+MODEL_NAME=Qwen/Qwen2.5-72B-Instruct
+API_BASE_URL=https://router.huggingface.co/v1
+HF_TOKEN=your_hf_token_here
 
 # OpenEnv server base URL used by the agent
 ENV_BASE_URL=http://localhost:8000
@@ -244,8 +250,21 @@ META_HACKATHON_PIPELINE_TIMEOUT_SECONDS=300
 META_HACKATHON_RUBRIC_ENABLED=true
 META_HACKATHON_RUBRIC_WEIGHT=0.30
 META_HACKATHON_RUBRIC_TIMEOUT_SECONDS=10
-META_HACKATHON_RUBRIC_MODEL=llama-3.3-70b-versatile
+META_HACKATHON_RUBRIC_MODEL=Qwen/Qwen2.5-72B-Instruct
 META_HACKATHON_RUBRIC_DEBUG=false
+
+# Optional override for rubric provider specifically
+# RUBRIC_LLM_PROVIDER=openrouter
+
+# OpenRouter testing mode (set these when LLM_PROVIDER=openrouter)
+# API_BASE_URL=https://openrouter.ai/api/v1
+# OPENROUTER_API_KEY=your_openrouter_api_key_here
+# OPENROUTER_REFERER=https://your-site.com
+# OPENROUTER_TITLE=meta_hackathon
+
+# Groq testing mode (set these when LLM_PROVIDER=groq)
+# API_BASE_URL=https://api.groq.com/openai/v1
+# GROQ_API_KEY=your_groq_api_key_here
 ```
 
 Optional local inference debug variables:
