@@ -56,6 +56,7 @@ def extract_error_lines(text: str, max_lines: int = 10) -> List[str]:
 _CONFIG_PATHS = [
     "Dockerfile",
     "docker-compose.yml",
+    ".env",
     "services/api/requirements.txt",
     "services/api/routes.py",
     "services/api/app.py",
@@ -187,7 +188,43 @@ def build_surfaced_errors(pipeline_result: PipelineResult, workspace_dir: str = 
                 continue
             stage_errors.append(line)
 
-    return (conflict_errors + stage_errors)[:10]
+    clue_errors = _build_config_clues(stage_errors, workspace_dir)
+    return (conflict_errors + stage_errors + clue_errors)[:10]
+
+
+def _build_config_clues(stage_errors: List[str], workspace_dir: str) -> List[str]:
+    if not workspace_dir or not stage_errors:
+        return []
+
+    joined = "\n".join(stage_errors).lower()
+    clues: List[str] = []
+
+    if (
+        "requirements.txt" in joined
+        and ("could not open requirements file" in joined or "no such file or directory" in joined)
+    ):
+        root_req = os.path.join(workspace_dir, "requirements.txt")
+        svc_req = os.path.join(workspace_dir, "services", "api", "requirements.txt")
+        if not os.path.exists(root_req) and os.path.exists(svc_req):
+            clues.append(
+                "Config clue: requirements.txt is at services/api/requirements.txt (not repository root)."
+            )
+
+    compose_path = os.path.join(workspace_dir, "docker-compose.yml")
+    if os.path.exists(compose_path):
+        compose_text = read_workspace_file(workspace_dir, "docker-compose.yml")
+        compose_lower = compose_text.lower()
+        deploy_env_error = (
+            ("port" in joined and "invalid" in joined)
+            or ("interpolation" in joined and "port" in joined)
+            or ("compose" in joined and "port" in joined)
+        )
+        if "${port}:5000" in compose_lower and "port=not-a-number" in compose_lower and deploy_env_error:
+            clues.append(
+                "Config clue: docker-compose.yml sets PORT=not-a-number while ports uses ${PORT}:5000."
+            )
+
+    return clues
 
 
 def build_visible_alerts(pipeline_result: PipelineResult) -> List[str]:
@@ -245,6 +282,7 @@ def build_observation(
     rubric_blend_weight: float = 0.0,
     rubric_judge_used: bool = False,
     rubric_judge_error: str = "",
+    drift_detected: bool = False,
     metadata: Optional[Dict[str, Any]] = None,
     findings: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
@@ -293,6 +331,7 @@ def build_observation(
         "redundant_actions": redundant_actions,
         "destructive_actions": destructive_actions,
         "incident_resolved": incident_resolved,
+        "drift_detected": drift_detected,
         "final_score": final_score,
         "deterministic_score": deterministic_score,
         "rubric_score": rubric_score,

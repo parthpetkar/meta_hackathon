@@ -24,10 +24,8 @@ except Exception:  # pragma: no cover - optional import safety
 LOGGER = logging.getLogger(__name__)
 
 
-DEFAULT_GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 DEFAULT_HF_BASE_URL = "https://router.huggingface.co/v1"
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 
 
 def _normalize(text: str) -> str:
@@ -78,7 +76,7 @@ class OpenEnvLLMJudgeAdapter:
         self._enabled = enabled
         self._model_name = model_name
         self._timeout_seconds = max(1, int(timeout_seconds))
-        self._provider = os.getenv("RUBRIC_LLM_PROVIDER", os.getenv("LLM_PROVIDER", "hf")).strip().lower()
+        self._provider = os.getenv("RUBRIC_LLM_PROVIDER", os.getenv("LLM_PROVIDER", "openrouter")).strip().lower()
         self._api_base_url = self._resolve_api_base_url()
         self._api_key = self._resolve_api_key()
         self._openrouter_referer = (os.getenv("OPENROUTER_REFERER") or "").strip()
@@ -282,37 +280,25 @@ class OpenEnvLLMJudgeAdapter:
         explicit = (os.getenv("API_BASE_URL") or "").strip()
         if explicit:
             return explicit
-        if self._provider == "openrouter":
-            return DEFAULT_OPENROUTER_BASE_URL
-        if self._provider == "groq":
-            return DEFAULT_GROQ_BASE_URL
-        return DEFAULT_HF_BASE_URL
+        if self._provider == "hf":
+            return DEFAULT_HF_BASE_URL
+        return DEFAULT_OPENROUTER_BASE_URL
 
     def _resolve_api_key(self) -> str:
         explicit = (os.getenv("API_KEY") or "").strip()
         if explicit:
             return explicit
-        if self._provider == "openrouter":
+        if self._provider == "hf":
             return (
-                os.getenv("OPENROUTER_API_KEY")
+                os.getenv("HF_TOKEN")
                 or os.getenv("OPENAI_API_KEY")
-                or os.getenv("HF_TOKEN")
-                or os.getenv("GROQ_API_KEY")
-                or ""
-            ).strip()
-        if self._provider == "groq":
-            return (
-                os.getenv("GROQ_API_KEY")
-                or os.getenv("OPENAI_API_KEY")
-                or os.getenv("HF_TOKEN")
                 or os.getenv("OPENROUTER_API_KEY")
                 or ""
             ).strip()
         return (
-            os.getenv("HF_TOKEN")
+            os.getenv("OPENROUTER_API_KEY")
             or os.getenv("OPENAI_API_KEY")
-            or os.getenv("OPENROUTER_API_KEY")
-            or os.getenv("GROQ_API_KEY")
+            or os.getenv("HF_TOKEN")
             or ""
         ).strip()
 
@@ -339,7 +325,7 @@ class OpenEnvLLMJudgeAdapter:
     def _endpoint_and_port_from_base_url(self, base_url: str) -> tuple[str, int]:
         parsed = urlparse(base_url)
         scheme = parsed.scheme or "https"
-        host = parsed.hostname or "api.groq.com"
+        host = parsed.hostname or "openrouter.ai"
         port = parsed.port or (443 if scheme == "https" else 80)
         endpoint = f"{scheme}://{host}"
         return endpoint, port

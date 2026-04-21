@@ -29,7 +29,7 @@ from .config import (
 from .http_environment import format_obs_for_llm, reset_env, step_env, trim_messages
 from .model_client import get_model_action
 from .prompts import build_system_prompt
-from .trajectory_logging import log_detail, log_end, log_start, log_step
+from .trajectory_logging import log_detail, log_end, log_memory, log_start, log_step
 
 try:
     from ..models import MetaHackathonObservation
@@ -130,21 +130,64 @@ def _select_fallback_action(
     return ("view_logs", stage, f"detail-{len(action_history) + 1}")
 
 
-def _memory_hint(errors: List[str]) -> str:
+def _memory_hint(errors: List[str], fault_type: str) -> Tuple[str, str]:
     if not errors or recall is None:
-        return ""
-    suggestion = recall(errors)
+        return "", ""
+    suggestion = recall(errors, fault_type=fault_type)
     if not suggestion.get("suggested_fix"):
-        return ""
+        return "", ""
     confidence = float(suggestion.get("confidence", 0.0) or 0.0)
     times_seen = int(suggestion.get("times_seen", 0) or 0)
     fix_text = str(suggestion.get("suggested_fix", "")).strip()
-    return (
+    hint = (
         "Persistent memory hint from prior episodes:\n"
         f"- confidence: {confidence:.3f}\n"
         f"- times_seen: {times_seen}\n"
         f"- suggested_fix: {fix_text}"
     )
+    memory_log = str(suggestion.get("memory_log", "") or "")
+    return hint, memory_log
+
+
+def _fault_type_from_observation(observation: MetaHackathonObservation, fallback: str = "unknown") -> str:
+    metadata = observation.metadata if isinstance(observation.metadata, dict) else {}
+    if isinstance(metadata, dict) and metadata.get("fault_type"):
+        return str(metadata.get("fault_type"))
+    if observation.task_id and observation.task_id.startswith("real_"):
+        return observation.task_id[len("real_") :]
+    return fallback
+
+
+def _repetition_escape_action(
+    observation: MetaHackathonObservation,
+    action_history: List[Tuple[str, str, str]],
+    repeated_action: Tuple[str, str, str],
+) -> Tuple[str, str, str]:
+    stage = observation.current_stage or "build"
+    repeated_text = "|".join(repeated_action).lower()
+
+    candidates: List[Tuple[str, str, str]] = []
+    if "requirements" in repeated_text or stage == "build":
+        candidates.extend(
+            [
+                ("inspect_config", "services/api/requirements.txt", ""),
+                ("inspect_config", "requirements.txt", ""),
+                ("inspect_config", "Dockerfile", ""),
+            ]
+        )
+
+    candidates.extend(
+        [
+            ("view_logs", stage, ""),
+            ("inspect_config", "docker-compose.yml", ""),
+            ("inspect_dockerfile", "build", ""),
+        ]
+    )
+
+    for candidate in candidates:
+        if candidate != repeated_action and candidate not in action_history:
+            return candidate
+    return ("view_logs", stage, "")
 
 
 def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: str) -> Tuple[str, bool, int, float]:
@@ -160,6 +203,9 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
     hypothesis_accepted: bool = False       # True once set_hypothesis scores > 0
     steps_taken = 0
     score = 0.0
+    deterministic_score = 0.0
+    rubric_score = 0.0
+    rubric_judge_used = False
     success = False
     resolved = False
     task_name = fallback_task_name
@@ -198,7 +244,10 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
             )
 
         task_title = observation.task_title or task_name
-        memory_hint = _memory_hint(initial_surfaced_errors)
+        fault_type = _fault_type_from_observation(observation, task_name)
+        memory_hint, memory_log = _memory_hint(initial_surfaced_errors, fault_type)
+        if memory_log:
+            log_memory(memory_log)
         task_intro = f"Task: {task_title}\n\n{format_obs_for_llm(observation, 0)}"
         if memory_hint:
             task_intro += f"\n\n{memory_hint}"
@@ -383,6 +432,18 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
 
                 break
 
+            action_tuple = (operation, target, value)
+            if action_history.count(action_tuple) >= 3:
+                operation, target, value = _repetition_escape_action(observation, action_history, action_tuple)
+                assistant_message = {
+                    "role": "assistant",
+                    "content": (
+                        "Repetition guard triggered: forcing a different action after 3+ identical attempts "
+                        f"-> {operation}|{target}|{value}"
+                    ),
+                }
+                tool_call_id = None
+
             try:
                 observation, reward, done, error = step_env(
                     session,
@@ -470,7 +531,14 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                 if inferred:
                     fix_phrase = inferred
             current_memory_key = fingerprint(observation_errors) if fingerprint is not None else ""
-            memory_hint = _memory_hint(observation_errors) if current_memory_key != last_memory_key else ""
+            observation_fault_type = _fault_type_from_observation(observation, task_name)
+            memory_hint, memory_log = (
+                _memory_hint(observation_errors, observation_fault_type)
+                if current_memory_key != last_memory_key
+                else ("", "")
+            )
+            if memory_log:
+                log_memory(memory_log)
             if memory_hint:
                 tool_result = f"{tool_result}\n\n{memory_hint}"
                 last_memory_key = current_memory_key
@@ -499,6 +567,9 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
 
         if observation is not None:
             score = float(observation.final_score)
+            deterministic_score = float(observation.deterministic_score)
+            rubric_score = float(observation.rubric_score)
+            rubric_judge_used = bool(observation.rubric_judge_used)
             resolved = bool(observation.incident_resolved)
         success = resolved and score >= SUCCESS_SCORE_THRESHOLD
         if remember is not None and initial_surfaced_errors and last_fix_value:
@@ -507,12 +578,23 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
             except Exception:
                 pass
     finally:
-        log_end(success=success, steps=steps_taken, score=score, resolved=resolved, rewards=rewards)
+        log_end(
+            success=success,
+            steps=steps_taken,
+            score=score,
+            resolved=resolved,
+            rewards=rewards,
+            deterministic_score=deterministic_score,
+            rubric_score=rubric_score,
+            rubric_judge_used=rubric_judge_used,
+        )
         if INFERENCE_VERBOSE:
             print(
                 "[DETAIL] "
                 f"task={task_name} success={str(success).lower()} steps={steps_taken} "
-                f"final_score={score:.3f} resolved={str(resolved).lower()}",
+                f"final_score={score:.3f} det={deterministic_score:.3f} "
+                f"rubric={rubric_score:.3f} judge={str(rubric_judge_used).lower()} "
+                f"resolved={str(resolved).lower()}",
                 flush=True,
             )
 

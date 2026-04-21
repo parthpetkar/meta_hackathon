@@ -167,6 +167,7 @@ class EpisodeState:
     rerun_attempts: int = 0
     episode_seed: int = 0
     procedural_mode: bool = False
+    drift_detected: bool = False
 
 
 def _canonical_operation(operation: str) -> str:
@@ -347,7 +348,7 @@ class RealCICDRepairEnvironment(Environment):
             cascading_faults=cascading_faults,
             curriculum_difficulty=curriculum_difficulty,
             episode_seed=episode_seed,
-            procedural_mode=procedural_mode,
+            procedural_mode=use_procedural_style,
         )
         self._episode = episode
 
@@ -359,11 +360,12 @@ class RealCICDRepairEnvironment(Environment):
             "flaky_test": "easy",
             "missing_permission": "hard",
             "secret_exposure": "security",
+            "env_drift": "network",
         }
         difficulty = difficulty_map.get(fault_type, "medium")
 
         # Build max_steps from difficulty
-        max_steps_map = {"easy": 16, "medium": 20, "security": 20, "hard": 25}
+        max_steps_map = {"easy": 16, "medium": 20, "network": 20, "security": 20, "hard": 25}
         max_steps = max_steps_map.get(difficulty, 15)
 
         obs_dict = build_observation(
@@ -383,6 +385,7 @@ class RealCICDRepairEnvironment(Environment):
                 "ready_to_finalize": False,
                 "verification_required": False,
                 "verified_since_last_rerun": False,
+                "drift_detected": False,
                 "supported_operations": CANONICAL_OPERATIONS,
                 "canonical_operations": CANONICAL_OPERATIONS,
             },
@@ -420,6 +423,7 @@ class RealCICDRepairEnvironment(Environment):
 
         # Dispatch action
         reward = 0.0
+        finalize_blocked = operation == "finalize" and not episode.verified_for_latest_rerun
 
         if operation == "view_logs":
             reward = self._handle_view_logs(episode, target)
@@ -448,8 +452,8 @@ class RealCICDRepairEnvironment(Environment):
         elif operation == "finalize":
             reward = self._handle_finalize(episode)
 
-        # Phase-aware bonus from adversarial judge (always active)
-        if episode.adversarial_scenario is not None:
+        # Phase-aware bonus from adversarial judge (always active except blocked finalize)
+        if episode.adversarial_scenario is not None and not finalize_blocked:
             phase_bonus, phase_note = self._adv_judge.score_step(
                 operation=operation,
                 value=value,
@@ -461,18 +465,21 @@ class RealCICDRepairEnvironment(Environment):
                 episode.findings.append(f"[Judge] {phase_note}")
 
         # Apply redundancy penalty
-        if was_redundant:
+        if was_redundant and not finalize_blocked:
             reward = min(reward, -0.08)
+
+        if finalize_blocked:
+            reward = -0.05
 
         # Determine if episode is done
         done = False
         max_steps = 15
         if episode.fault_metadata:
             difficulty = self._get_difficulty(episode.fault_metadata.fault_type)
-            max_steps_map = {"easy": 16, "medium": 20, "security": 20, "hard": 25}
+            max_steps_map = {"easy": 16, "medium": 20, "network": 20, "security": 20, "hard": 25}
             max_steps = max_steps_map.get(difficulty, 15)
 
-        if operation == "finalize":
+        if operation == "finalize" and episode.verified_for_latest_rerun:
             done = True
         elif self._state.step_count >= max_steps:
             done = True
@@ -524,7 +531,7 @@ class RealCICDRepairEnvironment(Environment):
             # Try the target as-is, then search in standard config paths
             filepath = target
             if not os.path.exists(os.path.join(ep.workspace_dir, filepath)):
-                for cfg in ["Dockerfile", "docker-compose.yml", "services/api/requirements.txt",
+                for cfg in ["Dockerfile", "docker-compose.yml", ".env", "services/api/requirements.txt",
                            "services/api/routes.py", "services/api/app.py", ".github/ci.yml"]:
                     if target.lower() in cfg.lower():
                         filepath = cfg
@@ -707,6 +714,7 @@ class RealCICDRepairEnvironment(Environment):
             )
             if drift_event:
                 ep.drift_events_fired.append(drift_event)
+                ep.drift_detected = True
                 ep.findings.append(
                     f"[World Drift] {drift_event.description} "
                     f"Files affected: {', '.join(drift_event.files_touched)}. "
@@ -781,6 +789,10 @@ class RealCICDRepairEnvironment(Environment):
 
     def _handle_finalize(self, ep: EpisodeState) -> float:
         """Compute final score — adversarial terminal scorer always used."""
+        if not ep.verified_for_latest_rerun:
+            ep.findings.append("Run verify_fix before finalize")
+            return -0.05
+
         pipeline_passed = (
             ep.pipeline_result is not None
             and ep.pipeline_result.status == PipelineStatus.PASSED
@@ -804,6 +816,7 @@ class RealCICDRepairEnvironment(Environment):
             "flaky_test": "easy",
             "missing_permission": "hard",
             "secret_exposure": "security",
+            "env_drift": "network",
         }
         return difficulty_map.get(fault_type, "medium")
 
@@ -892,6 +905,7 @@ class RealCICDRepairEnvironment(Environment):
             rubric_blend_weight=self._rubric_weight if self._rubric_judge.is_active() else 0.0,
             rubric_judge_used=rubric_judge_used,
             rubric_judge_error=rubric_judge_error,
+            drift_detected=ep.drift_detected,
             findings=ep.findings[-16:],
             metadata={
                 "task_key": fault_type,
@@ -900,6 +914,9 @@ class RealCICDRepairEnvironment(Environment):
                 "ready_to_finalize": ep.incident_resolved and ep.verified_for_latest_rerun,
                 "verification_required": ep.incident_resolved and not ep.verified_for_latest_rerun,
                 "verified_since_last_rerun": ep.verified_for_latest_rerun,
+                "drift_detected": ep.drift_detected,
+                "drift_event_count": len(ep.drift_events_fired),
+                "latest_drift": ep.drift_events_fired[-1].kind if ep.drift_events_fired else "",
                 "supported_operations": CANONICAL_OPERATIONS,
                 "canonical_operations": CANONICAL_OPERATIONS,
                 "rubric_enabled": self._rubric_judge.is_active(),
@@ -954,7 +971,7 @@ class RealCICDRepairEnvironment(Environment):
 
         # Efficiency bonus
         step_count = self._state.step_count
-        max_steps_map = {"easy": 16, "medium": 20, "security": 20, "hard": 25}
+        max_steps_map = {"easy": 16, "medium": 20, "network": 20, "security": 20, "hard": 25}
         difficulty = self._get_difficulty(ep.fault_metadata.fault_type if ep.fault_metadata else "medium")
         max_steps = max_steps_map.get(difficulty, 15)
         efficiency = max(0.0, 1.0 - (step_count / max_steps))

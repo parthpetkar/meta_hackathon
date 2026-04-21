@@ -165,6 +165,10 @@ class MetaHackathonObservation(Observation):
         default=False,
         description="Whether the CI/CD incident is resolved.",
     )
+    drift_detected: bool = Field(
+        default=False,
+        description="Whether a mid-episode world/config drift event was detected.",
+    )
     final_score: float = Field(
         default=0.0,
         description="Episode score in [0.0, 1.0] once done=True.",

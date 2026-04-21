@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import os
 import random
-import textwrap
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -113,7 +112,53 @@ def _drift_compose_port_shift(workspace: str) -> Optional[DriftEvent]:
     )
 
 
+def _drift_compose_env_key_move(workspace: str) -> Optional[DriftEvent]:
+    """Rename/move compose env keys and inject an invalid port env value.
+
+    This is a visible re-triage drift: after a previously successful rerun,
+    deploy fails because compose now depends on an invalid PORT value.
+    """
+    compose = os.path.join(workspace, "docker-compose.yml")
+    if not os.path.exists(compose):
+        return None
+    try:
+        with open(compose, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        if "APP_RUNTIME_ENV=production" in content and "${PORT}:5000" in content:
+            return None
+
+        new_content = content
+        if "FLASK_ENV=production" in new_content:
+            new_content = new_content.replace("FLASK_ENV=production", "APP_RUNTIME_ENV=production")
+
+        if '"5000:5000"' in new_content:
+            new_content = new_content.replace('"5000:5000"', '"${PORT}:5000"')
+
+        if "PORT=not-a-number" not in new_content and "environment:" in new_content:
+            new_content = new_content.replace("environment:\n", "environment:\n      - PORT=not-a-number\n", 1)
+
+        if new_content == content:
+            return None
+
+        with open(compose, "w", encoding="utf-8") as f:
+            f.write(new_content)
+    except OSError:
+        return None
+
+    return DriftEvent(
+        kind="infra_drift_compose_env_key_move",
+        files_touched=["docker-compose.yml"],
+        description=(
+            "Runtime compose keys drifted (FLASK_ENV moved to APP_RUNTIME_ENV and PORT mapping externalized); "
+            "deploy now fails until env mapping is repaired."
+        ),
+        hint_keywords=["compose", "environment", "PORT", "invalid", "deploy", "key"],
+    )
+
+
 _DRIFT_STRATEGIES = [
+    _drift_compose_env_key_move,
     _drift_health_schema,
     _drift_new_required_dep,
     _drift_compose_port_shift,

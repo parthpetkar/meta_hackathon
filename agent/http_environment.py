@@ -49,7 +49,14 @@ def parse_observation_payload(payload: Dict[str, Any]) -> MetaHackathonObservati
         redundant_actions=obs_data.get("redundant_actions", 0),
         destructive_actions=obs_data.get("destructive_actions", 0),
         incident_resolved=obs_data.get("incident_resolved", False),
+        drift_detected=obs_data.get("drift_detected", False),
         final_score=obs_data.get("final_score", 0.0),
+        deterministic_score=obs_data.get("deterministic_score", 0.0),
+        rubric_score=obs_data.get("rubric_score", 0.0),
+        delayed_reward=obs_data.get("delayed_reward", 0.0),
+        rubric_blend_weight=obs_data.get("rubric_blend_weight", 0.0),
+        rubric_judge_used=obs_data.get("rubric_judge_used", False),
+        rubric_judge_error=obs_data.get("rubric_judge_error", ""),
         done=payload.get("done", obs_data.get("done", False)),
         reward=payload.get("reward", obs_data.get("reward")),
         metadata=obs_data.get("metadata", {}),
@@ -129,6 +136,9 @@ def format_obs_for_llm(observation: MetaHackathonObservation, step_num: int) -> 
 
     if observation.incident_resolved:
         parts.append("*** ALL ISSUES RESOLVED - call finalize now ***")
+
+    if observation.drift_detected:
+        parts.append("*** WORLD DRIFT DETECTED - re-triage active failure before finalizing ***")
 
     return "\n".join(parts)
 

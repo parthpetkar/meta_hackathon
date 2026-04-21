@@ -44,11 +44,31 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
     )
 
 
-def log_end(success: bool, steps: int, score: float, resolved: bool, rewards: List[float]) -> None:
+def log_end(
+    success: bool,
+    steps: int,
+    score: float,
+    resolved: bool,
+    rewards: List[float],
+    *,
+    deterministic_score: float = 0.0,
+    rubric_score: float = 0.0,
+    rubric_judge_used: bool = False,
+) -> None:
     color = GREEN if success else RED
     print(f"\n{BOLD}{color}=== TASK COMPLETED ==={RESET}")
     print(f"{color}Success: {success} | Resolved: {resolved} | Score: {score:.3f} | Steps: {steps}{RESET}")
+    print(
+        f"{color}Rubric: det={deterministic_score:.3f} rubric={rubric_score:.3f} "
+        f"judge_used={str(rubric_judge_used).lower()}{RESET}"
+    )
     print(f"{color}Rewards: {','.join(f'{r:.2f}' for r in rewards)}{RESET}\n")
+
+
+def log_memory(message: str) -> None:
+    if not message:
+        return
+    print(f"  {CYAN}{message}{RESET}", flush=True)
 
 
 def _compact_list(values: List[Any], limit: int = INFERENCE_DETAIL_MAX_ITEMS) -> str:

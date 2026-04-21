@@ -37,6 +37,7 @@ _FAULT_FILES = {
     "flaky_test": {"tests/test_api.py"},
     "missing_permission": {"docker-compose.yml"},
     "secret_exposure": {"services/api/app.py"},
+    "env_drift": {"docker-compose.yml"},
 }
 
 

@@ -40,9 +40,15 @@ OpenEnv API compliance:
 Runtime architecture (current):
 
 - `server/environment.py` hosts `RealCICDRepairEnvironment` and action dispatch.
+- `server/rubric_judge.py` provides delayed reward rubric scoring with provider-aware fallback.
+- `server/agent_memory.py` stores persistent cross-episode fix memory in SQLite.
+- `server/curriculum.py` adapts difficulty from episode outcomes.
+- `server/adversarial_designer.py` composes LLM-designed multi-fault incidents.
+- `server/adversarial_judge.py` applies phase-aware adversarial reward shaping.
 - `cicd/fault_injector.py` injects task faults into the episode workspace.
 - `cicd/pipeline_runner.py` executes `clone -> build -> test -> deploy` via subprocess.
 - `cicd/observation_builder.py` builds surfaced errors/logs/config snapshots.
+- `cicd/drift_injector.py` performs opt-in mid-episode drift mutations.
 - `cicd/fix_applier.py` applies structured JSON or heuristic fixes and commits successful changes.
 
 ## Action space
@@ -72,6 +78,7 @@ At each step the agent receives structured state including:
 - Config snapshots: `config_files`.
 - Reasoning trace: `findings`, `action_history`, `current_hypothesis`, `attempted_fix`, `hypothesis_history`.
 - Progress indicators: `active_issue_index`, `revealed_issue_count`, `incident_resolved`.
+- World drift signal: `drift_detected` (true after a mid-episode drift event).
 - Safety/cost signals: `pipeline_health`, `recovery_cost`, `redundant_actions`, `destructive_actions`.
 - Episode outputs: `reward`, `done`, `final_score` (terminal), and `metadata`.
 
@@ -119,6 +126,30 @@ Additional runtime scoring rules:
 - Final score is computed at episode end in `server/environment.py` and is clipped to `[0.0, 1.0]`.
 - Final score components include: resolution status, hypothesis quality, fix hits, efficiency bonus, and penalties for redundant/destructive/wrong fixes.
 
+## Curriculum and LLM adversarial training
+
+The runtime now includes adaptive curriculum plus adversarial incident generation.
+
+- `server/curriculum.py` persists episode outcomes and updates global difficulty via EMA.
+- Curriculum difficulty and skill-profile stats are injected into scenario design on every `reset()`.
+- `server/adversarial_designer.py` uses an LLM to generate multi-fault incidents (root cause + cascades + optional red herring).
+- `server/adversarial_judge.py` adds phase-aware shaping bonuses/penalties for triage, investigation, hypothesis, fix, and verification.
+- `cicd/drift_injector.py` can mutate the workspace after a successful rerun to simulate live infra/schema drift.
+
+How this affects episodes:
+
+- Episodes are no longer static one-shot puzzles; they can include cascading failure structure.
+- Agent behavior is rewarded for correct SRE phase progression, not only final pass/fail.
+- Optional drift forces re-triage and adaptation after an apparent recovery.
+
+Key controls:
+
+- Curriculum: `CURRICULUM_EMA_ALPHA`, `CURRICULUM_UCB_C`, `CURRICULUM_WARMUP`
+- Adversarial designer endpoint/model: `CICD_ADV_BASE_URL`, `CICD_ADV_MODEL`
+- Adversarial provider headers/keys: `OPENROUTER_API_KEY`, `OPENROUTER_REFERER`, `OPENROUTER_TITLE`
+- Drift: `META_HACKATHON_DRIFT_ENABLED`, `META_HACKATHON_DRIFT_PROBABILITY`
+- Episode count for inference/evaluation loops: `META_HACKATHON_NUM_EPISODES`
+
 ## Task descriptions
 
 `easy` - Single-file merge conflict (6-step resolution target)
@@ -153,6 +184,11 @@ Additional runtime scoring rules:
 
 - Build fails due to broken Dockerfile copy/install ordering.
 - Agent should inspect Dockerfile and apply order/layer correction, then rerun/verify/finalize.
+
+`env_drift` - Runtime env-var deploy drift
+
+- Deploy fails because a runtime env var in `docker-compose.yml` is invalid (for example `PORT=not-a-number` with `${PORT}:5000`).
+- Agent should inspect compose/runtime config, repair the broken env mapping, rerun, verify, and finalize.
 
 ## Setup instructions
 
@@ -205,7 +241,14 @@ For a deeper narrative of intended upstream value and extension strategy, see `D
 
 ## Inference
 
-`inference.py` is the agentic baseline entry point. The implementation lives in `agent/` so prompts, tool schemas, action guards, fallback plans, HTTP calls, logging, and orchestration can be debugged independently. By default it keeps the model in the loop across the task budget (`MAX_MODEL_CALLS_PER_TASK` defaults to the per-task step ceiling, `PREFER_DETERMINISTIC_ACTIONS=false`), and only falls back to the scripted policy when tool-calling repeatedly fails or the trajectory clearly stalls.
+`inference.py` is the agentic baseline entry point. The implementation lives in `agent/` so prompts, tool schemas, action guards, memory hints, HTTP calls, logging, and orchestration can be debugged independently. By default it keeps the model in the loop and only falls back when tool-calling repeatedly fails or the trajectory clearly stalls.
+
+Current runtime defaults from `agent/config.py`:
+
+- `MAX_TOKENS=512`
+- `MESSAGE_WINDOW=12`
+- `MAX_MODEL_CALLS_PER_TASK=MAX_STEPS * 3` unless overridden
+- `META_HACKATHON_NUM_EPISODES=6` (creates `episode_1 ... episode_n` run order)
 
 `eval_runner.py` is separate: it is a deterministic regression baseline for score calibration and reproducibility, not a claim that the environment itself is solved by hardcoded control flow.
 
@@ -220,35 +263,61 @@ For a deeper narrative of intended upstream value and extension strategy, see `D
 Duplicate `.env.example` (or set these directly) to configure inference and grading features:
 
 ```bash
-# Provider mode:
-# - hf (hackathon-compatible)
-# - openrouter (testing)
-# - groq (testing)
+# Provider mode for inference/rubric client creation:
+# - hf         -> hackathon-compatible Hugging Face router
+# - openrouter -> testing
+# - groq       -> testing
 LLM_PROVIDER=hf
 
-# Model endpoint
-MODEL_NAME=Qwen/Qwen2.5-72B-Instruct
+# OpenAI-compatible endpoint + model
 API_BASE_URL=https://router.huggingface.co/v1
+MODEL_NAME=Qwen/Qwen2.5-72B-Instruct
+
+# Provider keys (set the one matching your provider)
 HF_TOKEN=your_hf_token_here
+OPENROUTER_API_KEY=
+GROQ_API_KEY=
+
+# Optional explicit override (normally leave empty)
+# API_KEY=
+
+# OpenRouter attribution headers (used when provider is openrouter)
+OPENROUTER_REFERER=https://your-site.com
+OPENROUTER_TITLE=meta_hackathon
 
 # OpenEnv server base URL used by the agent
 ENV_BASE_URL=http://localhost:8000
 
-# Task mode (easy|flaky|medium|network|security|hard)
-META_HACKATHON_TASK_MODE=easy
+# Episode count: each reset() gets a new challenge from the LLM adversarial designer.
+# Fault selection is ALWAYS by LLM (not curriculum).
+# Difficulty is scheduled by server-side curriculum (UCB1 + EMA).
+META_HACKATHON_NUM_EPISODES=6
+
+# Scenario construction style (controls HOW faults are injected, not WHAT fault):
+# - procedural/combo -> use deterministic multi-fault generator (input: LLM-chosen root cause)
+# - anything else    -> use LLM-generated multi-fault scenario (default)
+META_HACKATHON_TASK_MODE=cycle
 
 # Agent runtime controls
+HTTP_TIMEOUT_SECONDS=180
+MAX_TOKENS=512
+MESSAGE_WINDOW=12
 MAX_MODEL_CALLS_PER_TASK=16
 MAX_CONSECUTIVE_TOOL_CALL_MISSES=4
 MIN_MODEL_CALLS_BEFORE_FORCED_FALLBACK=4
 INFERENCE_VERBOSE=true
+INFERENCE_DETAIL_MAX_ITEMS=3
+SUCCESS_SCORE_THRESHOLD=0.20
 
 # Server/runtime controls
 META_HACKATHON_PIPELINE_TIMEOUT_SECONDS=300
 
+# Optional provenance audit trail in reset/step metadata
+META_HACKATHON_AUDIT_TRAIL=true
+
 # Rubric delayed-reward controls
 META_HACKATHON_RUBRIC_ENABLED=true
-META_HACKATHON_RUBRIC_WEIGHT=0.30
+META_HACKATHON_RUBRIC_WEIGHT=0.20
 META_HACKATHON_RUBRIC_TIMEOUT_SECONDS=10
 META_HACKATHON_RUBRIC_MODEL=Qwen/Qwen2.5-72B-Instruct
 META_HACKATHON_RUBRIC_DEBUG=false
@@ -256,21 +325,29 @@ META_HACKATHON_RUBRIC_DEBUG=false
 # Optional override for rubric provider specifically
 # RUBRIC_LLM_PROVIDER=openrouter
 
-# OpenRouter testing mode (set these when LLM_PROVIDER=openrouter)
-# API_BASE_URL=https://openrouter.ai/api/v1
-# OPENROUTER_API_KEY=your_openrouter_api_key_here
-# OPENROUTER_REFERER=https://your-site.com
-# OPENROUTER_TITLE=meta_hackathon
-
-# Groq testing mode (set these when LLM_PROVIDER=groq)
-# API_BASE_URL=https://api.groq.com/openai/v1
-# GROQ_API_KEY=your_groq_api_key_here
+# Mid-episode state/schema drift injection (experimental world-modeling feature)
+META_HACKATHON_DRIFT_ENABLED=true
+META_HACKATHON_DRIFT_PROBABILITY=0.4
 ```
 
 Optional local inference debug variables:
 
 - `INFERENCE_DETAIL_MAX_ITEMS` (default `3`, controls list preview size in `[DETAIL]` lines)
 - `SUCCESS_SCORE_THRESHOLD` (default `0.20`)
+
+## Utility scripts
+
+- `reset_sqlite_db.py` clears all rows from the agent memory SQLite database while preserving schema.
+
+```bash
+uv run python reset_sqlite_db.py
+```
+
+Optional custom path:
+
+```bash
+uv run python reset_sqlite_db.py --db path/to/your.db
+```
 
 ## Provenance Audit Trail
 
