@@ -7,6 +7,7 @@ Preserves the OpenEnv API contract: reset(), step(), state().
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import tempfile
@@ -15,6 +16,8 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
+
+logger = logging.getLogger(__name__)
 
 try:
     from ..models import MetaHackathonAction, MetaHackathonObservation
@@ -54,15 +57,15 @@ from cicd.fix_applier import apply_fix, FixResult
 from cicd.procedural_generator import generate_scenario as procedural_generate_scenario, inject_procedural
 from cicd.drift_injector import maybe_drift, drift_enabled
 try:
-    from .rubric_judge import DEFAULT_GROQ_MODEL, OpenEnvLLMJudgeAdapter
+    from .rubric_judge import DEFAULT_OPENROUTER_MODEL, OpenEnvLLMJudgeAdapter
     from .curriculum import CurriculumController
     from .adversarial_designer import AdversarialDesigner
     from .adversarial_judge import AdversarialJudge
 except (ImportError, ModuleNotFoundError):
-    from rubric_judge import DEFAULT_GROQ_MODEL, OpenEnvLLMJudgeAdapter
-    from curriculum import CurriculumController
-    from adversarial_designer import AdversarialDesigner
-    from adversarial_judge import AdversarialJudge
+    from server.rubric_judge import DEFAULT_OPENROUTER_MODEL, OpenEnvLLMJudgeAdapter
+    from server.curriculum import CurriculumController
+    from server.adversarial_designer import AdversarialDesigner
+    from server.adversarial_judge import AdversarialJudge
 
 
 # ── Constants ──────────────────────────────────────────────────────────────
@@ -232,7 +235,7 @@ class RealCICDRepairEnvironment(Environment):
         self._rubric_model = (
             os.getenv("META_HACKATHON_RUBRIC_MODEL")
             or os.getenv("MODEL_NAME")
-            or DEFAULT_GROQ_MODEL
+            or DEFAULT_OPENROUTER_MODEL
         )
         self._rubric_judge = OpenEnvLLMJudgeAdapter(
             enabled=self._rubric_enabled,
@@ -325,13 +328,38 @@ class RealCICDRepairEnvironment(Environment):
         fault_metadata = injected[0] if injected else inject_fault(repo_dir, fault_type)
         cascading_faults: list = injected[1:] if len(injected) > 1 else []
 
-        # Run the pipeline (should fail)
+        # Run the pipeline — if injection silently failed and pipeline passes,
+        # retry with a fresh deterministic fault (up to 2 retries) so every
+        # episode has a real failure for the agent to debug.
         runner = PipelineRunner(
             repo_path=repo_dir,
             workspace_base=workspace_base,
             timeout_per_stage=self._pipeline_timeout,
         )
         pipeline_result = runner.run(workspace_dir=repo_dir)
+
+        _retry = 0
+        try:
+            while pipeline_result.status == PipelineStatus.PASSED and _retry < 2:
+                _retry += 1
+                logger.warning(
+                    "[reset] Initial pipeline passed after injection — fault may not have applied "
+                    "(fault_type=%s). Retrying with deterministic fallback (attempt %d/2).",
+                    fault_type, _retry,
+                )
+                fallback_fault = inject_fault(repo_dir, fault_type)
+                if fallback_fault:
+                    fault_metadata = fallback_fault
+                pipeline_result = runner.run(workspace_dir=repo_dir)
+        except Exception as _exc:
+            logger.error("[reset] Fault injection retry failed: %s. Continuing with current state.", _exc)
+
+        if pipeline_result.status == PipelineStatus.PASSED:
+            logger.error(
+                "[reset] Pipeline still passing after %d retries for fault_type=%s. "
+                "Episode will have no detectable failure — agent will likely score 0.",
+                _retry, fault_type,
+            )
 
         # Create episode state
         episode = EpisodeState(
@@ -760,7 +788,10 @@ class RealCICDRepairEnvironment(Environment):
 
         if progressed:
             ep.fix_hits += 1
-            ep.findings.append("Run verify_fix before finalize to confirm the failure signature is gone.")
+            ep.findings.append(
+                "Pipeline PASSED. Call verify_fix next (required before finalize) — "
+                "then immediately call finalize. Do not apply more fixes."
+            )
             return 0.18
         return 0.05
 
@@ -774,10 +805,19 @@ class RealCICDRepairEnvironment(Environment):
             ep.findings.append("Latest rerun is already verified.")
             return -0.06
 
+        if ep.rerun_attempts == 0:
+            ep.findings.append(
+                "Cannot verify: run rerun_pipeline after applying a fix before calling verify_fix."
+            )
+            return -0.06
+
         if ep.pipeline_result.status == PipelineStatus.PASSED:
             ep.incident_resolved = True
             ep.verified_for_latest_rerun = True
-            ep.findings.append("Verification confirms the fix resolved the incident.")
+            ep.findings.append(
+                "VERIFIED: fix resolved the incident. "
+                "Call finalize now — do NOT apply further fixes or reruns."
+            )
             return 0.16
         elif ep.last_rerun_progressed:
             ep.verified_for_latest_rerun = True
@@ -792,6 +832,12 @@ class RealCICDRepairEnvironment(Environment):
         if not ep.verified_for_latest_rerun:
             ep.findings.append("Run verify_fix before finalize")
             return -0.05
+
+        if ep.rerun_attempts == 0:
+            ep.findings.append(
+                "Finalize without running rerun_pipeline — no terminal bonus awarded."
+            )
+            return 0.05
 
         pipeline_passed = (
             ep.pipeline_result is not None
@@ -953,12 +999,14 @@ class RealCICDRepairEnvironment(Environment):
         """Compute final episode score from real outcomes."""
         score = 0.0
 
-        # Base score from resolution
-        if ep.incident_resolved and ep.verified_for_latest_rerun:
+        genuine_work = ep.fix_hits > 0 and ep.rerun_attempts > 0
+
+        # Base score from resolution — only credited if real repair work happened
+        if genuine_work and ep.incident_resolved and ep.verified_for_latest_rerun:
             score += 0.50
-        elif ep.incident_resolved:
+        elif genuine_work and ep.incident_resolved:
             score += 0.30
-        elif ep.last_rerun_progressed:
+        elif genuine_work and ep.last_rerun_progressed:
             score += 0.20
 
         # Hypothesis quality
@@ -985,7 +1033,28 @@ class RealCICDRepairEnvironment(Environment):
         # Pipeline health factor
         score *= ep.pipeline_health
 
-        return round(max(0.0, min(1.0, score)), 3)
+        # Hard cap when no genuine repair work was performed
+        if not genuine_work:
+            score = min(score, 0.15)
+
+        final = round(max(0.0, min(1.0, score)), 3)
+        logger.debug(
+            "[score] ep=%s genuine=%s resolved=%s verified=%s fix_hits=%d reruns=%d "
+            "wrong=%d destructive=%d redundant=%d health=%.2f raw=%.3f final=%.3f",
+            ep.episode_id[:8],
+            genuine_work,
+            ep.incident_resolved,
+            ep.verified_for_latest_rerun,
+            ep.fix_hits,
+            ep.rerun_attempts,
+            ep.wrong_fixes,
+            ep.destructive_actions,
+            ep.redundant_actions,
+            ep.pipeline_health,
+            score,
+            final,
+        )
+        return final
 
     def _dict_to_observation(self, obs_dict: Dict[str, Any]) -> MetaHackathonObservation:
         """Convert observation dict to MetaHackathonObservation model."""

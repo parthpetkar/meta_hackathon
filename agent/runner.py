@@ -19,7 +19,7 @@ from .config import (
     MAX_CONSECUTIVE_TOOL_CALL_MISSES,
     MAX_MODEL_CALLS_PER_TASK,
     MAX_STEPS,
-    MIN_MODEL_CALLS_BEFORE_FORCED_FALLBACK,
+    MIN_MODEL_CALLS_BEFORE_STRICT_FAIL,
     MODEL_NAME,
     NUM_EPISODES,
     SUCCESS_SCORE_THRESHOLD,
@@ -85,49 +85,6 @@ def _extract_primary_surfaced_error_file(observation: MetaHackathonObservation) 
         if match:
             return match.group(1).strip()
     return ""
-
-
-def _select_fallback_action(
-    observation: MetaHackathonObservation,
-    action_history: List[Tuple[str, str, str]],
-    fix_phrase: str = "",
-    fix_applied_since_rerun: bool = False,
-) -> Tuple[str, str, str]:
-    surfaced_file = _extract_primary_surfaced_error_file(observation)
-    stage = observation.current_stage or "build"
-
-    candidates: List[Tuple[str, str, str]] = [
-        ("inspect_config", surfaced_file or stage, ""),
-        ("view_logs", stage, ""),
-        ("inspect_dockerfile", "build", ""),
-        ("inspect_permissions", stage, ""),
-    ]
-
-    # Inject fix candidates when we know what fix to apply
-    if fix_phrase:
-        is_dep_fix = any(kw in fix_phrase for kw in ["pin", "dependency", "urllib3", "requests"])
-        fix_op = "add_dependency" if is_dep_fix else "modify_config"
-        fix_candidate = (fix_op, stage, fix_phrase)
-        if fix_candidate not in action_history:
-            candidates.insert(0, fix_candidate)
-        elif fix_phrase == "auto":
-            # Retry auto-repair with fresh hint from latest stage
-            alt = (fix_op, stage, f"auto-{len(action_history)}")
-            candidates.insert(0, alt)
-
-    candidates += [
-        ("rerun_pipeline", "", ""),
-        ("verify_fix", "", ""),
-    ]
-
-    for candidate in candidates:
-        # Allow rerun_pipeline if a new fix was applied since the last one
-        if candidate[0] == "rerun_pipeline" and fix_applied_since_rerun:
-            return candidate
-        if candidate not in action_history:
-            return candidate
-
-    return ("view_logs", stage, f"detail-{len(action_history) + 1}")
 
 
 def _memory_hint(errors: List[str], fault_type: str) -> Tuple[str, str]:
@@ -211,7 +168,6 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
     task_name = fallback_task_name
     tool_call_misses = 0
     model_calls_used = 0
-    disable_model_calls = MAX_MODEL_CALLS_PER_TASK <= 0
     observation: Optional[MetaHackathonObservation] = None
     messages: List[Dict[str, Any]] = []
     task_max_steps = MAX_STEPS
@@ -282,38 +238,50 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
             }
             tool_call_id: Optional[str] = None
 
+            _model_failed = False
             guard_attempts = 0
-            while True:
+            try:
+              while True:
                 guard_attempts += 1
 
-                if disable_model_calls:
-                    assistant_message = {
-                        "role": "assistant",
-                        "content": "Model tool-calling disabled after repeated misses; using deterministic fallback.",
-                    }
-                    tool_call_id = None
-                    operation, target, value = _select_fallback_action(
-                        observation, action_history, fix_phrase, fix_applied_since_rerun
+                operation, target, value, assistant_message, tool_call_id = get_model_action(
+                    client=client,
+                    step=step,
+                    messages=messages,
+                )
+                model_calls_used += 1
+                if model_calls_used > MAX_MODEL_CALLS_PER_TASK:
+                    raise RuntimeError(
+                        "Model call budget exceeded while strict tool-calling is enabled. "
+                        "Increase MAX_MODEL_CALLS_PER_TASK or use a model/provider with reliable tool calls."
                     )
-                else:
-                    operation, target, value, assistant_message, tool_call_id = get_model_action(
-                        client=client,
-                        step=step,
-                        messages=messages,
-                    )
-                    model_calls_used += 1
-                    if model_calls_used >= MAX_MODEL_CALLS_PER_TASK:
-                        disable_model_calls = True
 
-                    if tool_call_id is None:
-                        tool_call_misses += 1
-                        if (
-                            tool_call_misses >= MAX_CONSECUTIVE_TOOL_CALL_MISSES
-                            and model_calls_used >= MIN_MODEL_CALLS_BEFORE_FORCED_FALLBACK
-                        ):
-                            disable_model_calls = True
-                    else:
-                        tool_call_misses = 0
+                if tool_call_id is None:
+                    tool_call_misses += 1
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your previous response did not include a native tool call. "
+                                "Return exactly one valid tool call from the provided tool schema."
+                            ),
+                        }
+                    )
+                    if (
+                        tool_call_misses >= MAX_CONSECUTIVE_TOOL_CALL_MISSES
+                        and model_calls_used >= MIN_MODEL_CALLS_BEFORE_STRICT_FAIL
+                    ):
+                        raise RuntimeError(
+                            "Model failed to emit required tool calls repeatedly. "
+                            "Strict tool-calling is mandatory and fallback is disabled."
+                        )
+                    if guard_attempts < 4:
+                        messages = trim_messages(messages)
+                        continue
+                    raise RuntimeError(
+                        "Model response missing tool call after retries in strict mode."
+                    )
+                tool_call_misses = 0
 
                 operation, target, value = normalize_model_action(
                     operation=operation,
@@ -419,17 +387,23 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                         )
                     should_resample = True
 
-                if should_resample and disable_model_calls:
-                    operation, target, value = _select_fallback_action(
-                        observation, action_history, fix_phrase, fix_applied_since_rerun
-                    )
-                    action_tuple = (operation, target, value)
-                    should_resample = False
-
-                if should_resample and (not disable_model_calls) and guard_attempts < 4:
+                if should_resample and guard_attempts < 4:
                     messages = trim_messages(messages)
                     continue
 
+                break
+            except RuntimeError as _model_exc:
+                _model_failed = True
+                log_step(
+                    step=step,
+                    action="[model_failure]||",
+                    reward=0.0,
+                    done=True,
+                    error=str(_model_exc),
+                    llm_thought="",
+                )
+
+            if _model_failed:
                 break
 
             action_tuple = (operation, target, value)
@@ -564,6 +538,27 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
 
             if done:
                 break
+
+        # Runner exhausted step budget without agent calling finalize — force one to trigger scoring.
+        if observation is not None and not observation.done:
+            try:
+                observation, reward, done, error = step_env(
+                    session,
+                    operation="finalize",
+                    target="",
+                    value="",
+                )
+                rewards.append(reward)
+                log_step(
+                    step=steps_taken + 1,
+                    action="finalize||",
+                    reward=reward,
+                    done=done,
+                    error=error,
+                    llm_thought="[forced finalize: step budget exhausted]",
+                )
+            except Exception as exc:
+                pass  # best-effort; scoring may be partial
 
         if observation is not None:
             score = float(observation.final_score)

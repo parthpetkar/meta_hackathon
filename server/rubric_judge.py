@@ -53,6 +53,9 @@ class RubricJudge(Protocol):
         ...
 
 
+DEFAULT_OPENROUTER_MODEL = "qwen/qwen-2.5-72b-instruct"
+
+
 class OpenEnvLLMJudgeAdapter:
     """OpenEnv LLMJudge first, API LLM fallback second, heuristic last."""
 
@@ -76,13 +79,12 @@ class OpenEnvLLMJudgeAdapter:
         self._enabled = enabled
         self._model_name = model_name
         self._timeout_seconds = max(1, int(timeout_seconds))
-        self._provider = os.getenv("RUBRIC_LLM_PROVIDER", os.getenv("LLM_PROVIDER", "openrouter")).strip().lower()
+        self._provider = os.getenv("RUBRIC_LLM_PROVIDER", "openrouter").strip().lower()
         self._api_base_url = self._resolve_api_base_url()
         self._api_key = self._resolve_api_key()
         self._openrouter_referer = (os.getenv("OPENROUTER_REFERER") or "").strip()
         self._openrouter_title = (os.getenv("OPENROUTER_TITLE") or "meta_hackathon").strip()
         self._debug_enabled = os.getenv("META_HACKATHON_RUBRIC_DEBUG", "false").strip().lower() == "true"
-
         self._openenv_judge: Any = None
         self._openenv_client: Any = None
         self._openenv_init_error: str = ""

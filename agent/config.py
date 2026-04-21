@@ -92,9 +92,15 @@ MESSAGE_WINDOW = int(os.getenv("MESSAGE_WINDOW", "12"))
 MAX_MODEL_CALLS_PER_TASK = int(os.getenv("MAX_MODEL_CALLS_PER_TASK", str(MAX_STEPS * 3)))
 PREFER_DETERMINISTIC_ACTIONS = os.getenv("PREFER_DETERMINISTIC_ACTIONS", "false").lower() == "true"
 MAX_CONSECUTIVE_TOOL_CALL_MISSES = max(1, int(os.getenv("MAX_CONSECUTIVE_TOOL_CALL_MISSES", "6")))
-MIN_MODEL_CALLS_BEFORE_FORCED_FALLBACK = max(
+# Strict mode hard-fail threshold. Backward-compatible with legacy fallback-named variable.
+MIN_MODEL_CALLS_BEFORE_STRICT_FAIL = max(
     1,
-    int(os.getenv("MIN_MODEL_CALLS_BEFORE_FORCED_FALLBACK", "4")),
+    int(
+        os.getenv(
+            "MIN_MODEL_CALLS_BEFORE_STRICT_FAIL",
+            os.getenv("MIN_MODEL_CALLS_BEFORE_FORCED_FALLBACK", "4"),
+        )
+    ),
 )
 
 INFERENCE_VERBOSE = os.getenv("INFERENCE_VERBOSE", "false").strip().lower() == "true"

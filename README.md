@@ -51,6 +51,49 @@ Runtime architecture (current):
 - `cicd/drift_injector.py` performs opt-in mid-episode drift mutations.
 - `cicd/fix_applier.py` applies structured JSON or heuristic fixes and commits successful changes.
 
+## Architecture
+
+The runtime follows a layered architecture to keep OpenEnv APIs stable while evolving internal behavior.
+
+### 1) API + Session Layer
+
+- `server/app.py`: OpenEnv HTTP server wiring (`/reset`, `/step`, `/state`).
+- `server/environment.py`: `RealCICDRepairEnvironment` episode state machine and action dispatcher.
+
+### 2) Execution Layer
+
+- `cicd/pipeline_runner.py`: real subprocess pipeline (`clone -> build -> test -> deploy`).
+- `cicd/fault_injector.py`: file-level fault mutations with git commits.
+- `cicd/fix_applier.py`: structured JSON edits + heuristic/auto fixes.
+
+### 3) Evidence Layer
+
+- `cicd/observation_builder.py`: builds surfaced logs/errors/metrics/config snapshots.
+- `cicd/drift_injector.py`: optional post-recovery drift to force re-triage.
+
+### 4) Adaptation + Scoring Layer
+
+- `server/curriculum.py`: difficulty scheduling from prior outcomes.
+- `server/adversarial_designer.py`: LLM-designed cascading incidents.
+- `server/adversarial_judge.py`: phase-aware step/terminal shaping.
+- `server/rubric_judge.py`: delayed semantic rubric score (OpenEnv judge + API fallback).
+- `server/agent_memory.py`: persistent cross-episode fix recall.
+
+### 5) Inference Layer
+
+- `inference.py`: compatibility entrypoint plus run logging.
+- `agent/runner.py`: tool-calling loop, action guards, memory-aware hints.
+- `agent/http_environment.py`: OpenEnv HTTP observation/action adapter.
+- `agent/trajectory_logging.py`: strict START/STEP/END structured logs.
+
+### End-to-end flow
+
+1. `reset()` creates a workspace from `sample-app`, injects scenario faults, runs pipeline, returns evidence-rich observation.
+2. Agent issues inspect/hypothesis/fix/rerun/verify actions via `step()`.
+3. Environment updates state, applies shaping + safeguards, and emits next observation.
+4. Optional drift mutates state after a successful rerun, requiring re-triage.
+5. `finalize` is accepted only after a valid `verify_fix`; terminal score blends deterministic + optional rubric.
+
 ## Action space
 
 All actions use the schema: `operation | target | value`
