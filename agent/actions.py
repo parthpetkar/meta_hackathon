@@ -130,35 +130,3 @@ def progression_guard_action(
     return None
 
 
-def should_force_fallback(
-    *,
-    step: int,
-    rewards: List[float],
-    history: List[str],
-    observation: MetaHackathonObservation,
-) -> bool:
-    """Enter deterministic fallback when trajectory stalls."""
-    if step <= 3:
-        return False
-
-    recent_rewards = rewards[-3:]
-    if len(recent_rewards) == 3 and all(value <= 0.0 for value in recent_rewards):
-        return True
-
-    if len(history) >= 3:
-        last_ops = [entry.split("|", 1)[0] for entry in history[-3:]]
-        if len(set(last_ops)) == 1 and last_ops[0] in {"set_hypothesis", "modify_config", "add_dependency"}:
-            return True
-
-    redundancy_threshold = 4 if (observation.difficulty or "").strip().lower() == "hard" else 3
-    if observation.redundant_actions >= redundancy_threshold and not observation.incident_resolved:
-        return True
-
-    # Consecutive reruns without improvement generally indicate semantic drift.
-    if len(history) >= 2:
-        last_two_ops = [entry.split("|", 1)[0] for entry in history[-2:]]
-        if last_two_ops == ["rerun_pipeline", "rerun_pipeline"] and recent_rewards and recent_rewards[-1] <= 0.0:
-            return True
-
-    return False
-

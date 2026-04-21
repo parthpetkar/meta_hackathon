@@ -31,6 +31,7 @@ FAULT_TYPES = [
     "flaky_test",
     "missing_permission",
     "secret_exposure",
+    "env_drift",
 ]
 
 # Which pipeline stage each fault causes to fail
@@ -41,6 +42,7 @@ FAULT_STAGE_MAP: Dict[str, str] = {
     "flaky_test": "test",
     "missing_permission": "deploy",
     "secret_exposure": "build",
+    "env_drift": "deploy",
 }
 
 # Keywords the agent's hypothesis should contain to score positively
@@ -51,6 +53,7 @@ FAULT_KEYWORDS: Dict[str, List[str]] = {
     "flaky_test": ["flaky", "test", "intermittent", "timing", "random", "fail"],
     "missing_permission": ["permission", "network", "deploy", "compose", "missing"],
     "secret_exposure": ["secret", "credential", "api_key", "hardcoded", "exposed", "scan"],
+    "env_drift": ["environment", "variable", "compose", "port", "invalid", "deploy"],
 }
 
 
@@ -97,6 +100,7 @@ def inject_fault(workspace: str, fault_type: str) -> FaultMetadata:
         "flaky_test": _inject_flaky_test,
         "missing_permission": _inject_missing_permission,
         "secret_exposure": _inject_secret_exposure,
+        "env_drift": _inject_env_drift,
     }
     if fault_type not in injectors:
         raise ValueError(f"Unknown fault type: {fault_type!r}. Valid: {FAULT_TYPES}")
@@ -174,11 +178,11 @@ def _inject_docker_order(workspace: str) -> FaultMetadata:
 
             WORKDIR /app
 
-            # Copy all application code first (wrong order — breaks layer caching)
-            COPY . /app/
+            # Wrong order: install before copying requirements into image
+            RUN uv pip install --system --no-cache -r services/api/requirements.txt
 
-            # Install dependencies after copy
-            RUN pip install --no-cache-dir -r requirements.txt
+            # Copy application code too late
+            COPY . /app/
 
             EXPOSE 5000
 
@@ -189,7 +193,7 @@ def _inject_docker_order(workspace: str) -> FaultMetadata:
         fault_type="docker_order",
         affected_files=["Dockerfile"],
         injected_at_commit_sha=sha,
-        description="Dockerfile COPY . before pip install causes requirements.txt path error",
+        description="Dockerfile installs services/api/requirements.txt before COPY, so file is unavailable at build time",
     )
 
 
@@ -298,3 +302,34 @@ def _inject_secret_exposure(workspace: str) -> FaultMetadata:
         injected_at_commit_sha=sha,
         description="Hardcoded API keys and secrets exposed in source code",
     )
+
+
+def _inject_env_drift(workspace: str) -> FaultMetadata:
+        path = os.path.join(workspace, "docker-compose.yml")
+        with open(path, "w", encoding="utf-8") as f:
+                f.write(textwrap.dedent("""\
+                        version: "3.8"
+
+                        services:
+                            api:
+                                build:
+                                    context: .
+                                    dockerfile: Dockerfile
+                                ports:
+                                    - "${PORT}:5000"
+                                environment:
+                                    - FLASK_ENV=production
+                                    - PORT=not-a-number
+                                healthcheck:
+                                    test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+                                    interval: 30s
+                                    timeout: 5s
+                                    retries: 3
+                """))
+        sha = _commit(workspace, "infra: externalize PORT via env for deploy standardization", [path])
+        return FaultMetadata(
+                fault_type="env_drift",
+                affected_files=["docker-compose.yml"],
+                injected_at_commit_sha=sha,
+                description="Invalid runtime env var PORT=not-a-number breaks docker compose deploy port mapping",
+        )

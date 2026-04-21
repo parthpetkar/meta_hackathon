@@ -1,118 +1,189 @@
 # Meta Hackathon Environment Design
 
-## Goal
+## 1. Purpose
 
-Build a realistic, reusable RL environment for CI/CD incident repair where agents must reason over evidence, not just memorize one-step fixes.
+This repository implements a real CI/CD repair environment for RL agents under OpenEnv.
+The key design intent is to evaluate world-modeling behavior in professional tasks:
 
-## Core design principles
+- infer root cause from partial/noisy evidence,
+- choose safe interventions,
+- validate with real pipeline reruns,
+- adapt when the world changes mid-episode.
 
-- Evidence before intervention: the environment rewards investigation quality and penalizes blind changes.
-- Safety-aware remediation: destructive shortcuts reduce health and score.
-- Sequential dependence: upstream fixes can reveal downstream failures.
-- Verifiable completion: `verify_fix` is required before `finalize`.
-- Deterministic replay: scenario cards and variants produce reproducible benchmark runs.
+The environment is not a synthetic rule table. It executes real file mutations and real subprocess pipeline stages over a per-episode workspace.
 
-## Task model
+## 2. OpenEnv contract
 
-The environment uses incident chains of increasing complexity:
+The API contract is stable and intentionally small:
 
-- easy: single merge-conflict root cause.
-- medium: dependency mismatch plus Docker ordering instability.
-- security: dual-fix requirement (IAM + secret hygiene).
-- hard: multi-service cascade with permission, rollback, and rollout tuning.
+- `reset()` -> initial observation
+- `step(action)` -> next observation, reward, done
+- `state()` -> `episode_id`, `step_count`
 
-Each chain stage defines:
+All architecture changes are implemented behind this contract.
 
-- semantic hypothesis terms,
-- relevant inspection actions,
-- accepted fix patterns,
-- partial-fix behavior,
-- red-herring penalties.
+## 3. Architecture overview
 
-## Incident taxonomy mapping
+### 3.1 Runtime layers
 
-This environment maps incident patterns to widely recognized operational taxonomies so evaluator outcomes can be interpreted in production terms.
+- API layer: `server/app.py`
+  - Creates OpenEnv HTTP server wiring for `RealCICDRepairEnvironment`.
+- Environment orchestration: `server/environment.py`
+  - Owns episode lifecycle, action dispatch, reward shaping, termination, and metadata.
+- CI/CD execution layer: `cicd/pipeline_runner.py`
+  - Runs `clone -> build -> test -> deploy` with subprocesses and captured logs.
+- Scenario and mutation layer:
+  - Fault injection: `cicd/fault_injector.py`
+  - Procedural scenario generator: `cicd/procedural_generator.py`
+  - Mid-episode drift: `cicd/drift_injector.py`
+- Evidence layer: `cicd/observation_builder.py`
+  - Builds surfaced errors, config snapshots, metrics, and stage-specific logs.
+- Fix execution layer: `cicd/fix_applier.py`
+  - Applies structured JSON edits or heuristic fixes, then commits.
+- Learning and adaptation layer:
+  - Curriculum scheduler: `server/curriculum.py`
+  - Adversarial incident designer: `server/adversarial_designer.py`
+  - Phase-aware judge shaping: `server/adversarial_judge.py`
+  - Cross-episode memory: `server/agent_memory.py`
+  - Rubric semantic judge: `server/rubric_judge.py`
 
-- PagerDuty-style incident classes:
-  - Merge conflicts and dependency breaks map to change-failure/deployment incidents.
-  - IAM push denial maps to authorization/access-control incidents.
-  - Secret exposure maps to security/compliance incidents.
-  - Flaky test failures map to pipeline quality degradation incidents.
-  - DNS/timeout upload failures map to external dependency/network reliability incidents.
-- Google SRE-style categories:
-  - Build/test regressions and flakes align to release-engineering and CI reliability classes.
-  - Permission and secret failures align to security and policy-enforcement classes.
-  - Rollout timeout and registry outages align to dependency and production rollout stability classes.
+### 3.2 Inference stack
 
-Because every episode surfaces logs, stage context, and remediation decisions in a deterministic schema, the environment can also serve as diagnostic middleware: a reusable evaluation layer that sits between real production-style telemetry and agent policies to benchmark triage quality, remediation safety, and verification discipline.
+- Entry point: `inference.py`
+- Agent runtime: `agent/runner.py`
+- Model tool-calling: `agent/model_client.py`
+- Action normalization and guards: `agent/actions.py`
+- HTTP adapter: `agent/http_environment.py`
+- Structured logs: `agent/trajectory_logging.py`
 
-## Scoring model
+## 4. Episode lifecycle
 
-### Step rewards
+### 4.1 Reset path
 
-Step-level rewards drive tactical behavior (inspect, hypothesis, modify, rerun, verify, finalize).
+1. Create isolated workspace from `sample-app`.
+2. Select/adapt scenario via curriculum plus adversarial designer.
+3. Inject one or more faults into real files.
+4. Execute initial pipeline.
+5. Build and return observation with logs, surfaced errors, and config snapshots.
 
-### Deterministic terminal score
+### 4.2 Step path
 
-Deterministic score captures quality dimensions:
+1. Parse action (`operation|target|value`) and update episode history.
+2. Dispatch to operation handler in `server/environment.py`.
+3. Optionally mutate files, rerun pipeline, or verify fix state.
+4. Apply phase bonuses/penalties and redundancy policy.
+5. Build observation with updated evidence and metadata flags.
 
-- progression and resolution,
-- fix precision,
-- reasoning coverage,
-- efficiency (difficulty-aware action budgets),
-- penalties for redundancy/destructive actions.
+### 4.3 Termination path
 
-Hard-task calibration includes extra redundancy grace and a small cascade-completion bonus so multi-step service recovery is rewarded without collapsing the overall difficulty gradient.
+- Termination occurs on verified finalize or step budget exhaustion.
+- Terminal scoring combines deterministic score and optional rubric score.
 
-### Optional rubric delayed reward
+## 5. Fault and drift model
 
-When enabled, a rubric judge adds semantic quality evaluation at episode end.
+### 5.1 Fault classes
 
-- primary: OpenEnv `LLMJudge`
-- fallback 1: API LLM JSON scorer
-- fallback 2: heuristic semantic scorer
+Faults include merge conflict, dependency conflict, docker order, flaky tests, permission/network faults, secret exposure, and env-var drift style deploy faults.
 
-Final score blending:
+Each fault declares:
+
+- expected failing stage,
+- affected files,
+- keyword set for hypothesis alignment,
+- injection mutation behavior.
+
+### 5.2 Mid-episode drift
+
+When drift is enabled, a successful rerun may trigger a second mutation (for example compose key/env drift), causing new failure signals and requiring re-triage.
+
+Observation fields include drift indicators (`drift_detected` and drift metadata in `metadata`) so downstream agents/evaluators can attribute behavior.
+
+## 6. Reward and scoring model
+
+### 6.1 Step rewards
+
+Per-step rewards encourage:
+
+- stage-relevant inspection,
+- accurate hypothesis formulation,
+- safe fix application,
+- rerun-verify-finalize discipline.
+
+Penalties discourage:
+
+- wrong hypotheses,
+- failed or destructive fixes,
+- repeated redundant actions,
+- premature finalize without verification.
+
+### 6.2 Deterministic terminal score
+
+Deterministic scoring factors:
+
+- incident resolution and verification,
+- hypothesis quality signal,
+- fix hits,
+- efficiency versus difficulty budget,
+- penalties for redundant/destructive/wrong actions,
+- pipeline health multiplier.
+
+### 6.3 Rubric delayed reward
+
+Rubric scoring is optional and blended at episode end:
+
+- primary: OpenEnv LLMJudge path,
+- fallback: OpenRouter-compatible API scoring,
+- final fallback: heuristic semantic scorer.
+
+Blend formula:
 
 `final = (1 - w) * deterministic + w * rubric`
 
-where `w` is the rubric blend weight.
+where `w = META_HACKATHON_RUBRIC_WEIGHT`.
 
-This delayed reward lets you measure how well hypotheses map to real causes, not only whether trajectory happened to succeed.
+## 7. Safety and completion guards
 
-## Observability and debugging
+Key safeguards in runtime:
 
-The observation model surfaces both deterministic and rubric diagnostics:
+- finalize is blocked unless `verify_fix` has confirmed latest rerun,
+- destructive fixes are explicitly penalized,
+- repeated identical actions are clamped by redundancy policy,
+- verification requires rerun evidence context.
 
-- `deterministic_score`
-- `rubric_score`
-- `delayed_reward`
-- `rubric_blend_weight`
-- `rubric_judge_used`
-- `rubric_judge_error`
+These prevent score gaming and align behavior with production SRE workflow.
 
-`eval_runner.py` prints per-episode and summary metrics including rubric fallback counts for quick reliability checks.
+## 8. Observability and reproducibility
 
-### Provenance audit trail (runtime)
+### 8.1 Runtime observability
 
-The environment includes an opt-in runtime audit trail for evidence provenance.
+Observation payload surfaces:
 
-- Toggle with `META_HACKATHON_AUDIT_TRAIL=true`.
-- When enabled, reset/step metadata includes deterministic lineage fields:
-  - `episode_seed`, `variant_id`
-  - `active_issue_pattern_buckets`
-  - `sampled_pattern_events` (pattern bucket, sampled index, and line)
-- This allows external reviewers to verify that surfaced evidence lines came from declared pattern buckets.
-- Default behavior remains unchanged when the flag is disabled.
+- stage status and logs,
+- extracted/surfaced errors,
+- config file snapshots,
+- reasoning trace (`findings`, action/hypothesis history),
+- scoring diagnostics (`deterministic_score`, `rubric_score`, `delayed_reward`),
+- drift and verification readiness metadata.
 
-## Extensibility
+### 8.2 Audit trail and reproducibility
 
-Add or change behavior in isolated modules:
+With audit trail enabled, metadata includes deterministic lineage fields (`episode_seed`, variant metadata, sampled pattern events), enabling reviewer-side traceability for surfaced evidence.
 
-- scenarios: `server/scenarios.py`
-- transitions/runtime: `server/meta_hackathon_environment.py`
-- deterministic rewards/grade: `server/graders.py`
-- rubric adapter: `server/rubric_judge.py`
-- agentic inference baseline: `agent/`
+Generated artifacts in `results/` capture deterministic evaluation and inference trajectories.
 
-This separation keeps task authoring, runtime logic, and evaluation policy modular for upstream OpenEnv contribution.
+## 9. Extensibility guide
+
+Preferred extension points:
+
+- Add new fault types in `cicd/fault_injector.py` and clue extraction in `cicd/observation_builder.py`.
+- Add new drift strategies in `cicd/drift_injector.py`.
+- Tune rewards/terminal components in `server/environment.py`.
+- Extend semantic judging policy in `server/rubric_judge.py`.
+- Add agent guards/strategies in `agent/actions.py` and `agent/runner.py`.
+
+## 10. Design constraints
+
+- Keep OpenEnv API surface unchanged.
+- Maintain backward-compatible env vars and defaults where possible.
+- Avoid silent, implicit shortcuts that bypass inspect/rerun/verify loops.
+- Preserve reproducibility for benchmark runs.

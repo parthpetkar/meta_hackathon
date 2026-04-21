@@ -40,10 +40,16 @@ def fingerprint(errors: list[str]) -> str:
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
-def recall(errors: list[str]) -> dict:
+def recall(errors: list[str], fault_type: str = "unknown") -> dict:
     """Return best known fix for this error pattern, or an empty suggestion."""
     if not errors:
-        return {"suggested_fix": "", "confidence": 0.0, "times_seen": 0}
+        return {
+            "suggested_fix": "",
+            "confidence": 0.0,
+            "times_seen": 0,
+            "historical_success_rate": 0.0,
+            "memory_log": "",
+        }
 
     h = fingerprint(errors)
     try:
@@ -57,18 +63,36 @@ def recall(errors: list[str]) -> dict:
         ).fetchone()
         conn.close()
     except Exception:
-        return {"suggested_fix": "", "confidence": 0.0, "times_seen": 0}
+        return {
+            "suggested_fix": "",
+            "confidence": 0.0,
+            "times_seen": 0,
+            "historical_success_rate": 0.0,
+            "memory_log": "",
+        }
 
     if row is None:
-        return {"suggested_fix": "", "confidence": 0.0, "times_seen": 0}
+        return {
+            "suggested_fix": "",
+            "confidence": 0.0,
+            "times_seen": 0,
+            "historical_success_rate": 0.0,
+            "memory_log": "",
+        }
 
     fix_text, success_count, failure_count = row
     total = success_count + failure_count
     confidence = success_count / total if total > 0 else 0.0
+    memory_log = (
+        "[MEMORY] Recalling fix for fault_type="
+        f"{fault_type}: action={fix_text}, historical_success_rate={confidence:.2f}"
+    )
     return {
         "suggested_fix": fix_text,
         "confidence": round(confidence, 3),
         "times_seen": total,
+        "historical_success_rate": round(confidence, 3),
+        "memory_log": memory_log,
     }
 
 

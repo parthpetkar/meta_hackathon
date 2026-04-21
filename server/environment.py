@@ -7,6 +7,7 @@ Preserves the OpenEnv API contract: reset(), step(), state().
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import tempfile
@@ -15,6 +16,8 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
+
+logger = logging.getLogger(__name__)
 
 try:
     from ..models import MetaHackathonAction, MetaHackathonObservation
@@ -51,10 +54,18 @@ from cicd.observation_builder import (
     read_workspace_file,
 )
 from cicd.fix_applier import apply_fix, FixResult
+from cicd.procedural_generator import generate_scenario as procedural_generate_scenario, inject_procedural
+from cicd.drift_injector import maybe_drift, drift_enabled
 try:
-    from .rubric_judge import DEFAULT_GROQ_MODEL, OpenEnvLLMJudgeAdapter
+    from .rubric_judge import DEFAULT_OPENROUTER_MODEL, OpenEnvLLMJudgeAdapter
+    from .curriculum import CurriculumController
+    from .adversarial_designer import AdversarialDesigner
+    from .adversarial_judge import AdversarialJudge
 except (ImportError, ModuleNotFoundError):
-    from rubric_judge import DEFAULT_GROQ_MODEL, OpenEnvLLMJudgeAdapter
+    from server.rubric_judge import DEFAULT_OPENROUTER_MODEL, OpenEnvLLMJudgeAdapter
+    from server.curriculum import CurriculumController
+    from server.adversarial_designer import AdversarialDesigner
+    from server.adversarial_judge import AdversarialJudge
 
 
 # ── Constants ──────────────────────────────────────────────────────────────
@@ -136,6 +147,11 @@ class EpisodeState:
     inspected_since_last_rerun: bool = True
     fix_hits: int = 0
 
+    # Adversarial mode
+    adversarial_scenario: Optional[Any] = None
+    cascading_faults: List[Any] = field(default_factory=list)
+    curriculum_difficulty: float = 0.5
+
     # Rubric scoring
     deterministic_score: float = 0.0
     rubric_score: float = 0.0
@@ -148,6 +164,13 @@ class EpisodeState:
 
     # Timestamps
     created_at: float = 0.0
+
+    # Drift state
+    drift_events_fired: List[Any] = field(default_factory=list)
+    rerun_attempts: int = 0
+    episode_seed: int = 0
+    procedural_mode: bool = False
+    drift_detected: bool = False
 
 
 def _canonical_operation(operation: str) -> str:
@@ -212,13 +235,20 @@ class RealCICDRepairEnvironment(Environment):
         self._rubric_model = (
             os.getenv("META_HACKATHON_RUBRIC_MODEL")
             or os.getenv("MODEL_NAME")
-            or DEFAULT_GROQ_MODEL
+            or DEFAULT_OPENROUTER_MODEL
         )
         self._rubric_judge = OpenEnvLLMJudgeAdapter(
             enabled=self._rubric_enabled,
             model_name=self._rubric_model,
             timeout_seconds=self._rubric_timeout,
         )
+
+        # Curriculum + adversarial always active together
+        self._curriculum = CurriculumController()
+        self._adv_designer = AdversarialDesigner(
+            api_key=os.getenv("OPENROUTER_API_KEY") or os.getenv("API_KEY"),
+        )
+        self._adv_judge = AdversarialJudge()
 
         # Cleanup thread
         self._cleanup_lock = threading.Lock()
@@ -251,25 +281,13 @@ class RealCICDRepairEnvironment(Environment):
         episode_id = str(uuid.uuid4())
         self._state = State(episode_id=episode_id, step_count=0)
 
+        # Curriculum controls difficulty + construction style (procedural vs LLM).
+        # LLM adversarial designer is the SOLE source of fault selection.
         eff_task_key = task_key or self._task_key
+        use_procedural_style = eff_task_key in ("procedural", "combo")
 
-        # Choose fault type
-        if eff_task_key == "cycle":
-            fault_type = self._task_order[self._task_cursor % len(self._task_order)]
-            self._task_cursor += 1
-        elif eff_task_key in FAULT_TYPES:
-            fault_type = eff_task_key
-        else:
-            # Map old task keys to fault types
-            key_map = {
-                "easy": "merge_conflict",
-                "medium": "dependency_conflict",
-                "flaky": "flaky_test",
-                "security": "secret_exposure",
-                "hard": "missing_permission",
-                "network": "docker_order",
-            }
-            fault_type = key_map.get(eff_task_key, "merge_conflict")
+        curriculum_difficulty = self._curriculum.get_difficulty()
+        skill_profile = self._curriculum.get_skill_profile()
 
         # Set up workspace
         workspace_base = tempfile.mkdtemp(prefix="cicd-episode-")
@@ -278,16 +296,70 @@ class RealCICDRepairEnvironment(Environment):
         # Initialize git repo from template
         setup_repo_from_template(self._template_dir, repo_dir)
 
-        # Inject the fault
-        fault_metadata = inject_fault(repo_dir, fault_type)
+        episode_seed = int(uuid.UUID(episode_id).int & 0xFFFFFFFF)
 
-        # Run the pipeline (should fail)
+        # LLM adversarial designer picks the root cause fault + composes scenario.
+        # Use a random fault as the prompt seed; LLM is free to use it or ignore it.
+        # (In practice, LLM always respects the root_cause_fault field per its prompt.)
+        import random as _random
+        seed_fault = _random.choice(FAULT_TYPES)
+        adversarial_scenario = self._adv_designer.design(
+            root_cause_fault=seed_fault,
+            difficulty=curriculum_difficulty,
+            skill_profile=skill_profile,
+        )
+        # If procedural style: regenerate the scenario using deterministic generator
+        # with the LLM-chosen root cause, but keep the LLM's decision
+        if use_procedural_style and adversarial_scenario.steps:
+            root_cause_ft = adversarial_scenario.steps[0].fault_type
+            procedural_scenario = procedural_generate_scenario(
+                difficulty=curriculum_difficulty,
+                seed=episode_seed,
+                root_cause=root_cause_ft,
+            )
+            adversarial_scenario = procedural_scenario
+            injected = inject_procedural(repo_dir, adversarial_scenario)
+        else:
+            # LLM-generated scenario as-is
+            injected = self._adv_designer.inject(repo_dir, adversarial_scenario)
+
+        fault_type = adversarial_scenario.steps[0].fault_type if adversarial_scenario.steps else "merge_conflict"
+
+        fault_metadata = injected[0] if injected else inject_fault(repo_dir, fault_type)
+        cascading_faults: list = injected[1:] if len(injected) > 1 else []
+
+        # Run the pipeline — if injection silently failed and pipeline passes,
+        # retry with a fresh deterministic fault (up to 2 retries) so every
+        # episode has a real failure for the agent to debug.
         runner = PipelineRunner(
             repo_path=repo_dir,
             workspace_base=workspace_base,
             timeout_per_stage=self._pipeline_timeout,
         )
         pipeline_result = runner.run(workspace_dir=repo_dir)
+
+        _retry = 0
+        try:
+            while pipeline_result.status == PipelineStatus.PASSED and _retry < 2:
+                _retry += 1
+                logger.warning(
+                    "[reset] Initial pipeline passed after injection — fault may not have applied "
+                    "(fault_type=%s). Retrying with deterministic fallback (attempt %d/2).",
+                    fault_type, _retry,
+                )
+                fallback_fault = inject_fault(repo_dir, fault_type)
+                if fallback_fault:
+                    fault_metadata = fallback_fault
+                pipeline_result = runner.run(workspace_dir=repo_dir)
+        except Exception as _exc:
+            logger.error("[reset] Fault injection retry failed: %s. Continuing with current state.", _exc)
+
+        if pipeline_result.status == PipelineStatus.PASSED:
+            logger.error(
+                "[reset] Pipeline still passing after %d retries for fault_type=%s. "
+                "Episode will have no detectable failure — agent will likely score 0.",
+                _retry, fault_type,
+            )
 
         # Create episode state
         episode = EpisodeState(
@@ -300,6 +372,11 @@ class RealCICDRepairEnvironment(Environment):
             all_pipeline_results=[pipeline_result],
             findings=["Incident acknowledged. Investigate before changing configuration."],
             created_at=time.time(),
+            adversarial_scenario=adversarial_scenario,
+            cascading_faults=cascading_faults,
+            curriculum_difficulty=curriculum_difficulty,
+            episode_seed=episode_seed,
+            procedural_mode=use_procedural_style,
         )
         self._episode = episode
 
@@ -311,11 +388,12 @@ class RealCICDRepairEnvironment(Environment):
             "flaky_test": "easy",
             "missing_permission": "hard",
             "secret_exposure": "security",
+            "env_drift": "network",
         }
         difficulty = difficulty_map.get(fault_type, "medium")
 
         # Build max_steps from difficulty
-        max_steps_map = {"easy": 16, "medium": 20, "security": 20, "hard": 25}
+        max_steps_map = {"easy": 16, "medium": 20, "network": 20, "security": 20, "hard": 25}
         max_steps = max_steps_map.get(difficulty, 15)
 
         obs_dict = build_observation(
@@ -335,6 +413,7 @@ class RealCICDRepairEnvironment(Environment):
                 "ready_to_finalize": False,
                 "verification_required": False,
                 "verified_since_last_rerun": False,
+                "drift_detected": False,
                 "supported_operations": CANONICAL_OPERATIONS,
                 "canonical_operations": CANONICAL_OPERATIONS,
             },
@@ -372,6 +451,7 @@ class RealCICDRepairEnvironment(Environment):
 
         # Dispatch action
         reward = 0.0
+        finalize_blocked = operation == "finalize" and not episode.verified_for_latest_rerun
 
         if operation == "view_logs":
             reward = self._handle_view_logs(episode, target)
@@ -400,19 +480,34 @@ class RealCICDRepairEnvironment(Environment):
         elif operation == "finalize":
             reward = self._handle_finalize(episode)
 
+        # Phase-aware bonus from adversarial judge (always active except blocked finalize)
+        if episode.adversarial_scenario is not None and not finalize_blocked:
+            phase_bonus, phase_note = self._adv_judge.score_step(
+                operation=operation,
+                value=value,
+                scenario=episode.adversarial_scenario,
+                history=episode.history,
+            )
+            reward += phase_bonus
+            if phase_note:
+                episode.findings.append(f"[Judge] {phase_note}")
+
         # Apply redundancy penalty
-        if was_redundant:
+        if was_redundant and not finalize_blocked:
             reward = min(reward, -0.08)
+
+        if finalize_blocked:
+            reward = -0.05
 
         # Determine if episode is done
         done = False
         max_steps = 15
         if episode.fault_metadata:
             difficulty = self._get_difficulty(episode.fault_metadata.fault_type)
-            max_steps_map = {"easy": 16, "medium": 20, "security": 20, "hard": 25}
+            max_steps_map = {"easy": 16, "medium": 20, "network": 20, "security": 20, "hard": 25}
             max_steps = max_steps_map.get(difficulty, 15)
 
-        if operation == "finalize":
+        if operation == "finalize" and episode.verified_for_latest_rerun:
             done = True
         elif self._state.step_count >= max_steps:
             done = True
@@ -459,19 +554,40 @@ class RealCICDRepairEnvironment(Environment):
         ep.used_inspections.add("inspect_config")
         ep.inspected_since_last_rerun = True
 
-        configs = read_config_files(ep.workspace_dir)
+        # If target specified, only read that file; otherwise read all
+        if target:
+            # Try the target as-is, then search in standard config paths
+            filepath = target
+            if not os.path.exists(os.path.join(ep.workspace_dir, filepath)):
+                for cfg in ["Dockerfile", "docker-compose.yml", ".env", "services/api/requirements.txt",
+                           "services/api/routes.py", "services/api/app.py", ".github/ci.yml"]:
+                    if target.lower() in cfg.lower():
+                        filepath = cfg
+                        break
+            content = read_workspace_file(ep.workspace_dir, filepath)
+            configs = {filepath: content}
+        else:
+            configs = read_config_files(ep.workspace_dir)
+
         for filename, content in configs.items():
-            # Surface conflict markers explicitly before truncating
-            conflict_lines = [
-                f"  line {i}: {line.rstrip()}"
-                for i, line in enumerate(content.splitlines(), 1)
-                if line.startswith(("<<<<<<<", "=======", ">>>>>>>"))
-            ]
-            if conflict_lines:
-                ep.findings.append(
-                    f"⚠ MERGE CONFLICT in '{filename}':\n" + "\n".join(conflict_lines)
+            # Extract conflict markers and surrounding lines for clarity
+            lines = content.splitlines()
+            conflict_indices = []
+            for i, line in enumerate(lines):
+                if line.startswith(("<<<<<<<", "=======", ">>>>>>>")):
+                    conflict_indices.append(i)
+
+            if conflict_indices:
+                # Show conflict with context (±2 lines)
+                start_ctx = max(0, conflict_indices[0] - 2)
+                end_ctx = min(len(lines), conflict_indices[-1] + 3)
+                conflict_section = "\n".join(
+                    f"  {i:3d}: {line}" for i, line in enumerate(lines[start_ctx:end_ctx], start_ctx + 1)
                 )
-            ep.findings.append(f"Config file '{filename}':\n{content[:500]}")
+                ep.findings.append(f"⚠ MERGE CONFLICT in '{filename}':\n{conflict_section}")
+            else:
+                # No conflict — show first portion
+                ep.findings.append(f"Config file '{filename}':\n{content[:600]}")
 
         # Relevant if fault is in a config file
         if ep.fault_metadata:
@@ -531,9 +647,17 @@ class RealCICDRepairEnvironment(Environment):
         if not ep.fault_metadata:
             return -0.10
 
-        # Score by comparing key terms against real fault type and affected files
+        # Build keyword pool from all injected faults (adversarial = multiple faults)
         hypothesis_lower = value.lower()
-        keywords = ep.fault_metadata.keywords or FAULT_KEYWORDS.get(ep.fault_metadata.fault_type, [])
+        if ep.adversarial_scenario is not None:
+            # Adversarial: accept match against expected terms OR any injected fault's keywords
+            keywords = list(ep.adversarial_scenario.expected_hypothesis_terms)
+            for step in ep.adversarial_scenario.steps:
+                keywords += FAULT_KEYWORDS.get(step.fault_type, [])
+            keywords = list(dict.fromkeys(keywords))  # deduplicate
+        else:
+            keywords = ep.fault_metadata.keywords or FAULT_KEYWORDS.get(ep.fault_metadata.fault_type, [])
+
         match_count = sum(1 for kw in keywords if kw.lower() in hypothesis_lower)
         match_ratio = match_count / max(len(keywords), 1)
 
@@ -543,14 +667,18 @@ class RealCICDRepairEnvironment(Environment):
             for f in ep.fault_metadata.affected_files
         )
 
-        if match_ratio >= 0.4 or (match_ratio >= 0.2 and file_mentioned):
+        # 1+ keyword OR file mentioned = correct (lenient to avoid misleading the agent)
+        if match_count >= 1 or file_mentioned:
             ep.hypothesis_correct = True
-            ep.findings.append("Hypothesis aligns with current failure evidence.")
+            ep.findings.append(f"Hypothesis partially aligns (matched {match_count}/{len(keywords)} keywords). Apply the fix.")
             if ep.hypothesis_attempts == 1:
-                return 0.22  # First try
-            return 0.10  # Retry
+                return 0.18 if match_ratio >= 0.4 else 0.12
+            return 0.08 if match_ratio >= 0.4 else 0.05
         else:
-            ep.findings.append("Hypothesis does not explain all current clues yet.")
+            # Give a hint using the ROOT CAUSE fault's keywords (not cascading fault's)
+            root_fault = ep.fault_metadata.fault_type
+            hint_keywords = FAULT_KEYWORDS.get(root_fault, keywords)[:3]
+            ep.findings.append("Hypothesis does not match current evidence. Try mentioning: " + ", ".join(hint_keywords))
             return -0.10
 
     def _handle_modify(self, ep: EpisodeState, operation: str, target: str, value: str) -> float:
@@ -588,6 +716,7 @@ class RealCICDRepairEnvironment(Environment):
         ep.recovery_cost += 1
         ep.verified_for_latest_rerun = False
         ep.inspected_since_last_rerun = False
+        ep.rerun_attempts += 1
 
         if not ep.pipeline_runner:
             ep.findings.append("No pipeline runner available for rerun.")
@@ -600,6 +729,29 @@ class RealCICDRepairEnvironment(Environment):
         new_result = ep.pipeline_runner.run(workspace_dir=ep.workspace_dir)
         ep.all_pipeline_results.append(new_result)
         ep.pipeline_result = new_result
+
+        # ── Mid-episode schema/state drift ─────────────────────────────
+        # Once the pipeline passes, the *world* may shift: a team rotates an
+        # endpoint, infra pins a new dep, ports change. This forces the agent
+        # to maintain a persistent world model rather than memorize the fix.
+        if drift_enabled() and new_result.status == PipelineStatus.PASSED:
+            drift_event = maybe_drift(
+                workspace=ep.workspace_dir,
+                episode_seed=ep.episode_seed,
+                attempt_idx=ep.rerun_attempts,
+            )
+            if drift_event:
+                ep.drift_events_fired.append(drift_event)
+                ep.drift_detected = True
+                ep.findings.append(
+                    f"[World Drift] {drift_event.description} "
+                    f"Files affected: {', '.join(drift_event.files_touched)}. "
+                    f"Re-investigate before finalizing."
+                )
+                # Re-run so the agent sees the fresh failure from drift
+                new_result = ep.pipeline_runner.run(workspace_dir=ep.workspace_dir)
+                ep.all_pipeline_results.append(new_result)
+                ep.pipeline_result = new_result
 
         # Append per-stage logs so the agent can see what happened
         for stage_name in STAGE_ORDER:
@@ -636,7 +788,10 @@ class RealCICDRepairEnvironment(Environment):
 
         if progressed:
             ep.fix_hits += 1
-            ep.findings.append("Run verify_fix before finalize to confirm the failure signature is gone.")
+            ep.findings.append(
+                "Pipeline PASSED. Call verify_fix next (required before finalize) — "
+                "then immediately call finalize. Do not apply more fixes."
+            )
             return 0.18
         return 0.05
 
@@ -650,10 +805,19 @@ class RealCICDRepairEnvironment(Environment):
             ep.findings.append("Latest rerun is already verified.")
             return -0.06
 
+        if ep.rerun_attempts == 0:
+            ep.findings.append(
+                "Cannot verify: run rerun_pipeline after applying a fix before calling verify_fix."
+            )
+            return -0.06
+
         if ep.pipeline_result.status == PipelineStatus.PASSED:
             ep.incident_resolved = True
             ep.verified_for_latest_rerun = True
-            ep.findings.append("Verification confirms the fix resolved the incident.")
+            ep.findings.append(
+                "VERIFIED: fix resolved the incident. "
+                "Call finalize now — do NOT apply further fixes or reruns."
+            )
             return 0.16
         elif ep.last_rerun_progressed:
             ep.verified_for_latest_rerun = True
@@ -664,19 +828,29 @@ class RealCICDRepairEnvironment(Environment):
             return -0.06
 
     def _handle_finalize(self, ep: EpisodeState) -> float:
-        """Compute final score from real pipeline outcome."""
-        if ep.incident_resolved and ep.verified_for_latest_rerun:
-            ep.findings.append("CI/CD incident fully resolved. Pipeline healthy.")
-            return 0.25
-        elif ep.incident_resolved and not ep.verified_for_latest_rerun:
-            ep.findings.append("Finalization rejected: run verify_fix after rerun_pipeline.")
-            return -0.15
-        elif ep.last_rerun_progressed:
-            ep.findings.append("Partial resolution — some stages still failing.")
-            return 0.20
-        else:
-            ep.findings.append("Finalization rejected: unresolved stages remain.")
-            return -0.15
+        """Compute final score — adversarial terminal scorer always used."""
+        if not ep.verified_for_latest_rerun:
+            ep.findings.append("Run verify_fix before finalize")
+            return -0.05
+
+        if ep.rerun_attempts == 0:
+            ep.findings.append(
+                "Finalize without running rerun_pipeline — no terminal bonus awarded."
+            )
+            return 0.05
+
+        pipeline_passed = (
+            ep.pipeline_result is not None
+            and ep.pipeline_result.status == PipelineStatus.PASSED
+        )
+        bonus, note = self._adv_judge.score_terminal(
+            incident_resolved=ep.incident_resolved,
+            verified=ep.verified_for_latest_rerun,
+            pipeline_passed=pipeline_passed,
+            cascading_fault_count=len(ep.cascading_faults),
+        )
+        ep.findings.append(f"[Judge] terminal: {note}")
+        return bonus
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -688,6 +862,7 @@ class RealCICDRepairEnvironment(Environment):
             "flaky_test": "easy",
             "missing_permission": "hard",
             "secret_exposure": "security",
+            "env_drift": "network",
         }
         return difficulty_map.get(fault_type, "medium")
 
@@ -741,6 +916,15 @@ class RealCICDRepairEnvironment(Environment):
             ep.rubric_judge_used = rubric_judge_used
             ep.rubric_judge_error = rubric_judge_error
 
+            # Record outcome in curriculum for next episode scheduling
+            self._curriculum.record_episode(
+                fault_type=fault_type,
+                difficulty=ep.curriculum_difficulty,
+                final_score=final_score,
+                resolved=ep.incident_resolved,
+                steps_used=self._state.step_count,
+            )
+
         pipeline_result = ep.pipeline_result or PipelineResult()
 
         return build_observation(
@@ -767,6 +951,7 @@ class RealCICDRepairEnvironment(Environment):
             rubric_blend_weight=self._rubric_weight if self._rubric_judge.is_active() else 0.0,
             rubric_judge_used=rubric_judge_used,
             rubric_judge_error=rubric_judge_error,
+            drift_detected=ep.drift_detected,
             findings=ep.findings[-16:],
             metadata={
                 "task_key": fault_type,
@@ -775,6 +960,9 @@ class RealCICDRepairEnvironment(Environment):
                 "ready_to_finalize": ep.incident_resolved and ep.verified_for_latest_rerun,
                 "verification_required": ep.incident_resolved and not ep.verified_for_latest_rerun,
                 "verified_since_last_rerun": ep.verified_for_latest_rerun,
+                "drift_detected": ep.drift_detected,
+                "drift_event_count": len(ep.drift_events_fired),
+                "latest_drift": ep.drift_events_fired[-1].kind if ep.drift_events_fired else "",
                 "supported_operations": CANONICAL_OPERATIONS,
                 "canonical_operations": CANONICAL_OPERATIONS,
                 "rubric_enabled": self._rubric_judge.is_active(),
@@ -811,12 +999,14 @@ class RealCICDRepairEnvironment(Environment):
         """Compute final episode score from real outcomes."""
         score = 0.0
 
-        # Base score from resolution
-        if ep.incident_resolved and ep.verified_for_latest_rerun:
+        genuine_work = ep.fix_hits > 0 and ep.rerun_attempts > 0
+
+        # Base score from resolution — only credited if real repair work happened
+        if genuine_work and ep.incident_resolved and ep.verified_for_latest_rerun:
             score += 0.50
-        elif ep.incident_resolved:
+        elif genuine_work and ep.incident_resolved:
             score += 0.30
-        elif ep.last_rerun_progressed:
+        elif genuine_work and ep.last_rerun_progressed:
             score += 0.20
 
         # Hypothesis quality
@@ -829,7 +1019,7 @@ class RealCICDRepairEnvironment(Environment):
 
         # Efficiency bonus
         step_count = self._state.step_count
-        max_steps_map = {"easy": 16, "medium": 20, "security": 20, "hard": 25}
+        max_steps_map = {"easy": 16, "medium": 20, "network": 20, "security": 20, "hard": 25}
         difficulty = self._get_difficulty(ep.fault_metadata.fault_type if ep.fault_metadata else "medium")
         max_steps = max_steps_map.get(difficulty, 15)
         efficiency = max(0.0, 1.0 - (step_count / max_steps))
@@ -843,7 +1033,28 @@ class RealCICDRepairEnvironment(Environment):
         # Pipeline health factor
         score *= ep.pipeline_health
 
-        return round(max(0.0, min(1.0, score)), 3)
+        # Hard cap when no genuine repair work was performed
+        if not genuine_work:
+            score = min(score, 0.15)
+
+        final = round(max(0.0, min(1.0, score)), 3)
+        logger.debug(
+            "[score] ep=%s genuine=%s resolved=%s verified=%s fix_hits=%d reruns=%d "
+            "wrong=%d destructive=%d redundant=%d health=%.2f raw=%.3f final=%.3f",
+            ep.episode_id[:8],
+            genuine_work,
+            ep.incident_resolved,
+            ep.verified_for_latest_rerun,
+            ep.fix_hits,
+            ep.rerun_attempts,
+            ep.wrong_fixes,
+            ep.destructive_actions,
+            ep.redundant_actions,
+            ep.pipeline_health,
+            score,
+            final,
+        )
+        return final
 
     def _dict_to_observation(self, obs_dict: Dict[str, Any]) -> MetaHackathonObservation:
         """Convert observation dict to MetaHackathonObservation model."""

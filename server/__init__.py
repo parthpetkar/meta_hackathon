@@ -7,5 +7,13 @@
 """Meta Hackathon environment server components."""
 
 from .environment import RealCICDRepairEnvironment
+from .curriculum import CurriculumController
+from .adversarial_designer import AdversarialDesigner
+from .adversarial_judge import AdversarialJudge
 
-__all__ = ["RealCICDRepairEnvironment"]
+__all__ = [
+    "RealCICDRepairEnvironment",
+    "CurriculumController",
+    "AdversarialDesigner",
+    "AdversarialJudge",
+]

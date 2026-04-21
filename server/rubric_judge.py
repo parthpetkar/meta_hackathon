@@ -24,8 +24,8 @@ except Exception:  # pragma: no cover - optional import safety
 LOGGER = logging.getLogger(__name__)
 
 
-DEFAULT_GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_HF_BASE_URL = "https://router.huggingface.co/v1"
+DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 def _normalize(text: str) -> str:
@@ -53,6 +53,9 @@ class RubricJudge(Protocol):
         ...
 
 
+DEFAULT_OPENROUTER_MODEL = "qwen/qwen-2.5-72b-instruct"
+
+
 class OpenEnvLLMJudgeAdapter:
     """OpenEnv LLMJudge first, API LLM fallback second, heuristic last."""
 
@@ -76,16 +79,12 @@ class OpenEnvLLMJudgeAdapter:
         self._enabled = enabled
         self._model_name = model_name
         self._timeout_seconds = max(1, int(timeout_seconds))
-        self._api_base_url = os.getenv("API_BASE_URL", DEFAULT_GROQ_BASE_URL).strip()
-        self._api_key = (
-            os.getenv("GROQ_API_KEY")
-            or os.getenv("HF_TOKEN")
-            or os.getenv("OPENAI_API_KEY")
-            or os.getenv("API_KEY")
-            or ""
-        ).strip()
+        self._provider = os.getenv("RUBRIC_LLM_PROVIDER", "openrouter").strip().lower()
+        self._api_base_url = self._resolve_api_base_url()
+        self._api_key = self._resolve_api_key()
+        self._openrouter_referer = (os.getenv("OPENROUTER_REFERER") or "").strip()
+        self._openrouter_title = (os.getenv("OPENROUTER_TITLE") or "meta_hackathon").strip()
         self._debug_enabled = os.getenv("META_HACKATHON_RUBRIC_DEBUG", "false").strip().lower() == "true"
-
         self._openenv_judge: Any = None
         self._openenv_client: Any = None
         self._openenv_init_error: str = ""
@@ -245,10 +244,22 @@ class OpenEnvLLMJudgeAdapter:
         if not self._api_base_url:
             raise RuntimeError("API_BASE_URL is empty")
 
+        client_kwargs = {
+            "base_url": self._api_base_url,
+            "api_key": self._api_key or "not-needed",
+            "timeout": float(self._timeout_seconds),
+        }
+        if self._is_openrouter():
+            headers = {}
+            if self._openrouter_referer:
+                headers["HTTP-Referer"] = self._openrouter_referer
+            if self._openrouter_title:
+                headers["X-Title"] = self._openrouter_title
+            if headers:
+                client_kwargs["default_headers"] = headers
+
         client = OpenAI(
-            base_url=self._api_base_url,
-            api_key=self._api_key or "not-needed",
-            timeout=float(self._timeout_seconds),
+            **client_kwargs,
         )
         response = client.chat.completions.create(
             model=self._model_name,
@@ -266,6 +277,35 @@ class OpenEnvLLMJudgeAdapter:
             max_tokens=220,
         )
         return str((response.choices[0].message.content or "").strip())
+
+    def _resolve_api_base_url(self) -> str:
+        explicit = (os.getenv("API_BASE_URL") or "").strip()
+        if explicit:
+            return explicit
+        if self._provider == "hf":
+            return DEFAULT_HF_BASE_URL
+        return DEFAULT_OPENROUTER_BASE_URL
+
+    def _resolve_api_key(self) -> str:
+        explicit = (os.getenv("API_KEY") or "").strip()
+        if explicit:
+            return explicit
+        if self._provider == "hf":
+            return (
+                os.getenv("HF_TOKEN")
+                or os.getenv("OPENAI_API_KEY")
+                or os.getenv("OPENROUTER_API_KEY")
+                or ""
+            ).strip()
+        return (
+            os.getenv("OPENROUTER_API_KEY")
+            or os.getenv("OPENAI_API_KEY")
+            or os.getenv("HF_TOKEN")
+            or ""
+        ).strip()
+
+    def _is_openrouter(self) -> bool:
+        return self._provider == "openrouter" or "openrouter.ai" in self._api_base_url
 
     def _run_async_with_timeout(self, coroutine_obj: Any, *, timeout_seconds: int) -> Any:
         async def _runner() -> Any:
@@ -287,7 +327,7 @@ class OpenEnvLLMJudgeAdapter:
     def _endpoint_and_port_from_base_url(self, base_url: str) -> tuple[str, int]:
         parsed = urlparse(base_url)
         scheme = parsed.scheme or "https"
-        host = parsed.hostname or "api.groq.com"
+        host = parsed.hostname or "openrouter.ai"
         port = parsed.port or (443 if scheme == "https" else 80)
         endpoint = f"{scheme}://{host}"
         return endpoint, port

@@ -19,15 +19,17 @@ from .config import (
     MAX_CONSECUTIVE_TOOL_CALL_MISSES,
     MAX_MODEL_CALLS_PER_TASK,
     MAX_STEPS,
-    MIN_MODEL_CALLS_BEFORE_FORCED_FALLBACK,
+    MIN_MODEL_CALLS_BEFORE_STRICT_FAIL,
     MODEL_NAME,
+    NUM_EPISODES,
     SUCCESS_SCORE_THRESHOLD,
     TASK_ORDER,
+    get_openai_client_kwargs,
 )
 from .http_environment import format_obs_for_llm, reset_env, step_env, trim_messages
 from .model_client import get_model_action
 from .prompts import build_system_prompt
-from .trajectory_logging import log_detail, log_end, log_start, log_step
+from .trajectory_logging import log_detail, log_end, log_memory, log_start, log_step
 
 try:
     from ..models import MetaHackathonObservation
@@ -52,6 +54,30 @@ def _normalize_hypothesis(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").strip().lower())
 
 
+# Maps error signatures → canonical fix phrases that fix_applier.py recognizes
+_FIX_PHRASE_RULES: List[Tuple[List[str], str]] = [
+    (["merge conflict", "<<<<<<<", "conflict marker", "<<<", "⚠ merge"], "resolve merge conflict markers"),
+    # Cache-checksum / missing-file errors (Docker build context desync) come before
+    # dependency rules so they don't get captured by the generic "requirements" match.
+    (["failed to compute cache key", "failed to calculate checksum", "no such file or directory: 'requirements"], "reorder dockerfile install steps"),
+    (["requests", "urllib3", "dependency", "version conflict", "incompatible", "resolutionimpossible"], "pin compatible requests urllib3 versions"),
+    (["dockerfile", "install order", "layer order", "copy before install"], "reorder dockerfile install steps"),
+    (["flaky", "timing", "intermittent", "response_time", "test_response_time"], "add flaky test retry wrapper"),
+    (["permission", "network", "compose network", "volume"], "fix docker compose network permission"),
+    (["secret", "credential", "api_key", "hardcoded", "plaintext"], "remove hardcoded secrets from source"),
+]
+
+
+def _infer_fix_phrase(surfaced_errors: List[str], hypothesis: str = "", findings: List[str] | None = None) -> str:
+    """Return a fix phrase matching the failure signature, or 'auto' for generic repair."""
+    combined = " ".join(surfaced_errors + [hypothesis] + (findings or [])).lower()
+    for keywords, phrase in _FIX_PHRASE_RULES:
+        if any(kw in combined for kw in keywords):
+            return phrase
+    # Unknown fault type — signal the generic auto-repair strategy
+    return "auto" if combined.strip() else ""
+
+
 def _extract_primary_surfaced_error_file(observation: MetaHackathonObservation) -> str:
     for err in observation.surfaced_errors or []:
         text = str(err)
@@ -61,42 +87,64 @@ def _extract_primary_surfaced_error_file(observation: MetaHackathonObservation) 
     return ""
 
 
-def _select_fallback_action(
-    observation: MetaHackathonObservation,
-    action_history: List[Tuple[str, str, str]],
-) -> Tuple[str, str, str]:
-    surfaced_file = _extract_primary_surfaced_error_file(observation)
-    stage = observation.current_stage or "build"
-    candidates: List[Tuple[str, str, str]] = [
-        ("inspect_config", surfaced_file or stage, ""),
-        ("view_logs", stage, ""),
-        ("inspect_dockerfile", "build", ""),
-        ("inspect_permissions", stage, ""),
-        ("rerun_pipeline", "", ""),
-        ("verify_fix", "", ""),
-    ]
-    for candidate in candidates:
-        if candidate not in action_history:
-            return candidate
-    # Keep tuple uniqueness even when all standard candidates were already used.
-    return ("view_logs", stage, f"detail-{len(action_history) + 1}")
-
-
-def _memory_hint(errors: List[str]) -> str:
+def _memory_hint(errors: List[str], fault_type: str) -> Tuple[str, str]:
     if not errors or recall is None:
-        return ""
-    suggestion = recall(errors)
+        return "", ""
+    suggestion = recall(errors, fault_type=fault_type)
     if not suggestion.get("suggested_fix"):
-        return ""
+        return "", ""
     confidence = float(suggestion.get("confidence", 0.0) or 0.0)
     times_seen = int(suggestion.get("times_seen", 0) or 0)
     fix_text = str(suggestion.get("suggested_fix", "")).strip()
-    return (
+    hint = (
         "Persistent memory hint from prior episodes:\n"
         f"- confidence: {confidence:.3f}\n"
         f"- times_seen: {times_seen}\n"
         f"- suggested_fix: {fix_text}"
     )
+    memory_log = str(suggestion.get("memory_log", "") or "")
+    return hint, memory_log
+
+
+def _fault_type_from_observation(observation: MetaHackathonObservation, fallback: str = "unknown") -> str:
+    metadata = observation.metadata if isinstance(observation.metadata, dict) else {}
+    if isinstance(metadata, dict) and metadata.get("fault_type"):
+        return str(metadata.get("fault_type"))
+    if observation.task_id and observation.task_id.startswith("real_"):
+        return observation.task_id[len("real_") :]
+    return fallback
+
+
+def _repetition_escape_action(
+    observation: MetaHackathonObservation,
+    action_history: List[Tuple[str, str, str]],
+    repeated_action: Tuple[str, str, str],
+) -> Tuple[str, str, str]:
+    stage = observation.current_stage or "build"
+    repeated_text = "|".join(repeated_action).lower()
+
+    candidates: List[Tuple[str, str, str]] = []
+    if "requirements" in repeated_text or stage == "build":
+        candidates.extend(
+            [
+                ("inspect_config", "services/api/requirements.txt", ""),
+                ("inspect_config", "requirements.txt", ""),
+                ("inspect_config", "Dockerfile", ""),
+            ]
+        )
+
+    candidates.extend(
+        [
+            ("view_logs", stage, ""),
+            ("inspect_config", "docker-compose.yml", ""),
+            ("inspect_dockerfile", "build", ""),
+        ]
+    )
+
+    for candidate in candidates:
+        if candidate != repeated_action and candidate not in action_history:
+            return candidate
+    return ("view_logs", stage, "")
 
 
 def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: str) -> Tuple[str, bool, int, float]:
@@ -106,14 +154,20 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
     attempted_hypotheses: set[str] = set()
     forced_messages: List[str] = []
     inspected_config_targets: set[str] = set()
+    injected_guardrails: set[str] = set()  # deduplicate guardrail messages
+    fix_applied_since_rerun: bool = False   # allow rerun after a new fix
+    fix_phrase: str = ""                    # canonical phrase inferred from errors
+    hypothesis_accepted: bool = False       # True once set_hypothesis scores > 0
     steps_taken = 0
     score = 0.0
+    deterministic_score = 0.0
+    rubric_score = 0.0
+    rubric_judge_used = False
     success = False
     resolved = False
     task_name = fallback_task_name
     tool_call_misses = 0
     model_calls_used = 0
-    disable_model_calls = MAX_MODEL_CALLS_PER_TASK <= 0
     observation: Optional[MetaHackathonObservation] = None
     messages: List[Dict[str, Any]] = []
     task_max_steps = MAX_STEPS
@@ -130,6 +184,7 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
             task_max_steps = max(task_max_steps, int(observed.get("max_steps", MAX_STEPS)))
         initial_surfaced_errors = [str(item) for item in (observation.surfaced_errors or [])]
         last_memory_key = fingerprint(initial_surfaced_errors) if fingerprint is not None else ""
+        fix_phrase = _infer_fix_phrase(initial_surfaced_errors, findings=list(observation.findings or []))
 
         messages = [{"role": "system", "content": build_system_prompt(task_name)}]
 
@@ -145,7 +200,10 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
             )
 
         task_title = observation.task_title or task_name
-        memory_hint = _memory_hint(initial_surfaced_errors)
+        fault_type = _fault_type_from_observation(observation, task_name)
+        memory_hint, memory_log = _memory_hint(initial_surfaced_errors, fault_type)
+        if memory_log:
+            log_memory(memory_log)
         task_intro = f"Task: {task_title}\n\n{format_obs_for_llm(observation, 0)}"
         if memory_hint:
             task_intro += f"\n\n{memory_hint}"
@@ -180,36 +238,50 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
             }
             tool_call_id: Optional[str] = None
 
+            _model_failed = False
             guard_attempts = 0
-            while True:
+            try:
+              while True:
                 guard_attempts += 1
 
-                if disable_model_calls:
-                    assistant_message = {
-                        "role": "assistant",
-                        "content": "Model tool-calling disabled after repeated misses; using deterministic fallback.",
-                    }
-                    tool_call_id = None
-                    operation, target, value = _select_fallback_action(observation, action_history)
-                else:
-                    operation, target, value, assistant_message, tool_call_id = get_model_action(
-                        client=client,
-                        step=step,
-                        messages=messages,
+                operation, target, value, assistant_message, tool_call_id = get_model_action(
+                    client=client,
+                    step=step,
+                    messages=messages,
+                )
+                model_calls_used += 1
+                if model_calls_used > MAX_MODEL_CALLS_PER_TASK:
+                    raise RuntimeError(
+                        "Model call budget exceeded while strict tool-calling is enabled. "
+                        "Increase MAX_MODEL_CALLS_PER_TASK or use a model/provider with reliable tool calls."
                     )
-                    model_calls_used += 1
-                    if model_calls_used >= MAX_MODEL_CALLS_PER_TASK:
-                        disable_model_calls = True
 
-                    if tool_call_id is None:
-                        tool_call_misses += 1
-                        if (
-                            tool_call_misses >= MAX_CONSECUTIVE_TOOL_CALL_MISSES
-                            and model_calls_used >= MIN_MODEL_CALLS_BEFORE_FORCED_FALLBACK
-                        ):
-                            disable_model_calls = True
-                    else:
-                        tool_call_misses = 0
+                if tool_call_id is None:
+                    tool_call_misses += 1
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your previous response did not include a native tool call. "
+                                "Return exactly one valid tool call from the provided tool schema."
+                            ),
+                        }
+                    )
+                    if (
+                        tool_call_misses >= MAX_CONSECUTIVE_TOOL_CALL_MISSES
+                        and model_calls_used >= MIN_MODEL_CALLS_BEFORE_STRICT_FAIL
+                    ):
+                        raise RuntimeError(
+                            "Model failed to emit required tool calls repeatedly. "
+                            "Strict tool-calling is mandatory and fallback is disabled."
+                        )
+                    if guard_attempts < 4:
+                        messages = trim_messages(messages)
+                        continue
+                    raise RuntimeError(
+                        "Model response missing tool call after retries in strict mode."
+                    )
+                tool_call_misses = 0
 
                 operation, target, value = normalize_model_action(
                     operation=operation,
@@ -237,11 +309,16 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
 
                 should_resample = False
                 surfaced_file = _extract_primary_surfaced_error_file(observation)
+
+                # Inject surfaced-file guardrail at most once per unique file
+                _sf_key = f"sf:{surfaced_file}"
                 if (
                     surfaced_file
                     and surfaced_file not in inspected_config_targets
                     and (operation != "inspect_config" or target != surfaced_file)
+                    and _sf_key not in injected_guardrails
                 ):
+                    injected_guardrails.add(_sf_key)
                     messages.append(
                         {
                             "role": "user",
@@ -253,7 +330,14 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                     )
                     should_resample = True
 
-                if operation == "set_hypothesis" and surfaced_file and surfaced_file not in inspected_config_targets:
+                _hyp_sf_key = f"hyp_sf:{surfaced_file}"
+                if (
+                    operation == "set_hypothesis"
+                    and surfaced_file
+                    and surfaced_file not in inspected_config_targets
+                    and _hyp_sf_key not in injected_guardrails
+                ):
+                    injected_guardrails.add(_hyp_sf_key)
                     messages.append(
                         {
                             "role": "user",
@@ -268,40 +352,71 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                 if operation == "set_hypothesis":
                     normalized_hypothesis = _normalize_hypothesis(value)
                     if normalized_hypothesis and normalized_hypothesis in attempted_hypotheses:
+                        _dup_hyp_key = f"dup_hyp:{normalized_hypothesis}"
+                        if _dup_hyp_key not in injected_guardrails:
+                            injected_guardrails.add(_dup_hyp_key)
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "You already tried this exact hypothesis and it scored negatively. "
+                                        "Choose a different root cause and different hypothesis text."
+                                    ),
+                                }
+                            )
+                        should_resample = True
+
+                action_tuple = (operation, target, value)
+                # Allow rerun_pipeline again if a new fix was applied since the last rerun
+                rerun_blocked = (
+                    action_tuple in action_history
+                    and not (operation == "rerun_pipeline" and fix_applied_since_rerun)
+                )
+                if rerun_blocked:
+                    _dup_act_key = f"dup_act:{operation}:{target}"
+                    if _dup_act_key not in injected_guardrails:
+                        injected_guardrails.add(_dup_act_key)
                         messages.append(
                             {
                                 "role": "user",
                                 "content": (
-                                    "You already tried this exact hypothesis and it scored negatively. "
-                                    "Choose a different root cause and different hypothesis text."
+                                    "You already tried this exact action and it failed. "
+                                    "Choose a different operation, target, or value."
                                 ),
                             }
                         )
-                        should_resample = True
-
-                action_tuple = (operation, target, value)
-                if action_tuple in action_history:
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "You already tried this exact action and it failed. "
-                                "Choose a different operation, target, or value."
-                            ),
-                        }
-                    )
                     should_resample = True
 
-                if should_resample and disable_model_calls:
-                    operation, target, value = _select_fallback_action(observation, action_history)
-                    action_tuple = (operation, target, value)
-                    should_resample = False
-
-                if should_resample and (not disable_model_calls) and guard_attempts < 4:
+                if should_resample and guard_attempts < 4:
                     messages = trim_messages(messages)
                     continue
 
                 break
+            except RuntimeError as _model_exc:
+                _model_failed = True
+                log_step(
+                    step=step,
+                    action="[model_failure]||",
+                    reward=0.0,
+                    done=True,
+                    error=str(_model_exc),
+                    llm_thought="",
+                )
+
+            if _model_failed:
+                break
+
+            action_tuple = (operation, target, value)
+            if action_history.count(action_tuple) >= 3:
+                operation, target, value = _repetition_escape_action(observation, action_history, action_tuple)
+                assistant_message = {
+                    "role": "assistant",
+                    "content": (
+                        "Repetition guard triggered: forcing a different action after 3+ identical attempts "
+                        f"-> {operation}|{target}|{value}"
+                    ),
+                }
+                tool_call_id = None
 
             try:
                 observation, reward, done, error = step_env(
@@ -337,11 +452,43 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
             action_history.append((operation, target, value))
             if operation == "inspect_config" and target:
                 inspected_config_targets.add(target)
+                # Re-enable surfaced-file guardrail if a new file appears later
+                injected_guardrails.discard(f"sf:{target}")
+                injected_guardrails.discard(f"hyp_sf:{target}")
+            if operation in {"modify_config", "add_dependency"} and value:
+                fix_applied_since_rerun = True
+            if operation == "rerun_pipeline":
+                fix_applied_since_rerun = False
             if operation == "set_hypothesis":
                 normalized_hypothesis = _normalize_hypothesis(value)
                 if normalized_hypothesis:
                     attempted_hypotheses.add(normalized_hypothesis)
-                if reward < 0:
+                if reward > 0:
+                    hypothesis_accepted = True
+                    # Refresh fix phrase using the accepted hypothesis text + current errors
+                    obs_errors = [str(e) for e in (observation.surfaced_errors or [])]
+                    obs_findings = [str(f) for f in (observation.findings or [])]
+                    inferred = _infer_fix_phrase(obs_errors, hypothesis=value, findings=obs_findings)
+                    if inferred:
+                        fix_phrase = inferred
+                    if fix_phrase and f"fix_hint:{fix_phrase}" not in injected_guardrails:
+                        injected_guardrails.add(f"fix_hint:{fix_phrase}")
+                        is_dep = any(kw in fix_phrase for kw in ["pin", "dependency", "urllib3", "requests"])
+                        fix_op = "add_dependency" if is_dep else "modify_config"
+                        if fix_phrase == "auto":
+                            forced_messages.append(
+                                "Hypothesis accepted. The fault type is unknown — apply a structured JSON fix. "
+                                "Call 'modify_config' with a JSON value like: "
+                                '{"file": "<path>", "action": "replace", "old": "<broken code>", "new": "<fixed code>"}. '
+                                "Use the file content you inspected to fill in the exact old/new strings."
+                            )
+                        else:
+                            forced_messages.append(
+                                f"Hypothesis accepted. Now apply the fix immediately. "
+                                f"Call tool '{fix_op}' with value='{fix_phrase}'. "
+                                f"Do not inspect or view_logs again — go straight to the fix."
+                            )
+                elif reward < 0:
                     forced_messages.append(
                         "Your last hypothesis was incorrect (negative reward). "
                         "You must NOT repeat it. Re-read surfaced_errors and form a new hypothesis "
@@ -351,8 +498,21 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
             messages.append(assistant_message)
             tool_result = format_obs_for_llm(observation, step)
             observation_errors = [str(item) for item in (observation.surfaced_errors or [])]
+            # Refresh fix_phrase from latest observation if not yet determined
+            if not fix_phrase or not hypothesis_accepted:
+                obs_findings = [str(f) for f in (observation.findings or [])]
+                inferred = _infer_fix_phrase(observation_errors, findings=obs_findings)
+                if inferred:
+                    fix_phrase = inferred
             current_memory_key = fingerprint(observation_errors) if fingerprint is not None else ""
-            memory_hint = _memory_hint(observation_errors) if current_memory_key != last_memory_key else ""
+            observation_fault_type = _fault_type_from_observation(observation, task_name)
+            memory_hint, memory_log = (
+                _memory_hint(observation_errors, observation_fault_type)
+                if current_memory_key != last_memory_key
+                else ("", "")
+            )
+            if memory_log:
+                log_memory(memory_log)
             if memory_hint:
                 tool_result = f"{tool_result}\n\n{memory_hint}"
                 last_memory_key = current_memory_key
@@ -379,8 +539,32 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
             if done:
                 break
 
+        # Runner exhausted step budget without agent calling finalize — force one to trigger scoring.
+        if observation is not None and not observation.done:
+            try:
+                observation, reward, done, error = step_env(
+                    session,
+                    operation="finalize",
+                    target="",
+                    value="",
+                )
+                rewards.append(reward)
+                log_step(
+                    step=steps_taken + 1,
+                    action="finalize||",
+                    reward=reward,
+                    done=done,
+                    error=error,
+                    llm_thought="[forced finalize: step budget exhausted]",
+                )
+            except Exception as exc:
+                pass  # best-effort; scoring may be partial
+
         if observation is not None:
             score = float(observation.final_score)
+            deterministic_score = float(observation.deterministic_score)
+            rubric_score = float(observation.rubric_score)
+            rubric_judge_used = bool(observation.rubric_judge_used)
             resolved = bool(observation.incident_resolved)
         success = resolved and score >= SUCCESS_SCORE_THRESHOLD
         if remember is not None and initial_surfaced_errors and last_fix_value:
@@ -389,12 +573,23 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
             except Exception:
                 pass
     finally:
-        log_end(success=success, steps=steps_taken, score=score, resolved=resolved, rewards=rewards)
+        log_end(
+            success=success,
+            steps=steps_taken,
+            score=score,
+            resolved=resolved,
+            rewards=rewards,
+            deterministic_score=deterministic_score,
+            rubric_score=rubric_score,
+            rubric_judge_used=rubric_judge_used,
+        )
         if INFERENCE_VERBOSE:
             print(
                 "[DETAIL] "
                 f"task={task_name} success={str(success).lower()} steps={steps_taken} "
-                f"final_score={score:.3f} resolved={str(resolved).lower()}",
+                f"final_score={score:.3f} det={deterministic_score:.3f} "
+                f"rubric={rubric_score:.3f} judge={str(rubric_judge_used).lower()} "
+                f"resolved={str(resolved).lower()}",
                 flush=True,
             )
 
@@ -403,15 +598,21 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
 
 def main() -> None:
     if not API_KEY:
-        raise RuntimeError("Missing HF_TOKEN or OPENAI_API_KEY for OpenAI client authentication.")
+        raise RuntimeError(
+            "Missing API credentials. Set provider-specific key: "
+            "HF_TOKEN (hf), OPENROUTER_API_KEY (openrouter), or GROQ_API_KEY (groq)."
+        )
 
     from openai import OpenAI
 
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    client = OpenAI(**get_openai_client_kwargs())
 
     with requests.Session() as session:
         session.headers.update({"Accept": "application/json"})
         task_scores: List[Tuple[str, float, bool]] = []
-        for fallback_task_name in TASK_ORDER:
-            task_name, success, _steps, score = run_task(client, session, fallback_task_name)
+        print(f"[INFERENCE] Running {NUM_EPISODES} episodes — faults chosen by LLM adversarial, difficulty scheduled by curriculum.", flush=True)
+        for episode_label in TASK_ORDER:
+            # episode_label is just a slot name ("episode_1", etc.).
+            # The actual fault/scenario is generated fresh by LLM for each reset.
+            task_name, success, _steps, score = run_task(client, session, episode_label)
             task_scores.append((task_name, score, success))
