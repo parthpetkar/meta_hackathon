@@ -51,6 +51,8 @@ from cicd.observation_builder import (
     read_workspace_file,
 )
 from cicd.fix_applier import apply_fix, FixResult
+from cicd.procedural_generator import generate_scenario as procedural_generate_scenario, inject_procedural
+from cicd.drift_injector import maybe_drift, drift_enabled
 try:
     from .rubric_judge import DEFAULT_GROQ_MODEL, OpenEnvLLMJudgeAdapter
     from .curriculum import CurriculumController
@@ -159,6 +161,12 @@ class EpisodeState:
 
     # Timestamps
     created_at: float = 0.0
+
+    # Drift state
+    drift_events_fired: List[Any] = field(default_factory=list)
+    rerun_attempts: int = 0
+    episode_seed: int = 0
+    procedural_mode: bool = False
 
 
 def _canonical_operation(operation: str) -> str:
@@ -269,23 +277,10 @@ class RealCICDRepairEnvironment(Environment):
         episode_id = str(uuid.uuid4())
         self._state = State(episode_id=episode_id, step_count=0)
 
+        # Curriculum controls difficulty + construction style (procedural vs LLM).
+        # LLM adversarial designer is the SOLE source of fault selection.
         eff_task_key = task_key or self._task_key
-
-        # Choose fault type — curriculum UCB1 for "cycle", explicit otherwise
-        if eff_task_key == "cycle":
-            fault_type = self._curriculum.select_fault_type()
-        elif eff_task_key in FAULT_TYPES:
-            fault_type = eff_task_key
-        else:
-            key_map = {
-                "easy": "merge_conflict",
-                "medium": "dependency_conflict",
-                "flaky": "flaky_test",
-                "security": "secret_exposure",
-                "hard": "missing_permission",
-                "network": "docker_order",
-            }
-            fault_type = key_map.get(eff_task_key, "merge_conflict")
+        use_procedural_style = eff_task_key in ("procedural", "combo")
 
         curriculum_difficulty = self._curriculum.get_difficulty()
         skill_profile = self._curriculum.get_skill_profile()
@@ -297,13 +292,35 @@ class RealCICDRepairEnvironment(Environment):
         # Initialize git repo from template
         setup_repo_from_template(self._template_dir, repo_dir)
 
-        # Curriculum selects root cause; designer builds full scenario around it
+        episode_seed = int(uuid.UUID(episode_id).int & 0xFFFFFFFF)
+
+        # LLM adversarial designer picks the root cause fault + composes scenario.
+        # Use a random fault as the prompt seed; LLM is free to use it or ignore it.
+        # (In practice, LLM always respects the root_cause_fault field per its prompt.)
+        import random as _random
+        seed_fault = _random.choice(FAULT_TYPES)
         adversarial_scenario = self._adv_designer.design(
-            root_cause_fault=fault_type,
+            root_cause_fault=seed_fault,
             difficulty=curriculum_difficulty,
             skill_profile=skill_profile,
         )
-        injected = self._adv_designer.inject(repo_dir, adversarial_scenario)
+        # If procedural style: regenerate the scenario using deterministic generator
+        # with the LLM-chosen root cause, but keep the LLM's decision
+        if use_procedural_style and adversarial_scenario.steps:
+            root_cause_ft = adversarial_scenario.steps[0].fault_type
+            procedural_scenario = procedural_generate_scenario(
+                difficulty=curriculum_difficulty,
+                seed=episode_seed,
+                root_cause=root_cause_ft,
+            )
+            adversarial_scenario = procedural_scenario
+            injected = inject_procedural(repo_dir, adversarial_scenario)
+        else:
+            # LLM-generated scenario as-is
+            injected = self._adv_designer.inject(repo_dir, adversarial_scenario)
+
+        fault_type = adversarial_scenario.steps[0].fault_type if adversarial_scenario.steps else "merge_conflict"
+
         fault_metadata = injected[0] if injected else inject_fault(repo_dir, fault_type)
         cascading_faults: list = injected[1:] if len(injected) > 1 else []
 
@@ -329,6 +346,8 @@ class RealCICDRepairEnvironment(Environment):
             adversarial_scenario=adversarial_scenario,
             cascading_faults=cascading_faults,
             curriculum_difficulty=curriculum_difficulty,
+            episode_seed=episode_seed,
+            procedural_mode=procedural_mode,
         )
         self._episode = episode
 
@@ -662,6 +681,7 @@ class RealCICDRepairEnvironment(Environment):
         ep.recovery_cost += 1
         ep.verified_for_latest_rerun = False
         ep.inspected_since_last_rerun = False
+        ep.rerun_attempts += 1
 
         if not ep.pipeline_runner:
             ep.findings.append("No pipeline runner available for rerun.")
@@ -674,6 +694,28 @@ class RealCICDRepairEnvironment(Environment):
         new_result = ep.pipeline_runner.run(workspace_dir=ep.workspace_dir)
         ep.all_pipeline_results.append(new_result)
         ep.pipeline_result = new_result
+
+        # ── Mid-episode schema/state drift ─────────────────────────────
+        # Once the pipeline passes, the *world* may shift: a team rotates an
+        # endpoint, infra pins a new dep, ports change. This forces the agent
+        # to maintain a persistent world model rather than memorize the fix.
+        if drift_enabled() and new_result.status == PipelineStatus.PASSED:
+            drift_event = maybe_drift(
+                workspace=ep.workspace_dir,
+                episode_seed=ep.episode_seed,
+                attempt_idx=ep.rerun_attempts,
+            )
+            if drift_event:
+                ep.drift_events_fired.append(drift_event)
+                ep.findings.append(
+                    f"[World Drift] {drift_event.description} "
+                    f"Files affected: {', '.join(drift_event.files_touched)}. "
+                    f"Re-investigate before finalizing."
+                )
+                # Re-run so the agent sees the fresh failure from drift
+                new_result = ep.pipeline_runner.run(workspace_dir=ep.workspace_dir)
+                ep.all_pipeline_results.append(new_result)
+                ep.pipeline_result = new_result
 
         # Append per-stage logs so the agent can see what happened
         for stage_name in STAGE_ORDER:

@@ -80,9 +80,11 @@ MAX_STEPS = 16
 TEMPERATURE = 0.1
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "512"))
 SUCCESS_SCORE_THRESHOLD = float(os.getenv("SUCCESS_SCORE_THRESHOLD", "0.20"))
-_TASK_MODE = os.getenv("META_HACKATHON_TASK_MODE", "").strip().lower()
-_ALL_TASKS = ["easy", "flaky", "medium", "network", "security", "hard"]
-TASK_ORDER = [_TASK_MODE] if _TASK_MODE and _TASK_MODE in _ALL_TASKS else _ALL_TASKS
+# Number of episodes to run per inference session.
+# Fault selection is always by LLM adversarial designer.
+# Difficulty is scheduled by curriculum (UCB1 + EMA).
+NUM_EPISODES = int(os.getenv("META_HACKATHON_NUM_EPISODES", "6"))
+TASK_ORDER = [f"episode_{i+1}" for i in range(NUM_EPISODES)]
 
 RESCUE_ON_NEGATIVE_REWARD = os.getenv("RESCUE_ON_NEGATIVE_REWARD", "false").lower() == "true"
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))

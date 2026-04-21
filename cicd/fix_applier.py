@@ -129,10 +129,11 @@ def _try_structured_fix(workspace: str, fix_text: str) -> Optional[FixResult]:
                 modified.append(fix_obj["file"])
 
             elif action == "write":
+                # Allow empty content to create empty placeholder files
                 content = fix_obj.get("new", fix_obj.get("content", ""))
-                if not content:
-                    continue
-                os.makedirs(os.path.dirname(filepath), exist_ok=True)
+                parent = os.path.dirname(filepath)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
                 with open(filepath, "w", encoding="utf-8") as f:
                     f.write(content)
                 modified.append(fix_obj["file"])
@@ -432,6 +433,28 @@ def _auto_repair_workspace(workspace: str, error_hint: str = "") -> FixResult:
             with open(full_path, "w", encoding="utf-8") as f:
                 f.write(content)
             modified.append(rel_path)
+
+    # Pass 3b — missing requirements.txt at workspace root (Dockerfile COPY target)
+    # Common when agents experiment: they create/delete files and break the build context.
+    # If a canonical services/api/requirements.txt exists, mirror it to the root so
+    # `COPY requirements.txt .` Dockerfiles succeed.
+    root_req = os.path.join(workspace, "requirements.txt")
+    canonical_req = os.path.join(workspace, "services/api/requirements.txt")
+    error_hint_l = (error_hint or "").lower()
+    if (
+        not modified
+        and ("requirements" in error_hint_l or "cache key" in error_hint_l or "checksum" in error_hint_l)
+        and not os.path.exists(root_req)
+        and os.path.exists(canonical_req)
+    ):
+        try:
+            with open(canonical_req, "r", encoding="utf-8") as f:
+                req_content = f.read()
+            with open(root_req, "w", encoding="utf-8") as f:
+                f.write(req_content)
+            modified.append("requirements.txt")
+        except OSError:
+            pass
 
     # Pass 4 — requirements.txt: detect obviously conflicting pins
     req_path = os.path.join(workspace, "services/api/requirements.txt")

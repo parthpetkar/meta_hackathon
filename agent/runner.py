@@ -21,6 +21,7 @@ from .config import (
     MAX_STEPS,
     MIN_MODEL_CALLS_BEFORE_FORCED_FALLBACK,
     MODEL_NAME,
+    NUM_EPISODES,
     SUCCESS_SCORE_THRESHOLD,
     TASK_ORDER,
     get_openai_client_kwargs,
@@ -56,6 +57,9 @@ def _normalize_hypothesis(value: str) -> str:
 # Maps error signatures → canonical fix phrases that fix_applier.py recognizes
 _FIX_PHRASE_RULES: List[Tuple[List[str], str]] = [
     (["merge conflict", "<<<<<<<", "conflict marker", "<<<", "⚠ merge"], "resolve merge conflict markers"),
+    # Cache-checksum / missing-file errors (Docker build context desync) come before
+    # dependency rules so they don't get captured by the generic "requirements" match.
+    (["failed to compute cache key", "failed to calculate checksum", "no such file or directory: 'requirements"], "reorder dockerfile install steps"),
     (["requests", "urllib3", "dependency", "version conflict", "incompatible", "resolutionimpossible"], "pin compatible requests urllib3 versions"),
     (["dockerfile", "install order", "layer order", "copy before install"], "reorder dockerfile install steps"),
     (["flaky", "timing", "intermittent", "response_time", "test_response_time"], "add flaky test retry wrapper"),
@@ -529,6 +533,9 @@ def main() -> None:
     with requests.Session() as session:
         session.headers.update({"Accept": "application/json"})
         task_scores: List[Tuple[str, float, bool]] = []
-        for fallback_task_name in TASK_ORDER:
-            task_name, success, _steps, score = run_task(client, session, fallback_task_name)
+        print(f"[INFERENCE] Running {NUM_EPISODES} episodes — faults chosen by LLM adversarial, difficulty scheduled by curriculum.", flush=True)
+        for episode_label in TASK_ORDER:
+            # episode_label is just a slot name ("episode_1", etc.).
+            # The actual fault/scenario is generated fresh by LLM for each reset.
+            task_name, success, _steps, score = run_task(client, session, episode_label)
             task_scores.append((task_name, score, success))
