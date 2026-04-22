@@ -62,6 +62,12 @@ FAULT_TYPES = FAULT_TYPES + DB_FAULT_TYPES
 
 # Which pipeline stage each fault causes to fail
 FAULT_STAGE_MAP: Dict[str, str] = {
+    # DB faults
+    "bad_migration_sql": "build",
+    "schema_drift": "build",
+    "wrong_db_url": "deploy",
+    "init_order_race": "deploy",
+    "missing_volume_mount": "deploy",
     "merge_conflict": "test",       # SyntaxError surfaces when pytest imports routes.py
     "dependency_conflict": "build",
     "docker_order": "build",
@@ -84,6 +90,11 @@ FAULT_STAGE_MAP: Dict[str, str] = {
 
 # Keywords the agent's hypothesis should contain to score positively
 FAULT_KEYWORDS: Dict[str, List[str]] = {
+    "bad_migration_sql": ["sql", "syntax", "migration"],
+    "schema_drift": ["schema", "mismatch", "column"],
+    "wrong_db_url": ["database", "url", "connection"],
+    "init_order_race": ["startup", "race", "dependency"],
+    "missing_volume_mount": ["volume", "mount", "database"],
     "merge_conflict": ["merge", "conflict", "markers", "routes"],
     "dependency_conflict": ["dependency", "incompatible", "requests", "urllib3", "pip", "version"],
     "docker_order": ["docker", "order", "copy", "install", "layer", "dockerfile"],
