@@ -25,12 +25,17 @@ def _connect() -> sqlite3.Connection:
             success_count INTEGER NOT NULL DEFAULT 0,
             failure_count INTEGER NOT NULL DEFAULT 0,
             error_text    TEXT NOT NULL DEFAULT '',
-            PRIMARY KEY (pattern_hash, fix_text)
+            fault_type    TEXT NOT NULL DEFAULT 'unknown',
+            PRIMARY KEY (pattern_hash, fix_text, fault_type)
         )
     """)
-    # Add error_text column to existing databases that predate this schema
+    # Add columns to existing databases that predate this schema
     try:
         conn.execute("ALTER TABLE memory ADD COLUMN error_text TEXT NOT NULL DEFAULT ''")
+    except Exception:
+        pass  # column already exists
+    try:
+        conn.execute("ALTER TABLE memory ADD COLUMN fault_type TEXT NOT NULL DEFAULT 'unknown'")
     except Exception:
         pass  # column already exists
     conn.commit()
@@ -47,14 +52,13 @@ def fingerprint(errors: list[str]) -> str:
 
 
 def recall(errors: list[str], fault_type: str = "unknown") -> dict:
-    """Return best known fix for this error pattern using semantic similarity.
+    """Return best known fix for this error pattern, scoped by fault_type.
 
-    Tries semantic retrieval first (embedding-based), falls back to exact
-    fingerprint match if embeddings are unavailable. This allows the agent
-    to recall fixes for semantically similar errors even when the exact text
-    differs (different line numbers, timestamps, etc.).
+    Memory is now fault-type-aware: fixes are only recalled when the current
+    fault_type matches the stored fault_type, preventing cross-contamination
+    where different faults produce similar error messages.
     """
-    if not errors:
+    if not errors or fault_type == "unknown":
         return {
             "suggested_fix": "",
             "confidence": 0.0,
@@ -63,59 +67,16 @@ def recall(errors: list[str], fault_type: str = "unknown") -> dict:
             "memory_log": "",
         }
 
-    # Try semantic retrieval first
-    try:
-        from sentence_transformers import SentenceTransformer  # type: ignore
-        import numpy as np  # type: ignore
-
-        global _MEMORY_MODEL
-        if _MEMORY_MODEL is None:
-            _MEMORY_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
-
-        # Embed the current error pattern
-        error_text = " ".join(errors)
-        query_emb = _MEMORY_MODEL.encode(error_text, convert_to_numpy=True)
-
-        # Retrieve all memories and compute similarity
-        conn = _connect()
-        rows = conn.execute(
-            "SELECT DISTINCT pattern_hash, fix_text, success_count, failure_count FROM memory"
-        ).fetchall()
-        conn.close()
-
-        if not rows:
-            return {
-                "suggested_fix": "",
-                "confidence": 0.0,
-                "times_seen": 0,
-                "historical_success_rate": 0.0,
-                "memory_log": "",
-            }
-
-        # Compute similarity for each stored pattern (this is slow for large DBs;
-        # consider adding a vector index if memory grows beyond ~1000 entries)
-        best_fix, best_score, best_success, best_failure = "", -1.0, 0, 0
-        for pattern_hash, fix_text, success_count, failure_count in rows:
-            # Reconstruct the error pattern from the hash (not possible — hash is one-way).
-            # Instead, we'd need to store the original error text. For now, fall back
-            # to exact fingerprint match as a simpler first step.
-            pass
-
-        # Semantic retrieval requires storing error text, not just hash.
-        # Fall through to exact fingerprint match for now.
-    except Exception:
-        pass
-
-    # Exact fingerprint match (original behavior)
     h = fingerprint(errors)
     try:
         conn = _connect()
+        # Scope recall to the current fault_type to prevent cross-contamination
         row = conn.execute(
             "SELECT fix_text, success_count, failure_count FROM memory "
-            "WHERE pattern_hash = ? "
+            "WHERE pattern_hash = ? AND fault_type = ? "
             "ORDER BY success_count DESC, (success_count + failure_count) DESC "
             "LIMIT 1",
-            (h,),
+            (h, fault_type),
         ).fetchone()
         conn.close()
     except Exception:
@@ -156,13 +117,13 @@ def recall(errors: list[str], fault_type: str = "unknown") -> dict:
 _MEMORY_MODEL = None
 
 
-def remember(errors: list[str], fix: str, success: bool) -> None:
+def remember(errors: list[str], fix: str, success: bool, fault_type: str = "unknown") -> None:
     """Upsert fix outcome for this error pattern into persistent memory.
 
-    Stores both the hash (for exact lookup) and the raw error text
-    (for future semantic similarity retrieval).
+    Now stores fault_type alongside the pattern_hash so recall can be scoped
+    to the current fault, preventing cross-contamination.
     """
-    if not errors or not fix:
+    if not errors or not fix or fault_type == "unknown":
         return
 
     h = fingerprint(errors)
@@ -171,13 +132,13 @@ def remember(errors: list[str], fix: str, success: bool) -> None:
     try:
         conn = _connect()
         conn.execute(
-            "INSERT INTO memory (pattern_hash, fix_text, success_count, failure_count, error_text) "
-            "VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(pattern_hash, fix_text) DO UPDATE SET "
+            "INSERT INTO memory (pattern_hash, fix_text, success_count, failure_count, error_text, fault_type) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(pattern_hash, fix_text, fault_type) DO UPDATE SET "
             "success_count = success_count + excluded.success_count, "
             "failure_count = failure_count + excluded.failure_count, "
             "error_text = excluded.error_text",
-            (h, fix_clean, 1 if success else 0, 0 if success else 1, error_text),
+            (h, fix_clean, 1 if success else 0, 0 if success else 1, error_text, fault_type),
         )
         conn.commit()
         conn.close()

@@ -153,15 +153,18 @@ def _fix_shared_secret_rotation(workspace: str) -> List[str]:
 
 
 def _fix_infra_port_conflict(workspace: str) -> List[str]:
-    """Restore api-service port to 8000 in shared-infra/docker-compose.yml."""
+    """Restore api-service port to 9000 in shared-infra/docker-compose.yml."""
     path = os.path.join(workspace, "shared-infra", "docker-compose.yml")
     if not os.path.exists(path):
         return []
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
     cleaned = content.replace(
-        '      - "5000:8000"  # FAULT(infra_port_conflict): clashes with frontend port',
-        '      - "8000:8000"',
+        '      - "5000:9000"  # FAULT(infra_port_conflict): wrong container port',
+        '',
+    ).replace(
+        '      - "5000:9000"  # FAULT(infra_port_conflict)',
+        '',
     )
     if cleaned == content:
         return []

@@ -33,11 +33,11 @@ class AdversarialCICDScenario:
     expected_investigation: List[str]
     expected_hypothesis_terms: List[str]
     expected_fix_sequence: List[str]
-    expected_verification: List[str]
     red_herrings: List[str]
     root_cause_explanation: str
     difficulty: float = 0.5
     alert_message: str = ""
+    expected_verification: List[str] = field(default_factory=lambda: ["rerun_pipeline", "verify_fix"])
     # Database settings chosen for the scenario. "sqlite" or "postgres".
     db_backend: str = "sqlite"
     # Optional list of DB-specific faults to inject for this scenario.

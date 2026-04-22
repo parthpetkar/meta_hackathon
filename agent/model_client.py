@@ -82,7 +82,7 @@ def get_model_action(
             model=MODEL_NAME,
             messages=messages,
             tools=TOOL_SCHEMAS,
-            tool_choice="auto",
+            tool_choice="required",
             temperature=TEMPERATURE,
             max_tokens=MAX_TOKENS,
             stream=False,

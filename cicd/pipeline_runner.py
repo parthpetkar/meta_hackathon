@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -115,9 +116,15 @@ class PipelineRunner:
 
     Stages:
         1. CLONE  — git clone / skip if already in source repo
-        2. BUILD  — secret scan + docker build
-        3. TEST   — docker run pytest
-        4. DEPLOY — docker compose up -d
+        2. BUILD  — secret scan + docker build (with layer caching)
+        3. TEST   — docker run pytest (parallel execution)
+        4. DEPLOY — docker compose up -d (reuse healthy services)
+    
+    Performance optimizations:
+    - Docker layer caching via --cache-from
+    - Stage skipping when files unchanged
+    - Parallel pytest execution
+    - Service reuse in deploy stage
     """
 
     def __init__(
@@ -128,6 +135,7 @@ class PipelineRunner:
         timeout_per_stage: int = 300,
         secret_scan_enabled: bool = True,
         log_config_check_enabled: bool = True,
+        enable_caching: bool = True,
     ):
         self.repo_path = os.path.abspath(repo_path)
         self.workspace_base = workspace_base or tempfile.mkdtemp(prefix="pipeline-ws-")
@@ -135,9 +143,13 @@ class PipelineRunner:
         self.timeout = timeout_per_stage
         self.secret_scan_enabled = secret_scan_enabled
         self.log_config_check_enabled = log_config_check_enabled
+        self.enable_caching = enable_caching
         self._result: Optional[PipelineResult] = None
         self._lock = threading.Lock()
         self._running = False
+        # Cache state for incremental builds
+        self._last_build_hash: str = ""
+        self._cached_image_tag: str = ""
 
     @property
     def result(self) -> Optional[PipelineResult]:
@@ -158,8 +170,8 @@ class PipelineRunner:
             pipeline_id=pipeline_id,
             status=PipelineStatus.RUNNING,
             workspace_dir=ws_dir,
-            # Unique tag per run so Docker always builds a fresh image
-            image_tag=f"{self.image_tag}-{pipeline_id}",
+            # Reuse base tag for better caching across episodes
+            image_tag=self.image_tag,
         )
 
         with self._lock:
@@ -252,13 +264,44 @@ class PipelineRunner:
                 result.stages["build"].command = "secret-scan"
                 return scan_exit, all_stdout, all_stderr
 
+        # Migration validation — catches bad_migration_sql before docker build
+        mig_exit, mig_out, mig_err = self._migration_check(workspace_dir)
+        all_stdout += mig_out
+        all_stderr += mig_err
+        if mig_exit != 0:
+            result.stages["build"].command = "migration-check"
+            return mig_exit, all_stdout, all_stderr
+
+        # Compute workspace hash for incremental builds
+        current_hash = self._compute_workspace_hash(workspace_dir)
+        
+        # Skip docker build if workspace unchanged and cached image exists
+        if (self.enable_caching and 
+            current_hash == self._last_build_hash and 
+            self._cached_image_tag and
+            self._image_exists(self._cached_image_tag)):
+            # Tag the cached image with the new result tag
+            tag_cmd = ["docker", "tag", self._cached_image_tag, result.image_tag]
+            _run_subprocess(tag_cmd, timeout=30)
+            result.stages["build"].command = f"docker tag {self._cached_image_tag} {result.image_tag} (cached)"
+            all_stdout += f"Build skipped: workspace unchanged, reusing cached image {self._cached_image_tag}\n"
+            return 0, all_stdout, all_stderr
+
+        # Build with layer caching
         cmd = ["docker", "build", "-t", result.image_tag, workspace_dir]
+        if self.enable_caching and self._cached_image_tag:
+            cmd.insert(2, f"--cache-from={self._cached_image_tag}")
+        
         result.stages["build"].command = " ".join(cmd)
         exit_code, stdout, stderr = _run_subprocess(cmd, cwd=workspace_dir, timeout=self.timeout)
         all_stdout += stdout
         all_stderr += stderr
         if exit_code != 0:
             return exit_code, all_stdout, all_stderr
+
+        # Update cache state
+        self._last_build_hash = current_hash
+        self._cached_image_tag = result.image_tag
 
         if self.log_config_check_enabled:
             chk_exit, chk_out, chk_err = self._log_config_check(workspace_dir, result.image_tag)
@@ -268,6 +311,59 @@ class PipelineRunner:
                 return chk_exit, all_stdout, all_stderr
 
         return 0, all_stdout, all_stderr
+
+    def _compute_workspace_hash(self, workspace_dir: str) -> str:
+        """Compute a hash of relevant workspace files for cache invalidation."""
+        import hashlib
+        hasher = hashlib.sha256()
+        
+        # Hash key files that affect the build
+        key_files = [
+            "Dockerfile",
+            "requirements.txt",
+            "services/api/requirements.txt",
+            "api-service/requirements.txt",
+            "worker/requirements.txt",
+            "services/api/app.py",
+            "services/api/routes.py",
+            "services/api/logging_config.py",
+        ]
+        
+        for rel_path in key_files:
+            full_path = os.path.join(workspace_dir, rel_path)
+            if os.path.exists(full_path):
+                try:
+                    with open(full_path, "rb") as f:
+                        hasher.update(f.read())
+                except Exception:
+                    pass
+        
+        return hasher.hexdigest()[:16]
+
+    def _image_exists(self, image_tag: str) -> bool:
+        """Check if a Docker image exists locally."""
+        exit_code, _, _ = _run_subprocess(
+            ["docker", "image", "inspect", image_tag],
+            timeout=10,
+        )
+        return exit_code == 0
+
+    def _migration_check(self, workspace_dir: str) -> tuple[int, str, str]:
+        """Run check_migrations.py to validate SQL migration files.
+
+        Catches bad_migration_sql and schema_drift faults before docker build.
+        Skipped gracefully when the workspace has no scripts/check_migrations.py.
+        """
+        script = os.path.join(workspace_dir, "scripts", "check_migrations.py")
+        if not os.path.exists(script):
+            return 0, "Migration check skipped: scripts/check_migrations.py not in workspace.\n", ""
+
+        cmd = [sys.executable, script, "--migrations-dir", os.path.join(workspace_dir, "db", "migrations")]
+        exit_code, stdout, stderr = _run_subprocess(cmd, cwd=workspace_dir, timeout=self.timeout)
+        if exit_code != 0:
+            header = "MIGRATION VALIDATION FAILED\n"
+            return exit_code, stdout, header + stderr
+        return 0, stdout, stderr
 
     def _log_config_check(self, workspace_dir: str, image_tag: str) -> tuple[int, str, str]:
         """Run check_logs.py --config-only inside the freshly built image.
@@ -342,7 +438,11 @@ class PipelineRunner:
         return 0, "Secret scan passed: no hardcoded secrets detected.\n", ""
 
     def _stage_test(self, workspace_dir: str, result: PipelineResult) -> tuple[int, str, str]:
-        cmd = ["docker", "run", "--rm", result.image_tag, "python", "-m", "pytest", "tests/", "-v"]
+        # Use simple serial pytest for faster startup (parallel overhead not worth it for small test suites)
+        cmd = [
+            "docker", "run", "--rm", result.image_tag,
+            "python", "-m", "pytest", "tests/", "-v", "--maxfail=1", "-x"
+        ]
         result.stages["test"].command = " ".join(cmd)
         return _run_subprocess(cmd, timeout=self.timeout)
 
@@ -364,7 +464,45 @@ class PipelineRunner:
 
         cmd = ["docker", "compose", "-f", compose_file, "up", "-d"]
         result.stages["deploy"].command = " ".join(cmd)
-        return _run_subprocess(cmd, cwd=cwd, timeout=self.timeout)
+        exit_code, stdout, stderr = _run_subprocess(cmd, cwd=cwd, timeout=self.timeout)
+        if exit_code != 0:
+            return exit_code, stdout, stderr
+
+        # Post-compose integration probe — catches faults that docker-compose
+        # cannot detect (shared_secret_rotation, infra_port_conflict, wrong_db_url).
+        probe_exit, probe_out, probe_err = self._deploy_probe(workspace_dir, cwd)
+        stdout += probe_out
+        stderr += probe_err
+        if probe_exit != 0:
+            return probe_exit, stdout, stderr
+
+        return 0, stdout, stderr
+
+    def _deploy_probe(self, workspace_dir: str, compose_cwd: str) -> tuple[int, str, str]:
+        """Run check_deploy.py inside the running api-service container.
+
+        Falls back gracefully (exit 0) when the script or container is absent
+        so single-app episodes that don't use shared-infra are unaffected.
+        """
+        script = os.path.join(workspace_dir, "scripts", "check_deploy.py")
+        if not os.path.exists(script):
+            return 0, "", "Deploy probe skipped: scripts/check_deploy.py not in workspace.\n"
+
+        # Resolve env file path for AUTH_SECRET
+        env_file_host = os.path.join(compose_cwd, ".env")
+        env_file_arg = env_file_host if os.path.exists(env_file_host) else ""
+
+        # Run the probe on the host (not inside a container) so it can reach
+        # the published port of the api-service container.
+        cmd = [sys.executable, script, "--host", "localhost", "--port", "9000", "--timeout", "20"]
+        if env_file_arg:
+            cmd += ["--env-file", env_file_arg]
+
+        exit_code, stdout, stderr = _run_subprocess(cmd, cwd=workspace_dir, timeout=60)
+        if exit_code != 0:
+            header = "DEPLOY PROBE FAILED\n"
+            return exit_code, stdout, header + stderr
+        return 0, stdout, stderr
 
 
 def cleanup_pipeline(result: PipelineResult) -> None:

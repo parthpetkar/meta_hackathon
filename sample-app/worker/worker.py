@@ -5,7 +5,7 @@ import time
 
 import requests
 
-API_URL = os.environ.get("API_URL", "http://api-service:8000")
+API_URL = os.environ.get("API_URL", "http://api-service:9000")
 AUTH_SECRET = os.environ.get("AUTH_SECRET", "")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
 

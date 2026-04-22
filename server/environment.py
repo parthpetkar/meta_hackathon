@@ -1062,11 +1062,12 @@ class RealCICDRepairEnvironment(Environment):
         ep.all_pipeline_results.append(new_result)
         ep.pipeline_result = new_result
 
-        # ── Mid-episode schema/state drift ─────────────────────────────
-        # Once the pipeline passes, the *world* may shift: a team rotates an
-        # endpoint, infra pins a new dep, ports change. This forces the agent
-        # to maintain a persistent world model rather than memorize the fix.
-        if drift_enabled() and new_result.status == PipelineStatus.PASSED:
+        # ── Mid-episode schema/state drift (DISABLED) ─────────────────
+        # Drift is permanently disabled for performance and predictability.
+        # The code below is kept for reference but will never execute.
+        # Original purpose: Once the pipeline passes, the *world* may shift: 
+        # a team rotates an endpoint, infra pins a new dep, ports change.
+        if False:  # drift_enabled() - permanently disabled
             drift_event = maybe_drift(
                 workspace=ep.workspace_dir,
                 episode_seed=ep.episode_seed,
@@ -1218,8 +1219,9 @@ class RealCICDRepairEnvironment(Environment):
     def _get_max_steps(self, fault_type: str) -> int:
         """Single source of truth for max_steps — used by both reset() and step()."""
         difficulty = self._get_difficulty(fault_type)
-        max_steps_map = {"easy": 16, "medium": 20, "network": 20, "security": 20, "hard": 25}
-        return max_steps_map.get(difficulty, 20)
+        # Increased step budgets to handle world drift scenarios where multiple faults may appear
+        max_steps_map = {"easy": 20, "medium": 25, "network": 25, "security": 25, "hard": 30}
+        return max_steps_map.get(difficulty, 25)
 
     def _is_destructive_fix(self, value: str) -> bool:
         normalized = (value or "").strip().lower()

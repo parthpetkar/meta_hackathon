@@ -53,6 +53,14 @@ BASE_SYSTEM_PROMPT = textwrap.dedent(
               The server also applies a direct fault-type fix automatically, so your JSON
               patch and the server's fix are both applied — use JSON to be precise.
 
+          8. CRITICAL WORKFLOW AFTER SUCCESSFUL RERUN:
+              When rerun_pipeline returns "Pipeline PASSED", you MUST follow this exact sequence:
+              a) Call verify_fix (this confirms the fix resolved the issue)
+              b) Only after verify_fix succeeds, call finalize
+              
+              If you try to finalize without calling verify_fix first, you will receive a
+              -0.05 penalty and the episode will not complete. This is NON-NEGOTIABLE.
+
         You are a CI/CD repair agent. Debug broken pipelines by calling tools.
 
         Non-negotiable rules:

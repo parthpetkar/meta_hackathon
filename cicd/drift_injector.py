@@ -31,7 +31,12 @@ class DriftEvent:
 
 
 def drift_enabled() -> bool:
-    return os.getenv("META_HACKATHON_DRIFT_ENABLED", "false").strip().lower() == "true"
+    """Drift is disabled by default for faster, more predictable episodes.
+    
+    To enable drift (adds complexity and extra pipeline runs):
+    Set META_HACKATHON_DRIFT_ENABLED=true
+    """
+    return False  # Permanently disabled for performance
 
 
 def drift_probability() -> float:

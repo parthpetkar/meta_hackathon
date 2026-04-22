@@ -27,6 +27,7 @@ _UCB_C = float(os.getenv("CURRICULUM_UCB_C", "0.5"))
 _WARMUP_EPISODES = int(os.getenv("CURRICULUM_WARMUP", "2"))
 _DIFFICULTY_MIN = 0.20
 _DIFFICULTY_MAX = 0.95
+_INITIAL_DIFFICULTY = 0.30  # Start in "easy" bucket (< 0.40)
 
 
 def _conn() -> sqlite3.Connection:
@@ -115,7 +116,7 @@ class CurriculumController:
             ).fetchone()
         finally:
             db.close()
-        return float(row[0]) if row else 0.40
+        return float(row[0]) if row else _INITIAL_DIFFICULTY
 
     def select_fault_type(self) -> str:
         """
@@ -210,7 +211,7 @@ class CurriculumController:
             db.close()
         return {
             "total_episodes": total,
-            "current_difficulty": round(float(ema_row[0]) if ema_row else 0.40, 3),
+            "current_difficulty": round(float(ema_row[0]) if ema_row else _INITIAL_DIFFICULTY, 3),
             "per_fault": stats,
         }
 
@@ -264,7 +265,7 @@ class CurriculumController:
         row = db.execute(
             "SELECT value FROM curriculum_state WHERE key = 'ema_difficulty'"
         ).fetchone()
-        current = float(row[0]) if row else 0.40
+        current = float(row[0]) if row else _INITIAL_DIFFICULTY
 
         # Delta: positive when agent succeeds, negative when struggling
         delta = (new_score - _NEUTRAL_THRESHOLD) * _STEP_CAP / (1.0 - _NEUTRAL_THRESHOLD)

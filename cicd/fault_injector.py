@@ -145,7 +145,7 @@ FAULT_ERROR_PATTERNS: Dict[str, List[str]] = {
     "log_pii_leak":          [r"sk-live-", r"Auth token received", r"FAULT\(log_pii"],
     "log_disabled":          [r"CRITICAL", r"FAULT\(log_disabled\)", r"log_level"],
     "shared_secret_rotation": [r"AUTH_SECRET", r"rotated-secret", r"401"],
-    "infra_port_conflict":   [r"5000:8000.*FAULT", r"port.*conflict", r"address already in use"],
+    "infra_port_conflict":   [r"5000:9000.*FAULT", r"port.*conflict", r"address already in use"],
     "dependency_version_drift": [r"fastapi", r"pydantic", r"ResolutionImpossible"],
 }
 
@@ -625,4 +625,293 @@ def _inject_log_disabled(workspace: str) -> FaultMetadata:
         affected_files=["services/api/logging_config.py"],
         injected_at_commit_sha=sha,
         description="LOG_LEVEL hardcoded to CRITICAL — effective logging disabled, check_logs config check fails",
+    )
+
+
+# ── Multi-app cross-service fault injectors ────────────────────────────────
+
+def _inject_shared_secret_rotation(workspace: str) -> FaultMetadata:
+    """Rotate AUTH_SECRET in shared-infra/.env for only one service, breaking auth."""
+    env_path = os.path.join(workspace, "shared-infra", ".env")
+    # Fall back to root .env if the multi-app layout isn't present
+    if not os.path.exists(env_path):
+        env_path = os.path.join(workspace, ".env")
+
+    with open(env_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Rotate the secret in the shared env file — worker still has the old value
+    # baked into its image layer, so auth between services breaks at deploy time.
+    old_line = "AUTH_SECRET=initial-shared-secret-value-abc123"
+    new_line = "AUTH_SECRET=rotated-secret-xyz789  # FAULT(shared_secret_rotation)"
+    new_content = content.replace(old_line, new_line)
+    if new_content == content:
+        # env file may not have the exact line; append a conflicting override
+        new_content = content.rstrip("\n") + "\nAUTH_SECRET=rotated-secret-xyz789  # FAULT(shared_secret_rotation)\n"
+
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+    affected = [os.path.relpath(env_path, workspace).replace("\\", "/")]
+    sha = _commit(workspace, "ops: rotate shared AUTH_SECRET (partial rollout)", affected)
+    return FaultMetadata(
+        fault_type="shared_secret_rotation",
+        affected_files=affected,
+        injected_at_commit_sha=sha,
+        description=(
+            "AUTH_SECRET rotated in shared .env but worker image still carries the old value — "
+            "inter-service authentication fails with 401 at deploy time"
+        ),
+        injected_strings=["rotated-secret-xyz789", "AUTH_SECRET"],
+        expected_error_patterns=[r"AUTH_SECRET", r"rotated-secret", r"401"],
+    )
+
+
+def _inject_infra_port_conflict(workspace: str) -> FaultMetadata:
+    """Introduce a port mapping conflict in shared-infra/docker-compose.yml."""
+    compose_path = os.path.join(workspace, "shared-infra", "docker-compose.yml")
+    if not os.path.exists(compose_path):
+        compose_path = os.path.join(workspace, "docker-compose.yml")
+
+    with open(compose_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Map the frontend to port 5000 on the host but forward to container port 9000
+    # (same port the api-service already binds), causing a binding conflict.
+    old_ports = '      - "5000:5000"'
+    new_ports = '      - "5000:9000"  # FAULT(infra_port_conflict): wrong container port'
+    new_content = content.replace(old_ports, new_ports, 1)
+    if new_content == content:
+        # Fallback: append a duplicate port binding for api-service
+        new_content = content.replace(
+            '      - "9000:9000"',
+            '      - "9000:9000"\n      - "5000:9000"  # FAULT(infra_port_conflict)',
+            1,
+        )
+
+    with open(compose_path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+    affected = [os.path.relpath(compose_path, workspace).replace("\\", "/")]
+    sha = _commit(workspace, "infra: update port mappings for staging environment", affected)
+    return FaultMetadata(
+        fault_type="infra_port_conflict",
+        affected_files=affected,
+        injected_at_commit_sha=sha,
+        description=(
+            "docker-compose port mapping changed to 5000:9000 — conflicts with api-service binding, "
+            "frontend cannot reach api-service at deploy time"
+        ),
+        injected_strings=["5000:9000", "FAULT(infra_port_conflict)"],
+        expected_error_patterns=[r"5000:9000.*FAULT", r"port.*conflict", r"address already in use"],
+    )
+
+
+def _inject_dependency_version_drift(workspace: str) -> FaultMetadata:
+    """Pin incompatible fastapi/pydantic versions in api-service/requirements.txt."""
+    req_path = os.path.join(workspace, "api-service", "requirements.txt")
+    if not os.path.exists(req_path):
+        req_path = os.path.join(workspace, "services", "api", "requirements.txt")
+
+    with open(req_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # pydantic v1 is incompatible with fastapi>=0.100 which requires pydantic v2
+    old = "fastapi>=0.100.0"
+    new = "fastapi>=0.100.0\npydantic==1.10.13  # FAULT(dependency_version_drift): incompatible with fastapi>=0.100"
+    new_content = content.replace(old, new, 1)
+    if new_content == content:
+        # requirements.txt may not have the exact line; append the conflict
+        new_content = content.rstrip("\n") + "\npydantic==1.10.13  # FAULT(dependency_version_drift)\n"
+
+    with open(req_path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+    affected = [os.path.relpath(req_path, workspace).replace("\\", "/")]
+    sha = _commit(workspace, "deps: pin pydantic to stable v1 release", affected)
+    return FaultMetadata(
+        fault_type="dependency_version_drift",
+        affected_files=affected,
+        injected_at_commit_sha=sha,
+        description=(
+            "pydantic==1.10.13 pinned in api-service/requirements.txt — "
+            "incompatible with fastapi>=0.100.0 which requires pydantic v2; pip resolution fails at build"
+        ),
+        injected_strings=["pydantic==1.10.13", "FAULT(dependency_version_drift)"],
+        expected_error_patterns=[r"fastapi", r"pydantic", r"ResolutionImpossible"],
+    )
+
+
+# ── DB fault injectors ─────────────────────────────────────────────────────
+
+def _inject_bad_migration_sql(workspace: str) -> FaultMetadata:
+    """Introduce a SQL syntax error in the init migration file."""
+    migration_path = os.path.join(workspace, "db", "migrations", "001_init.sql")
+    if not os.path.exists(migration_path):
+        os.makedirs(os.path.dirname(migration_path), exist_ok=True)
+        with open(migration_path, "w", encoding="utf-8") as f:
+            f.write("CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT NOT NULL);\n")
+
+    with open(migration_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Append a statement with a deliberate SQL syntax error
+    fault_sql = "\n-- FAULT(bad_migration_sql): syntax error breaks migration runner\nCREATE TABLE orders (id SERIAL PRIMARYKEY, user_id INT REFERENCES users(id);\n"
+    new_content = content + fault_sql
+
+    with open(migration_path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+    affected = [os.path.relpath(migration_path, workspace).replace("\\", "/")]
+    sha = _commit(workspace, "db: add orders table migration", affected)
+    return FaultMetadata(
+        fault_type="bad_migration_sql",
+        affected_files=affected,
+        injected_at_commit_sha=sha,
+        description="SQL syntax error in 001_init.sql — migration runner fails at build/init time",
+        injected_strings=["PRIMARYKEY", "FAULT(bad_migration_sql)"],
+        expected_error_patterns=[r"syntax error", r"migration", r"SQL"],
+    )
+
+
+def _inject_schema_drift(workspace: str) -> FaultMetadata:
+    """Add a column reference in app code that doesn't exist in the migration."""
+    routes_path = os.path.join(workspace, "services", "api", "routes.py")
+    if not os.path.exists(routes_path):
+        routes_path = os.path.join(workspace, "api-service", "main.py")
+
+    with open(routes_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Inject a reference to a non-existent column
+    drift_snippet = (
+        '\n# FAULT(schema_drift): references column "email" not present in migration\n'
+        'def _get_user_email(user_id: int) -> str:\n'
+        '    return db.query("SELECT email FROM users WHERE id = ?", user_id)\n'
+    )
+    new_content = content + drift_snippet
+
+    with open(routes_path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+    affected = [os.path.relpath(routes_path, workspace).replace("\\", "/")]
+    sha = _commit(workspace, "feat: expose user email in API response", affected)
+    return FaultMetadata(
+        fault_type="schema_drift",
+        affected_files=affected,
+        injected_at_commit_sha=sha,
+        description="App code references column 'email' absent from migration schema — runtime query fails",
+        injected_strings=["email", "FAULT(schema_drift)"],
+        expected_error_patterns=[r"schema", r"column.*email", r"no such column"],
+    )
+
+
+def _inject_wrong_db_url(workspace: str) -> FaultMetadata:
+    """Set DATABASE_URL to an unreachable host in the shared .env."""
+    env_path = os.path.join(workspace, "shared-infra", ".env")
+    if not os.path.exists(env_path):
+        env_path = os.path.join(workspace, ".env")
+
+    with open(env_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    fault_line = "DATABASE_URL=postgresql://app:secret@nonexistent-db-host:5432/appdb  # FAULT(wrong_db_url)\n"
+    if "DATABASE_URL" in content:
+        import re as _re
+        new_content = _re.sub(
+            r"DATABASE_URL=.*\n",
+            fault_line,
+            content,
+        )
+    else:
+        new_content = content.rstrip("\n") + "\n" + fault_line
+
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+    affected = [os.path.relpath(env_path, workspace).replace("\\", "/")]
+    sha = _commit(workspace, "config: update DATABASE_URL for new DB cluster", affected)
+    return FaultMetadata(
+        fault_type="wrong_db_url",
+        affected_files=affected,
+        injected_at_commit_sha=sha,
+        description="DATABASE_URL points to nonexistent host — app cannot connect to DB at deploy time",
+        injected_strings=["nonexistent-db-host", "FAULT(wrong_db_url)"],
+        expected_error_patterns=[r"database", r"url", r"connection refused", r"could not connect"],
+    )
+
+
+def _inject_init_order_race(workspace: str) -> FaultMetadata:
+    """Remove the depends_on / healthcheck that ensures DB is ready before the app starts."""
+    compose_path = os.path.join(workspace, "shared-infra", "docker-compose.yml")
+    if not os.path.exists(compose_path):
+        compose_path = os.path.join(workspace, "docker-compose.yml")
+
+    with open(compose_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Remove depends_on block so app starts before DB is ready
+    import re as _re
+    new_content = _re.sub(
+        r"    depends_on:\s*\n(?:      - \S+\n)+",
+        "    # FAULT(init_order_race): depends_on removed — app may start before DB is ready\n",
+        content,
+        count=1,
+    )
+    if new_content == content:
+        # Append a comment marker so the fault is detectable even if no depends_on existed
+        new_content = content.rstrip("\n") + "\n# FAULT(init_order_race): startup race condition introduced\n"
+
+    with open(compose_path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+    affected = [os.path.relpath(compose_path, workspace).replace("\\", "/")]
+    sha = _commit(workspace, "infra: simplify service startup order", affected)
+    return FaultMetadata(
+        fault_type="init_order_race",
+        affected_files=affected,
+        injected_at_commit_sha=sha,
+        description="depends_on removed from docker-compose — app starts before DB is ready, causing startup race",
+        injected_strings=["FAULT(init_order_race)", "startup race"],
+        expected_error_patterns=[r"startup", r"race", r"connection refused", r"dependency"],
+    )
+
+
+def _inject_missing_volume_mount(workspace: str) -> FaultMetadata:
+    """Remove the DB data volume mount so the database has no persistent storage."""
+    compose_path = os.path.join(workspace, "shared-infra", "docker-compose.yml")
+    if not os.path.exists(compose_path):
+        compose_path = os.path.join(workspace, "docker-compose.yml")
+
+    with open(compose_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    import re as _re
+    # Remove postgres volume mount lines
+    new_content = _re.sub(
+        r"      - \./data/db:/var/lib/postgresql/data\n",
+        "      # FAULT(missing_volume_mount): DB volume mount removed — data lost on restart\n",
+        content,
+    )
+    if new_content == content:
+        # Generic fallback: strip any db-related volume line
+        new_content = _re.sub(
+            r"      - \./data/.*\n",
+            "      # FAULT(missing_volume_mount): volume mount removed\n",
+            content,
+            count=1,
+        )
+
+    with open(compose_path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+    affected = [os.path.relpath(compose_path, workspace).replace("\\", "/")]
+    sha = _commit(workspace, "infra: remove unused volume mounts to reduce disk usage", affected)
+    return FaultMetadata(
+        fault_type="missing_volume_mount",
+        affected_files=affected,
+        injected_at_commit_sha=sha,
+        description="DB volume mount removed from docker-compose — database has no persistent storage, deploy fails",
+        injected_strings=["FAULT(missing_volume_mount)", "volume mount removed"],
+        expected_error_patterns=[r"volume", r"mount", r"database", r"missing"],
     )

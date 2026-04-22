@@ -55,8 +55,8 @@ Given available fault primitives, compose 2-3 faults that create:
 
 Difficulty guide:
   0.2-0.4 → root cause only (1 fault), no red herring
-  0.4-0.6 → 2 faults, mild cascade
-  0.6-0.95 → 3 faults, explicit red herring
+  0.4-0.6 → 2 faults max (root + 1 cascade OR root + red herring)
+  0.6-0.95 → 2 faults max (root + 1 cascade + red herring symptoms in logs)
 
 The agent must follow this resolution workflow:
   triage (view_logs per failing stage)
@@ -191,7 +191,9 @@ class AdversarialDesigner:
                     "db_faults": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": ["title", "narrative", "alert_message", "steps",
-                             "expected_hypothesis_terms", "red_herrings",
+                             "expected_triage", "expected_investigation",
+                             "expected_hypothesis_terms", "expected_fix_sequence",
+                             "expected_verification", "red_herrings",
                              "root_cause_explanation", "difficulty"],
                 "additionalProperties": False,
             }

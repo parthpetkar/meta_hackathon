@@ -74,10 +74,7 @@ def _gk(kind: _GK, qualifier: str = "") -> str:
 
 # Structured JSON fix template injected as a hint after hypothesis is accepted.
 _STRUCTURED_FIX_HINT = (
-    "Hypothesis accepted. Now apply the fix using modify_config with a structured JSON value:\n"
-    '{"file": "<path/to/file>", "action": "replace", "old": "<exact broken lines>", "new": "<fixed lines>"}\n'
-    "Use the file content you already inspected to fill in the exact old/new strings. "
-    "Do not inspect or view_logs again — go straight to the fix."
+    "Good hypothesis. Now call modify_config with the JSON fix."
 )
 
 
@@ -239,7 +236,7 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                     messages.append(
                         {
                             "role": "user",
-                            "content": f"Guardrail: {reminder}",
+                            "content": reminder,  # Remove "Guardrail:" prefix — just send the instruction directly
                         }
                     )
                 forced_messages.clear()
@@ -403,7 +400,7 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                         )
                     should_resample = True
 
-                if should_resample and guard_attempts < 4:
+                if should_resample and guard_attempts < 6:
                     messages = trim_messages(messages)
                     continue
 
@@ -499,9 +496,8 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                     attempted_hypotheses.add(normalized_hypothesis)
                 if reward > 0:
                     hypothesis_accepted = True
-                    if _gk(_GK.FIX_HINT) not in injected_guardrails:
-                        injected_guardrails.add(_gk(_GK.FIX_HINT))
-                        forced_messages.append(_STRUCTURED_FIX_HINT)
+                    # Don't inject a hint — the tool schema already has examples.
+                    # Over-prompting confuses some models.
                 elif reward < 0:
                     forced_messages.append(
                         "Your last hypothesis was incorrect (negative reward). "
@@ -582,7 +578,7 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
         memory_errors = errors_at_last_fix if errors_at_last_fix else initial_surfaced_errors
         if remember is not None and memory_errors and last_fix_value:
             try:
-                remember(memory_errors, last_fix_value, success)
+                remember(memory_errors, last_fix_value, success, fault_type=fault_type)
             except Exception:
                 pass
     except Exception as _episode_exc:
