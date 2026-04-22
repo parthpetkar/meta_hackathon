@@ -96,8 +96,13 @@ def read_config_files(workspace_dir: str) -> Dict[str, str]:
 
 # ── Log builders ───────────────────────────────────────────────────────────
 
-def build_visible_logs(pipeline_result: PipelineResult, max_lines: int = 20) -> List[str]:
-    logs = []
+def build_visible_logs(
+    pipeline_result: PipelineResult,
+    max_lines: int = 20,
+    app_name: str = "frontend",
+) -> Dict[str, List[str]]:
+    """Return per-app log dict. Single-app pipelines emit logs under *app_name* ('frontend')."""
+    logs: List[str] = []
     for stage_name in STAGE_ORDER:
         stage = pipeline_result.stages.get(stage_name)
         if not stage or stage.status == StageStatus.PENDING:
@@ -109,7 +114,7 @@ def build_visible_logs(pipeline_result: PipelineResult, max_lines: int = 20) -> 
             lines = [l.strip() for l in combined.splitlines() if l.strip()]
             tail = lines[-12:] if stage.status == StageStatus.FAILED else lines[-3:]
             logs.extend(tail)
-    return logs[:max_lines]
+    return {app_name: logs[:max_lines]}
 
 
 def build_logs_by_stage(pipeline_result: PipelineResult) -> Dict[str, List[str]]:
@@ -357,6 +362,12 @@ def build_visible_metrics(pipeline_result: PipelineResult) -> List[str]:
 
 # ── Main observation builder ───────────────────────────────────────────────
 
+_DEFAULT_SERVICE_DEPENDENCY_GRAPH: Dict[str, List[str]] = {
+    "frontend": ["api-service"],
+    "api-service": ["worker", "shared-infra"],
+}
+
+
 def build_observation(
     pipeline_result: PipelineResult,
     workspace_dir: str,
@@ -385,6 +396,8 @@ def build_observation(
     drift_detected: bool = False,
     metadata: Optional[Dict[str, Any]] = None,
     findings: Optional[List[str]] = None,
+    affected_apps: Optional[List[str]] = None,
+    service_dependency_graph: Optional[Dict[str, List[str]]] = None,
 ) -> Dict[str, Any]:
     """Construct a complete observation dict from real pipeline state."""
     failed_stage = pipeline_result.failed_stage or ""
@@ -414,6 +427,8 @@ def build_observation(
         ],
         "visible_alerts": build_visible_alerts(pipeline_result),
         "visible_logs": build_visible_logs(pipeline_result),
+        "affected_apps": affected_apps or [],
+        "service_dependency_graph": service_dependency_graph if service_dependency_graph is not None else _DEFAULT_SERVICE_DEPENDENCY_GRAPH,
         "logs_by_stage": build_logs_by_stage(pipeline_result),
         "visible_metrics": build_visible_metrics(pipeline_result),
         "config_files": read_config_files(workspace_dir),

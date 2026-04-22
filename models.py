@@ -93,9 +93,9 @@ class MetaHackathonObservation(Observation):
         default_factory=list,
         description="Visible alert summaries.",
     )
-    visible_logs: List[str] = Field(
-        default_factory=list,
-        description="Visible log lines discovered so far.",
+    visible_logs: Dict[str, List[str]] = Field(
+        default_factory=dict,
+        description="Visible log lines per app: {'frontend': [...], 'api-service': [...], ...}.",
     )
     logs_by_stage: Dict[str, List[str]] = Field(
         default_factory=dict,
@@ -196,4 +196,12 @@ class MetaHackathonObservation(Observation):
     rubric_judge_error: str = Field(
         default="",
         description="Judge error/fallback reason when OpenEnv LLMJudge is unavailable or fails.",
+    )
+    affected_apps: List[str] = Field(
+        default_factory=list,
+        description="Apps directly affected by the injected fault (empty for single-app faults).",
+    )
+    service_dependency_graph: Dict[str, List[str]] = Field(
+        default_factory=dict,
+        description="Adjacency map of service dependencies: {'frontend': ['api-service'], ...}.",
     )
