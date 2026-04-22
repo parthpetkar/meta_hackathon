@@ -31,19 +31,32 @@ except ImportError:  # pragma: no cover
 # Which faults touch which files. Two faults that edit the same file will
 # clobber each other, so we refuse those combinations.
 _FAULT_FILES = {
-    "merge_conflict": {"services/api/routes.py"},
-    "dependency_conflict": {"services/api/requirements.txt"},
-    "docker_order": {"Dockerfile"},
-    "flaky_test": {"tests/test_api.py"},
-    "missing_permission": {"docker-compose.yml"},
-    "secret_exposure": {"services/api/app.py"},
-    "env_drift": {"docker-compose.yml"},
+    # Core faults
+    "merge_conflict":           {"services/api/routes.py"},
+    "dependency_conflict":      {"services/api/requirements.txt"},
+    "docker_order":             {"Dockerfile"},
+    "flaky_test":               {"tests/test_api.py"},
+    "missing_permission":       {"docker-compose.yml"},
+    "secret_exposure":          {"services/api/app.py"},
+    "env_drift":                {"docker-compose.yml"},
+    # Logging faults
+    "log_bad_config":           {"services/api/logging_config.py"},
+    "log_path_unwritable":      {"services/api/logging_config.py"},
+    "log_volume_missing":       {"shared-infra/docker-compose.yml"},
+    "log_rotation_missing":     {"services/api/logging_config.py"},
+    "log_pii_leak":             {"services/api/routes.py"},
+    "log_disabled":             {"services/api/logging_config.py"},
+    # Multi-app faults
+    "shared_secret_rotation":   {"shared-infra/.env"},
+    "infra_port_conflict":      {"shared-infra/docker-compose.yml"},
+    "dependency_version_drift": {"services/api/requirements.txt", "worker/requirements.txt"},
 }
 
 
 def _pick_compatible_extras(root: str, rng: random.Random, count: int) -> List[str]:
     """Pick `count` extra faults that don't touch the same file as any already-picked fault."""
-    used_files = set(_FAULT_FILES[root])
+    root_files = _FAULT_FILES.get(root, set())
+    used_files = set(root_files)
     picks: List[str] = []
     candidates = [f for f in FAULT_TYPES if f != root]
     rng.shuffle(candidates)
@@ -134,11 +147,29 @@ def inject_procedural(
     workspace: str,
     scenario: AdversarialCICDScenario,
 ) -> List[FaultMetadata]:
-    """Inject every fault in the scenario, ordered by step.order."""
+    """Inject every fault in the scenario, ordered by step.order.
+
+    Failures are logged and the failed step is removed from the scenario so
+    the episode contract stays consistent — the agent is never shown a fault
+    that wasn't actually injected.
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
     injected: List[FaultMetadata] = []
+    surviving_steps = []
     for step in sorted(scenario.steps, key=lambda s: s.order):
         try:
-            injected.append(inject_fault(workspace, step.fault_type))
-        except Exception:
-            continue
+            meta = inject_fault(workspace, step.fault_type)
+            injected.append(meta)
+            surviving_steps.append(step)
+        except Exception as exc:
+            _log.warning(
+                "inject_procedural: skipping fault '%s' (step %d) — injection failed: %s",
+                step.fault_type, step.order, exc,
+            )
+
+    # Prune scenario steps to match what was actually injected so callers
+    # don't present a 3-fault narrative when only 2 faults exist.
+    scenario.steps = surviving_steps
     return injected

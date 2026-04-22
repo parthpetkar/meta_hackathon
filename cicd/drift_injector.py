@@ -91,22 +91,29 @@ def _drift_new_required_dep(workspace: str) -> Optional[DriftEvent]:
 
 def _drift_compose_port_shift(workspace: str) -> Optional[DriftEvent]:
     """Change exposed port without updating healthcheck — deploy now fails."""
-    compose = os.path.join(workspace, "docker-compose.yml")
+    # Target shared-infra/docker-compose.yml (used by the pipeline runner) when
+    # present; fall back to root docker-compose.yml for single-service workspaces.
+    shared = os.path.join(workspace, "shared-infra", "docker-compose.yml")
+    root = os.path.join(workspace, "docker-compose.yml")
+    compose = shared if os.path.exists(shared) else root
     if not os.path.exists(compose):
         return None
+    rel = os.path.relpath(compose, workspace).replace("\\", "/")
     try:
         with open(compose, "r", encoding="utf-8") as f:
             content = f.read()
         if "5000:5000" not in content:
             return None
         new_content = content.replace('"5000:5000"', '"5050:5000"')
+        if new_content == content:
+            return None
         with open(compose, "w", encoding="utf-8") as f:
             f.write(new_content)
     except OSError:
         return None
     return DriftEvent(
         kind="infra_drift_port_shift",
-        files_touched=["docker-compose.yml"],
+        files_touched=[rel],
         description="Infra team shifted external port 5000 → 5050; healthchecks break.",
         hint_keywords=["port", "compose", "healthcheck", "5050"],
     )
@@ -118,9 +125,14 @@ def _drift_compose_env_key_move(workspace: str) -> Optional[DriftEvent]:
     This is a visible re-triage drift: after a previously successful rerun,
     deploy fails because compose now depends on an invalid PORT value.
     """
-    compose = os.path.join(workspace, "docker-compose.yml")
+    # Target shared-infra/docker-compose.yml (used by the pipeline runner) when
+    # present; fall back to root docker-compose.yml for single-service workspaces.
+    shared = os.path.join(workspace, "shared-infra", "docker-compose.yml")
+    root = os.path.join(workspace, "docker-compose.yml")
+    compose = shared if os.path.exists(shared) else root
     if not os.path.exists(compose):
         return None
+    rel = os.path.relpath(compose, workspace).replace("\\", "/")
     try:
         with open(compose, "r", encoding="utf-8") as f:
             content = f.read()
@@ -148,7 +160,7 @@ def _drift_compose_env_key_move(workspace: str) -> Optional[DriftEvent]:
 
     return DriftEvent(
         kind="infra_drift_compose_env_key_move",
-        files_touched=["docker-compose.yml"],
+        files_touched=[rel],
         description=(
             "Runtime compose keys drifted (FLASK_ENV moved to APP_RUNTIME_ENV and PORT mapping externalized); "
             "deploy now fails until env mapping is repaired."

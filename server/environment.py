@@ -112,6 +112,13 @@ KNOWN_CONFIG_PATHS = (
     "services/api/logging_config.py",
     "tests/test_api.py",
     ".github/ci.yml",
+    # Multi-app paths
+    "shared-infra/docker-compose.yml",
+    "shared-infra/.env",
+    "api-service/requirements.txt",
+    "api-service/Dockerfile",
+    "worker/requirements.txt",
+    "worker/Dockerfile",
 )
 
 
@@ -506,20 +513,10 @@ class RealCICDRepairEnvironment(Environment):
         self._episode = episode
 
         # Build difficulty from fault type
-        difficulty_map = {
-            "merge_conflict": "easy",
-            "dependency_conflict": "medium",
-            "docker_order": "medium",
-            "flaky_test": "easy",
-            "missing_permission": "hard",
-            "secret_exposure": "security",
-            "env_drift": "network",
-        }
-        difficulty = difficulty_map.get(fault_type, "medium")
+        difficulty = self._get_difficulty(fault_type)
 
-        # Build max_steps from difficulty
-        max_steps_map = {"easy": 16, "medium": 20, "network": 20, "security": 20, "hard": 25}
-        max_steps = max_steps_map.get(difficulty, 15)
+        # Build max_steps — single source of truth via _get_max_steps
+        max_steps = self._get_max_steps(fault_type)
 
         obs_dict = build_observation(
             pipeline_result=pipeline_result,
@@ -626,11 +623,8 @@ class RealCICDRepairEnvironment(Environment):
 
         # Determine if episode is done
         done = False
-        max_steps = 15
-        if episode.fault_metadata:
-            difficulty = self._get_difficulty(episode.fault_metadata.fault_type)
-            max_steps_map = {"easy": 16, "medium": 20, "network": 20, "security": 20, "hard": 25}
-            max_steps = max_steps_map.get(difficulty, 15)
+        fault_type_for_steps = episode.fault_metadata.fault_type if episode.fault_metadata else "unknown"
+        max_steps = self._get_max_steps(fault_type_for_steps)
 
         if operation == "finalize":
             done = True
@@ -659,13 +653,13 @@ class RealCICDRepairEnvironment(Environment):
         if ep.pipeline_result:
             if stage and stage in STAGE_ORDER:
                 log_text = build_stage_log_response(ep.pipeline_result, stage)
-                ep.findings.append(f"Logs for stage '{stage}':\n{log_text[:500]}")
+                ep.findings.append(f"Logs for stage '{stage}':\n{log_text[:300]}")
             else:
                 # Show logs for the failed stage
                 failed_stage = ep.pipeline_result.failed_stage
                 if failed_stage:
                     log_text = build_stage_log_response(ep.pipeline_result, failed_stage)
-                    ep.findings.append(f"Logs for failed stage '{failed_stage}':\n{log_text[:500]}")
+                    ep.findings.append(f"Logs for failed stage '{failed_stage}':\n{log_text[:300]}")
 
         # Reward: +0.12 if requested stage is where real failure occurred
         if ep.fault_metadata and stage == ep.fault_metadata.expected_fail_stage:
@@ -705,7 +699,7 @@ class RealCICDRepairEnvironment(Environment):
                 ep.findings.append(f"⚠ MERGE CONFLICT in '{filename}':\n{conflict_section}")
             else:
                 # No conflict — show first portion
-                ep.findings.append(f"Config file '{filename}':\n{content[:600]}")
+                ep.findings.append(f"Config file '{filename}':\n{content[:400]}")
 
         # Relevant if fault is in a config file
         if ep.fault_metadata:
@@ -721,7 +715,7 @@ class RealCICDRepairEnvironment(Environment):
         ep.inspected_since_last_rerun = True
 
         content = read_workspace_file(ep.workspace_dir, "Dockerfile")
-        ep.findings.append(f"Dockerfile content:\n{content[:400]}")
+        ep.findings.append(f"Dockerfile content:\n{content[:300]}")
 
         if ep.fault_metadata and "Dockerfile" in ep.fault_metadata.affected_files:
             return 0.12
@@ -765,14 +759,18 @@ class RealCICDRepairEnvironment(Environment):
         if not ep.fault_metadata:
             return -0.10
 
-        # Build keyword pool from all injected faults (adversarial = multiple faults)
-        hypothesis_lower = value.lower()
+        # Hypothesis is scored ONLY against the root cause fault's keywords.
+        # Accepting cascade-fault keywords here would give false-positive rewards
+        # when the agent guesses a secondary fault instead of the root cause,
+        # corrupting both the learning signal and the rubric score.
         if ep.adversarial_scenario is not None:
-            # Adversarial: accept match against expected terms OR any injected fault's keywords
+            # Use the scenario's declared hypothesis terms (root cause only)
             keywords = list(ep.adversarial_scenario.expected_hypothesis_terms)
-            for step in ep.adversarial_scenario.steps:
-                keywords += FAULT_KEYWORDS.get(step.fault_type, [])
-            keywords = list(dict.fromkeys(keywords))  # deduplicate
+            # Also accept the root cause fault's own keyword list as a fallback
+            root_fault_type = ep.fault_metadata.fault_type
+            for kw in FAULT_KEYWORDS.get(root_fault_type, []):
+                if kw not in keywords:
+                    keywords.append(kw)
         else:
             keywords = ep.fault_metadata.keywords or FAULT_KEYWORDS.get(ep.fault_metadata.fault_type, [])
 
@@ -982,15 +980,32 @@ class RealCICDRepairEnvironment(Environment):
 
     def _get_difficulty(self, fault_type: str) -> str:
         difficulty_map = {
-            "merge_conflict": "easy",
-            "dependency_conflict": "medium",
-            "docker_order": "medium",
-            "flaky_test": "easy",
-            "missing_permission": "hard",
-            "secret_exposure": "security",
-            "env_drift": "network",
+            "merge_conflict":           "easy",
+            "dependency_conflict":      "medium",
+            "docker_order":             "medium",
+            "flaky_test":               "easy",
+            "missing_permission":       "hard",
+            "secret_exposure":          "security",
+            "env_drift":                "network",
+            # Logging faults — treat as medium (need investigation but single-file fix)
+            "log_bad_config":           "medium",
+            "log_path_unwritable":      "medium",
+            "log_volume_missing":       "medium",
+            "log_rotation_missing":     "medium",
+            "log_pii_leak":             "security",
+            "log_disabled":             "medium",
+            # Multi-app faults — harder due to cross-service scope
+            "shared_secret_rotation":   "hard",
+            "infra_port_conflict":      "hard",
+            "dependency_version_drift": "hard",
         }
         return difficulty_map.get(fault_type, "medium")
+
+    def _get_max_steps(self, fault_type: str) -> int:
+        """Single source of truth for max_steps — used by both reset() and step()."""
+        difficulty = self._get_difficulty(fault_type)
+        max_steps_map = {"easy": 16, "medium": 20, "network": 20, "security": 20, "hard": 25}
+        return max_steps_map.get(difficulty, 20)
 
     def _is_destructive_fix(self, value: str) -> bool:
         normalized = (value or "").strip().lower()
@@ -1078,7 +1093,7 @@ class RealCICDRepairEnvironment(Environment):
             rubric_judge_used=rubric_judge_used,
             rubric_judge_error=rubric_judge_error,
             drift_detected=ep.drift_detected,
-            findings=ep.findings[-16:],
+            findings=ep.findings[-10:],
             metadata={
                 "task_key": fault_type,
                 "fault_type": fault_type,
@@ -1103,7 +1118,7 @@ class RealCICDRepairEnvironment(Environment):
             "evidence": {
                 "hypothesis_history": ep.hypothesis_history[-8:],
                 "current_hypothesis": ep.current_hypothesis,
-                "findings": ep.findings[-16:],
+                "findings": ep.findings[-10:],
                 "surfaced_errors": build_surfaced_errors(ep.pipeline_result or PipelineResult(), ep.workspace_dir),
                 "incident_resolved": ep.incident_resolved,
             },
