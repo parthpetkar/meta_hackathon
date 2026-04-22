@@ -162,6 +162,15 @@ class CurriculumController:
                 }
         return profile
 
+    def get_db_backend(self) -> str:
+        """Return default DB backend for the current curriculum difficulty.
+
+        Easy tiers prefer `sqlite` (low setup cost). Harder tiers prefer `postgres`.
+        """
+        diff = self.get_difficulty()
+        # difficulty near lower bound -> sqlite, high difficulty -> postgres
+        return "sqlite" if diff < 0.45 else "postgres"
+
     def get_stats_summary(self) -> dict:
         """Human-readable stats — useful for logging at episode start."""
         db = _conn()

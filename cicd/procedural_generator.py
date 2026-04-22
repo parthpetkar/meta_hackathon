@@ -140,6 +140,9 @@ def generate_scenario(
             f"are downstream effects of the same incident."
         ),
         difficulty=difficulty,
+        # DB selection: easy tiers prefer sqlite, harder tiers prefer postgres
+        db_backend=("sqlite" if difficulty < 0.4 else "postgres"),
+        db_faults=[],
     )
 
 

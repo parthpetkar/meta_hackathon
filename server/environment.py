@@ -512,6 +512,93 @@ class RealCICDRepairEnvironment(Environment):
         )
         self._episode = episode
 
+        # --- Database selection & compose mutation (episode-scoped) ---
+        # Respect explicit scenario choices when present; otherwise fall back
+        # to curriculum-provided defaults (easy -> sqlite, hard -> postgres).
+        try:
+            scenario_db_backend = getattr(adversarial_scenario, "db_backend", None)
+            scenario_db_faults = getattr(adversarial_scenario, "db_faults", []) or []
+        except Exception:
+            scenario_db_backend = None
+            scenario_db_faults = []
+
+        db_backend = scenario_db_backend or self._curriculum.get_db_backend()
+
+        compose_path = os.path.join(repo_dir, "docker-compose.yml")
+        try:
+            # Read or create compose file in the episode workspace
+            if os.path.exists(compose_path):
+                compose_text = open(compose_path, "r", encoding="utf-8").read()
+            else:
+                compose_text = "version: '3.8'\nservices:\n  api:\n    build:\n      context: .\n      dockerfile: Dockerfile\n"
+
+            # Ensure api service has a DATABASE_URL env set appropriate for backend
+            if db_backend == "postgres":
+                db_url = "postgresql://app:secret@postgres:5432/appdb"
+                # Ensure postgres service exists and is included (no profile) when postgres desired
+                if "\n  postgres:" not in compose_text:
+                    postgres_block = (
+                        "\n  postgres:\n"
+                        "    image: postgres:15-alpine\n"
+                        "    environment:\n"
+                        "      - POSTGRES_USER=app\n"
+                        "      - POSTGRES_PASSWORD=secret\n"
+                        "      - POSTGRES_DB=appdb\n"
+                        "    volumes:\n"
+                        "      - ./data/db:/var/lib/postgresql/data\n"
+                        "    healthcheck:\n"
+                        "      test: [\"CMD-SHELL\", \"pg_isready -U app -d appdb\"]\n"
+                    )
+                    compose_text = compose_text + postgres_block
+                else:
+                    # If a postgres service exists but has 'profiles: - postgres', remove that profile so it is included
+                    compose_text = compose_text.replace("profiles:\n      - postgres\n", "")
+            else:
+                # sqlite backend -> local file
+                db_url = "sqlite:///./app.db"
+                # If compose had a postgres service, mark it under the 'postgres' profile so it stays excluded
+                if "\n  postgres:" in compose_text and "profiles:\n      - postgres\n" not in compose_text:
+                    compose_text = compose_text.replace("\n  postgres:\n", "\n  postgres:\n    profiles:\n      - postgres\n")
+
+            # Ensure DATABASE_URL appears under api.environment
+            if "environment:" in compose_text:
+                # Naively insert DATABASE_URL if missing under api service
+                api_block_start = compose_text.find("  api:")
+                if api_block_start != -1:
+                    api_env_index = compose_text.find("environment:", api_block_start)
+                    if api_env_index != -1:
+                        # Find end of environment block (next non-indented or next service)
+                        following = compose_text[api_env_index:]
+                        if "DATABASE_URL" not in following:
+                            # insert DATABASE_URL line after environment:
+                            compose_text = compose_text.replace(
+                                "environment:",
+                                "environment:\n      - DATABASE_URL=%s" % db_url,
+                                1,
+                            )
+            else:
+                # no environment block: append one under api
+                compose_text = compose_text.replace(
+                    "  api:\n    build:",
+                    f"  api:\n    build:\n      context: .\n      dockerfile: Dockerfile\n    environment:\n      - DATABASE_URL={db_url}\n",
+                )
+
+            # Persist modified compose back to episode workspace
+            with open(compose_path, "w", encoding="utf-8") as f:
+                f.write(compose_text)
+
+        except Exception as _exc:
+            logger.warning("[reset] Failed to mutate docker-compose.yml for DB backend: %s", _exc)
+
+        # Apply any DB-targeted faults requested by the scenario (these mutate files and commit)
+        if scenario_db_faults:
+            for dbf in scenario_db_faults:
+                try:
+                    inject_fault(repo_dir, dbf)
+                except Exception as _e:
+                    logger.warning("[reset] Failed to inject DB fault '%s': %s", dbf, _e)
+        
+
         # Build difficulty from fault type
         difficulty = self._get_difficulty(fault_type)
 
