@@ -846,6 +846,8 @@ class RealCICDRepairEnvironment(Environment):
         if not ep.fault_metadata:
             return -0.10
 
+        hypothesis_lower = value.lower()
+
         # Hypothesis is scored ONLY against the root cause fault's keywords.
         # Accepting cascade-fault keywords here would give false-positive rewards
         # when the agent guesses a secondary fault instead of the root cause,

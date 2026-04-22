@@ -580,3 +580,223 @@ def _inject_log_disabled(workspace: str) -> FaultMetadata:
         injected_at_commit_sha=sha,
         description="LOG_LEVEL hardcoded to CRITICAL — effective logging disabled, check_logs config check fails",
     )
+
+
+# ── Multi-app cross-service fault injectors ───────────────────────────────
+
+
+def _inject_shared_secret_rotation(workspace: str) -> FaultMetadata:
+    """Rotate AUTH_SECRET in .env to a new value so api-service and worker reject auth."""
+    path = os.path.join(workspace, "shared-infra", ".env")
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    new_content = content.replace(
+        "AUTH_SECRET=initial-shared-secret-value-abc123",
+        "AUTH_SECRET=rotated-secret-xyz987-new  # FAULT(shared_secret_rotation)",
+    )
+    if new_content == content:
+        # Generic fallback: append a rotated secret line
+        new_content = content.rstrip("\n") + "\nAUTH_SECRET=rotated-secret-xyz987-new  # FAULT(shared_secret_rotation)\n"
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+    sha = _commit(workspace, "ops: rotate shared AUTH_SECRET for security compliance", [path])
+    return FaultMetadata(
+        fault_type="shared_secret_rotation",
+        affected_files=["shared-infra/.env"],
+        injected_at_commit_sha=sha,
+        description="AUTH_SECRET rotated in .env but services not restarted — api-service and worker reject auth",
+    )
+
+
+def _inject_infra_port_conflict(workspace: str) -> FaultMetadata:
+    """Change api-service port binding to conflict with frontend, breaking connectivity."""
+    path = os.path.join(workspace, "shared-infra", "docker-compose.yml")
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    new_content = content.replace(
+        '      - "8000:8000"',
+        '      - "5000:8000"  # FAULT(infra_port_conflict): clashes with frontend port',
+    )
+    if new_content == content:
+        raise RuntimeError(
+            "_inject_infra_port_conflict: expected port mapping '8000:8000' not found in "
+            "shared-infra/docker-compose.yml — template may have drifted"
+        )
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+    sha = _commit(workspace, "infra: expose api-service on port 5000 for load balancer", [path])
+    return FaultMetadata(
+        fault_type="infra_port_conflict",
+        affected_files=["shared-infra/docker-compose.yml"],
+        injected_at_commit_sha=sha,
+        description="api-service port changed to 5000, conflicting with frontend — docker compose deploy fails",
+    )
+
+
+def _inject_dependency_version_drift(workspace: str) -> FaultMetadata:
+    """Pin incompatible fastapi/pydantic versions in api-service requirements."""
+    path = os.path.join(workspace, "api-service", "requirements.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(
+            "fastapi==0.89.0\n"
+            "pydantic>=2.0.0\n"
+            "uvicorn>=0.23.0\n"
+            "httpx>=0.24.0\n"
+        )
+
+    sha = _commit(workspace, "chore: pin fastapi version for stability", [path])
+    return FaultMetadata(
+        fault_type="dependency_version_drift",
+        affected_files=["api-service/requirements.txt"],
+        injected_at_commit_sha=sha,
+        description="fastapi==0.89.0 requires pydantic<2.0 but pydantic>=2.0.0 is pinned — pip resolution fails",
+    )
+
+
+# ── DB fault injectors ────────────────────────────────────────────────────
+
+
+def _inject_bad_migration_sql(workspace: str) -> FaultMetadata:
+    """Introduce a SQL syntax error in the migration file."""
+    path = os.path.join(workspace, "db", "migrations", "001_init.sql")
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    new_content = content.replace(
+        "CREATE TABLE IF NOT EXISTS builds",
+        "CREAT TABLE IF NOT EXISTS builds",
+        1,
+    )
+    if new_content == content:
+        raise RuntimeError(
+            "_inject_bad_migration_sql: 'CREATE TABLE IF NOT EXISTS builds' not found — "
+            "template may have drifted"
+        )
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+    sha = _commit(workspace, "db: add migration for builds table", [path])
+    return FaultMetadata(
+        fault_type="bad_migration_sql",
+        affected_files=["db/migrations/001_init.sql"],
+        injected_at_commit_sha=sha,
+        description="SQL syntax error in 001_init.sql: 'CREAT TABLE' — database fails to initialise",
+    )
+
+
+def _inject_schema_drift(workspace: str) -> FaultMetadata:
+    """Add a phantom column to CANONICAL_COLUMNS that the schema never defines."""
+    path = os.path.join(workspace, "db", "database.py")
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    old = '"id", "task_key", "status", "started_at", "finished_at", "exit_code", "log_tail"'
+    new = '"id", "task_key", "status", "started_at", "finished_at", "exit_code", "log_tail", "artifact_url"'
+    if old not in content:
+        raise RuntimeError(
+            "_inject_schema_drift: expected CANONICAL_COLUMNS string not found in db/database.py"
+        )
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content.replace(old, new, 1))
+
+    sha = _commit(workspace, "feat: track artifact URL in builds table", [path])
+    return FaultMetadata(
+        fault_type="schema_drift",
+        affected_files=["db/database.py"],
+        injected_at_commit_sha=sha,
+        description="CANONICAL_COLUMNS includes 'artifact_url' but no migration adds it — queries fail",
+    )
+
+
+def _inject_wrong_db_url(workspace: str) -> FaultMetadata:
+    """Corrupt the DATABASE_URL with a double-slash making the host unparseable."""
+    path = os.path.join(workspace, "docker-compose.yml")
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    good = "postgresql://app:secret@db:5432/appdb"
+    bad = "postgresql://app:secret@//db:5432/appdb  # FAULT(wrong_db_url)"
+    if good in content:
+        new_content = content.replace(good, bad, 1)
+    else:
+        # Inject a DATABASE_URL env var into the api service environment block
+        new_content = content.replace(
+            "    environment:\n      - FLASK_ENV=production",
+            "    environment:\n"
+            "      - DATABASE_URL=postgresql://app:secret@//db:5432/appdb  # FAULT(wrong_db_url)\n"
+            "      - FLASK_ENV=production",
+            1,
+        )
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+    sha = _commit(workspace, "infra: add DATABASE_URL to api service config", [path])
+    return FaultMetadata(
+        fault_type="wrong_db_url",
+        affected_files=["docker-compose.yml"],
+        injected_at_commit_sha=sha,
+        description="DATABASE_URL contains double-slash after scheme — hostname unparseable, connection fails",
+    )
+
+
+def _inject_init_order_race(workspace: str) -> FaultMetadata:
+    """Remove the db healthcheck dependency so the app starts before Postgres is ready."""
+    path = os.path.join(workspace, "docker-compose.yml")
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    import re as _re
+    new_content = _re.sub(
+        r"\s+depends_on:\s*\n(\s+db:\s*\n\s+condition: service_healthy\s*\n(\s+required: false\s*\n)?)",
+        "\n",
+        content,
+        count=1,
+    )
+    if new_content == content:
+        # Fallback: add a comment indicating the race
+        new_content = content + "\n# FAULT(init_order_race): depends_on db removed\n"
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+    sha = _commit(workspace, "infra: remove startup ordering to speed up deploy", [path])
+    return FaultMetadata(
+        fault_type="init_order_race",
+        affected_files=["docker-compose.yml"],
+        injected_at_commit_sha=sha,
+        description="depends_on db healthcheck removed — app starts before Postgres is ready, init_db() fails",
+    )
+
+
+def _inject_missing_volume_mount(workspace: str) -> FaultMetadata:
+    """Comment out the pgdata volume mount so Postgres data doesn't persist."""
+    path = os.path.join(workspace, "docker-compose.yml")
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    target = "      - pgdata:/var/lib/postgresql/data"
+    replacement = (
+        "      # FAULT(missing_volume_mount): volume removed — data won't persist\n"
+        "      # - pgdata:/var/lib/postgresql/data"
+    )
+    if target in content:
+        new_content = content.replace(target, replacement, 1)
+    else:
+        # Generic fallback: remove any db volume line
+        new_content = content + "\n# FAULT(missing_volume_mount): pgdata volume not configured\n"
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+    sha = _commit(workspace, "infra: remove db volume for ephemeral test environment", [path])
+    return FaultMetadata(
+        fault_type="missing_volume_mount",
+        affected_files=["docker-compose.yml"],
+        injected_at_commit_sha=sha,
+        description="pgdata volume mount removed — Postgres data lost on restart, stateful tests fail",
+    )
