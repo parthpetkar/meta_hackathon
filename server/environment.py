@@ -36,11 +36,13 @@ from cicd.pipeline_runner import (
 )
 from cicd.fault_injector import (
     FaultMetadata,
+    CompoundFaultMetadata,
     FAULT_TYPES,
     FAULT_KEYWORDS,
     FAULT_STAGE_MAP,
     inject_fault,
     inject_random_fault,
+    inject_compound_fault,
 )
 from cicd.observation_builder import (
     build_observation,

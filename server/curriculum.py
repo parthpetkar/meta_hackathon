@@ -17,8 +17,14 @@ from typing import Dict, Optional
 
 try:
     from cicd.fault_injector import FAULT_TYPES
+    from server.agent_memory import record_fault_outcome, sample_weak_fault
 except ImportError:
-    from ..cicd.fault_injector import FAULT_TYPES
+    try:
+        from ..cicd.fault_injector import FAULT_TYPES
+        from .agent_memory import record_fault_outcome, sample_weak_fault
+    except ImportError:
+        from cicd.fault_injector import FAULT_TYPES
+        from server.agent_memory import record_fault_outcome, sample_weak_fault
 
 _DB_PATH = Path(__file__).parent / "agent_memory.db"
 
@@ -71,7 +77,7 @@ class CurriculumController:
         resolved: bool,
         steps_used: int,
     ) -> None:
-        """Persist episode outcome and update EMA difficulty."""
+        """Persist episode outcome, update EMA difficulty, and update fault-class weakness stats."""
         db = _conn()
         try:
             db.execute(
@@ -89,6 +95,9 @@ class CurriculumController:
             db.commit()
         finally:
             db.close()
+
+        # Update per-fault-class weakness stats in agent_memory
+        record_fault_outcome(fault_type, success=resolved)
 
     def get_difficulty(self) -> float:
         """Current scheduled difficulty in [0.2, 0.95]."""
@@ -118,17 +127,41 @@ class CurriculumController:
             if stats.get(ft, {}).get("attempts", 0) < _WARMUP_EPISODES:
                 return ft
 
-        # UCB1: weakness + exploration bonus
-        best_ft, best_score = FAULT_TYPES[0], -1.0
+        # Weakness-biased softmax sampling using per-fault failure rates from agent_memory.
+        # UCB1 exploration bonus is added to the failure-rate weight so under-tried faults
+        # still get pulled into the mix (avoids starvation after warmup).
+        log_total = math.log(max(2, total))
+        ucb_weights = {}
         for ft in FAULT_TYPES:
             s = stats.get(ft, {"win_rate": 0.5, "attempts": 1})
             weakness = 1.0 - s["win_rate"]
-            exploration = _UCB_C * math.sqrt(math.log(max(2, total)) / max(1, s["attempts"]))
-            ucb = weakness + exploration
-            if ucb > best_score:
-                best_score, best_ft = ucb, ft
+            exploration = _UCB_C * math.sqrt(log_total / max(1, s["attempts"]))
+            ucb_weights[ft] = weakness + exploration
 
-        return best_ft
+        # Blend per-fault failure rate (from agent_memory) with UCB exploration bonus.
+        # Effective weakness = max(memory_failure_rate, ucb_bonus) so under-tried faults
+        # always get a floor of exploration rather than collapsing to zero probability.
+        from server.agent_memory import get_fault_class_stats
+        import random as _rnd
+        fault_stats = get_fault_class_stats()
+        blended: list = []
+        for ft in FAULT_TYPES:
+            mem_failure = fault_stats.get(ft, {}).get("failure_rate", 1.0)
+            ucb_bonus = ucb_weights.get(ft, 0.0) * 0.5
+            blended.append(max(mem_failure, ucb_bonus))
+
+        # Softmax over blended weights
+        max_w = max(blended)
+        exp_w = [math.exp(w - max_w) for w in blended]
+        total_exp = sum(exp_w)
+        probs = [e / total_exp for e in exp_w]
+        r = _rnd.random()
+        cumulative = 0.0
+        for ft, p in zip(FAULT_TYPES, probs):
+            cumulative += p
+            if r <= cumulative:
+                return ft
+        return FAULT_TYPES[-1]
 
     def get_skill_profile(self) -> Dict[str, dict]:
         """

@@ -8,6 +8,7 @@
 
 import hashlib
 import json
+import random
 import re
 import sqlite3
 from pathlib import Path
@@ -25,6 +26,13 @@ def _connect() -> sqlite3.Connection:
             success_count INTEGER NOT NULL DEFAULT 0,
             failure_count INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (pattern_hash, fix_text)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fault_class_stats (
+            fault_type    TEXT PRIMARY KEY,
+            success_count INTEGER NOT NULL DEFAULT 0,
+            failure_count INTEGER NOT NULL DEFAULT 0
         )
     """)
     conn.commit()
@@ -117,3 +125,84 @@ def remember(errors: list[str], fix: str, success: bool) -> None:
         conn.close()
     except Exception:
         pass
+
+
+# ── Per-fault-class weakness tracking ─────────────────────────────────────────
+
+def record_fault_outcome(fault_type: str, success: bool) -> None:
+    """Increment success/failure counter for a fault class after each episode."""
+    if not fault_type:
+        return
+    try:
+        conn = _connect()
+        conn.execute(
+            "INSERT INTO fault_class_stats (fault_type, success_count, failure_count) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(fault_type) DO UPDATE SET "
+            "success_count = success_count + excluded.success_count, "
+            "failure_count = failure_count + excluded.failure_count",
+            (fault_type, 1 if success else 0, 0 if success else 1),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def get_fault_class_stats() -> dict[str, dict]:
+    """Return per-fault-class {attempts, success_rate, failure_rate} dict."""
+    try:
+        conn = _connect()
+        rows = conn.execute(
+            "SELECT fault_type, success_count, failure_count FROM fault_class_stats"
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return {}
+
+    result = {}
+    for fault_type, successes, failures in rows:
+        total = successes + failures
+        result[fault_type] = {
+            "attempts": total,
+            "success_rate": round(successes / total, 4) if total else 0.0,
+            "failure_rate": round(failures / total, 4) if total else 0.0,
+        }
+    return result
+
+
+def sample_weak_fault(fault_types: list[str], temperature: float = 1.0) -> str:
+    """Softmax-sample a fault type biased toward classes the agent keeps failing.
+
+    Weakness weight = failure_rate for seen faults; unseen faults get weight 1.0
+    (maximum curiosity — we haven't tried them yet).  Temperature controls how
+    sharply the distribution peaks on the weakest class:
+      temperature=1.0 → standard softmax
+      temperature<1.0 → sharper (more greedy toward weakness)
+      temperature>1.0 → flatter (more exploration)
+    """
+    import math
+
+    stats = get_fault_class_stats()
+
+    # Raw weakness score: failure_rate for seen, 1.0 for unseen
+    raw = [
+        stats[ft]["failure_rate"] if ft in stats else 1.0
+        for ft in fault_types
+    ]
+
+    # Softmax with temperature
+    scaled = [w / max(temperature, 1e-6) for w in raw]
+    max_scaled = max(scaled)
+    exp_w = [math.exp(s - max_scaled) for s in scaled]
+    total = sum(exp_w)
+    probs = [e / total for e in exp_w]
+
+    # Weighted random draw
+    r = random.random()
+    cumulative = 0.0
+    for ft, p in zip(fault_types, probs):
+        cumulative += p
+        if r <= cumulative:
+            return ft
+    return fault_types[-1]

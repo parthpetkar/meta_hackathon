@@ -24,6 +24,36 @@ class FaultMetadata:
     keywords: List[str] = field(default_factory=list)
 
 
+@dataclass
+class CompoundFaultMetadata:
+    """Metadata for a compound (multi-fault) injection."""
+    fault_types: List[str]
+    components: List[FaultMetadata]
+    # Primary stage where the agent will first hit failure
+    expected_fail_stage: str = ""
+    # Union of keywords across all faults — agent must triage multiple root causes
+    keywords: List[str] = field(default_factory=list)
+    description: str = ""
+
+    @property
+    def fault_type(self) -> str:
+        """Primary fault type (first injected = root cause)."""
+        return self.fault_types[0] if self.fault_types else "unknown"
+
+    @property
+    def affected_files(self) -> List[str]:
+        seen: List[str] = []
+        for c in self.components:
+            for f in c.affected_files:
+                if f not in seen:
+                    seen.append(f)
+        return seen
+
+    @property
+    def injected_at_commit_sha(self) -> str:
+        return self.components[0].injected_at_commit_sha if self.components else ""
+
+
 FAULT_TYPES = [
     "merge_conflict",
     "dependency_conflict",
@@ -113,6 +143,80 @@ def inject_fault(workspace: str, fault_type: str) -> FaultMetadata:
 
 def inject_random_fault(workspace: str) -> FaultMetadata:
     return inject_fault(workspace, random.choice(FAULT_TYPES))
+
+
+def inject_compound_fault(workspace: str, fault_types: List[str]) -> CompoundFaultMetadata:
+    """Inject multiple interacting faults in sequence and return compound metadata.
+
+    Faults are applied in list order. The first entry is the root cause; subsequent
+    entries are cascading / interacting faults. Each is committed separately so git
+    history is realistic (one bad commit per fault).
+
+    Incompatible combinations are skipped with a warning rather than raising, so the
+    caller always gets at least one injected fault back.
+    """
+    if not fault_types:
+        raise ValueError("fault_types must be a non-empty list")
+
+    components: List[FaultMetadata] = []
+    applied_types: List[str] = []
+
+    for ft in fault_types:
+        try:
+            meta = inject_fault(workspace, ft)
+            components.append(meta)
+            applied_types.append(ft)
+        except Exception as exc:
+            import warnings
+            warnings.warn(
+                f"inject_compound_fault: skipping fault '{ft}' — {exc}",
+                stacklevel=2,
+            )
+
+    if not components:
+        raise RuntimeError(f"All faults failed to inject: {fault_types}")
+
+    # Expected fail stage = earliest pipeline stage across all injected faults
+    stage_order_map = {s: i for i, s in enumerate(["build", "test", "deploy"])}
+    earliest_stage = min(
+        (c.expected_fail_stage for c in components if c.expected_fail_stage),
+        key=lambda s: stage_order_map.get(s, 99),
+        default=components[0].expected_fail_stage,
+    )
+
+    # Union of keywords — deduplicated, root-cause keywords first
+    seen_kw: dict = {}
+    for c in components:
+        for kw in (c.keywords or []):
+            seen_kw.setdefault(kw, None)
+    all_keywords = list(seen_kw.keys())
+
+    descriptions = "; ".join(c.description for c in components if c.description)
+
+    return CompoundFaultMetadata(
+        fault_types=applied_types,
+        components=components,
+        expected_fail_stage=earliest_stage,
+        keywords=all_keywords,
+        description=f"Compound fault ({' + '.join(applied_types)}): {descriptions}",
+    )
+
+
+# Curated interacting pairs — combinations that produce realistic co-incident failures
+COMPOUND_FAULT_PAIRS: List[List[str]] = [
+    ["dependency_conflict", "env_drift"],        # build breaks + deploy env wrong
+    ["docker_order", "dependency_conflict"],     # Dockerfile broken AND bad deps
+    ["merge_conflict", "flaky_test"],            # syntax error + unstable test suite
+    ["secret_exposure", "missing_permission"],   # secrets leak AND network unavailable
+    ["env_drift", "missing_permission"],         # bad env + missing network
+    ["docker_order", "env_drift"],               # layer order wrong + port misconfigured
+]
+
+
+def inject_random_compound_fault(workspace: str) -> CompoundFaultMetadata:
+    """Inject a randomly chosen interacting fault pair."""
+    pair = random.choice(COMPOUND_FAULT_PAIRS)
+    return inject_compound_fault(workspace, pair)
 
 
 def undo_fault(workspace: str, fault_metadata: FaultMetadata) -> bool:
