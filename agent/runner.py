@@ -79,11 +79,17 @@ def _infer_fix_phrase(surfaced_errors: List[str], hypothesis: str = "", findings
 
 
 def _extract_primary_surfaced_error_file(observation: MetaHackathonObservation) -> str:
+    patterns = [
+        r" in ([^:]+):\d+:",
+        r"\b((?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:py|ya?ml|txt|env))\b",
+        r"\b(Dockerfile)\b",
+    ]
     for err in observation.surfaced_errors or []:
         text = str(err)
-        match = re.search(r" in ([^:]+):\d+:", text)
-        if match:
-            return match.group(1).strip()
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                return match.group(1).strip().strip(".,)")
     return ""
 
 
@@ -173,6 +179,7 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
     task_max_steps = MAX_STEPS
     initial_surfaced_errors: List[str] = []
     last_fix_value: str = ""
+    errors_at_last_fix: List[str] = []   # errors active when the last fix was applied
     last_memory_key: str = ""
 
     try:
@@ -418,6 +425,12 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                 }
                 tool_call_id = None
 
+            # Capture errors active RIGHT BEFORE this fix so memory maps
+            # the error pattern that prompted the fix, not the initial errors.
+            pre_fix_errors: List[str] = []
+            if operation in {"modify_config", "add_dependency"} and value:
+                pre_fix_errors = [str(e) for e in (observation.surfaced_errors or [])]
+
             try:
                 observation, reward, done, error = step_env(
                     session,
@@ -436,6 +449,8 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
             llm_thought = assistant_message.get("content", "") if assistant_message else ""
             if operation in {"modify_config", "add_dependency"} and value:
                 last_fix_value = value
+                if pre_fix_errors:
+                    errors_at_last_fix = pre_fix_errors
             
             action_text = f"{operation}|{target}|{value}"
             log_step(step=step, action=action_text, reward=reward, done=done, error=error, llm_thought=llm_thought)
@@ -457,6 +472,16 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                 injected_guardrails.discard(f"hyp_sf:{target}")
             if operation in {"modify_config", "add_dependency"} and value:
                 fix_applied_since_rerun = True
+                # After any fix, push the agent to rerun immediately so it sees the
+                # updated error state. Without this nudge, agents often inspect stale
+                # errors and exhaust the budget before verifying the fix.
+                fix_note = str(observation.findings[-1]) if observation.findings else ""
+                fix_succeeded = "Fix applied" in fix_note or reward >= 0.0
+                if fix_succeeded and not observation.incident_resolved and not done:
+                    forced_messages.append(
+                        "Fix applied. Call rerun_pipeline NOW to see whether the issue is resolved. "
+                        "Do not inspect files or form hypotheses until you have seen the new pipeline state."
+                    )
             if operation == "rerun_pipeline":
                 fix_applied_since_rerun = False
             if operation == "set_hypothesis":
@@ -567,9 +592,14 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
             rubric_judge_used = bool(observation.rubric_judge_used)
             resolved = bool(observation.incident_resolved)
         success = resolved and score >= SUCCESS_SCORE_THRESHOLD
-        if remember is not None and initial_surfaced_errors and last_fix_value:
+        # Use the errors that were active when the fix was applied, not the initial errors.
+        # This prevents multi-fault episodes from poisoning the memory: e.g. a dep_conflict
+        # episode that also had log_path would previously store "dep errors → log_path fix",
+        # teaching the wrong fix for dep errors in future episodes.
+        memory_errors = errors_at_last_fix if errors_at_last_fix else initial_surfaced_errors
+        if remember is not None and memory_errors and last_fix_value:
             try:
-                remember(initial_surfaced_errors, last_fix_value, success)
+                remember(memory_errors, last_fix_value, success)
             except Exception:
                 pass
     finally:

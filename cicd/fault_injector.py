@@ -136,15 +136,23 @@ def _inject_merge_conflict(workspace: str) -> FaultMetadata:
     content = content.replace(
         '    @app.route("/health", methods=["GET"])\n'
         '    def health():\n'
+        '        _log.info("Health check", extra={"request_id": getattr(g, "request_id", "")})\n'
         '        return jsonify({"status": "healthy", "service": "api"})',
         '    @app.route("/health", methods=["GET"])\n'
         '    def health():\n'
         '<<<<<<< HEAD\n'
+        '        _log.info("Health check", extra={"request_id": getattr(g, "request_id", "")})\n'
         '        return jsonify({"status": "healthy", "service": "api", "version": "2.0"})\n'
         '=======\n'
+        '        _log.info("Health check", extra={"request_id": getattr(g, "request_id", "")})\n'
         '        return jsonify({"status": "healthy", "service": "api"})\n'
         '>>>>>>> feature/new-health-check',
     )
+    if '<<<<<<< HEAD' not in content:
+        raise RuntimeError(
+            "_inject_merge_conflict: replacement string not found in routes.py — "
+            "template may have drifted from expected content"
+        )
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
 
@@ -316,7 +324,7 @@ def _inject_env_drift(workspace: str) -> FaultMetadata:
                                     context: .
                                     dockerfile: Dockerfile
                                 ports:
-                                    - "${PORT}:5000"
+                                    - "not-a-number:5000"
                                 environment:
                                     - FLASK_ENV=production
                                     - PORT=not-a-number

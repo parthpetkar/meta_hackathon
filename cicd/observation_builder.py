@@ -60,8 +60,18 @@ _CONFIG_PATHS = [
     "services/api/requirements.txt",
     "services/api/routes.py",
     "services/api/app.py",
+    "services/api/logging_config.py",
+    "tests/test_api.py",
     ".github/ci.yml",
 ]
+
+
+def _find_line_number(src: str, pattern: str) -> int:
+    regex = re.compile(pattern)
+    for idx, line in enumerate(src.splitlines(), 1):
+        if regex.search(line):
+            return idx
+    return 1
 
 
 def read_workspace_file(workspace_dir: str, relative_path: str) -> str:
@@ -160,7 +170,8 @@ def build_surfaced_errors(pipeline_result: PipelineResult, workspace_dir: str = 
     # 1. Scan source files for merge conflict markers (primary — shown first)
     if workspace_dir:
         for rel_path in ["services/api/routes.py", "services/api/app.py",
-                          "services/api/requirements.txt", "Dockerfile", "docker-compose.yml"]:
+                          "services/api/requirements.txt", "services/api/logging_config.py",
+                          "tests/test_api.py", "Dockerfile", "docker-compose.yml"]:
             full_path = os.path.join(workspace_dir, rel_path)
             try:
                 with open(full_path, "r", encoding="utf-8", errors="replace") as f:
@@ -189,7 +200,7 @@ def build_surfaced_errors(pipeline_result: PipelineResult, workspace_dir: str = 
             stage_errors.append(line)
 
     clue_errors = _build_config_clues(stage_errors, workspace_dir)
-    return (conflict_errors + stage_errors + clue_errors)[:10]
+    return (conflict_errors + clue_errors + stage_errors)[:10]
 
 
 def _build_config_clues(stage_errors: List[str], workspace_dir: str) -> List[str]:
@@ -223,6 +234,95 @@ def _build_config_clues(stage_errors: List[str], workspace_dir: str) -> List[str
             clues.append(
                 "Config clue: docker-compose.yml sets PORT=not-a-number while ports uses ${PORT}:5000."
             )
+
+    clues.extend(_build_logging_fault_clues(joined, workspace_dir))
+    return clues
+
+
+def _build_logging_fault_clues(joined_errors: str, workspace_dir: str) -> List[str]:
+    clues: List[str] = []
+
+    logging_rel = "services/api/logging_config.py"
+    logging_text = read_workspace_file(workspace_dir, logging_rel)
+    if not logging_text.startswith("[File not found"):
+        path_m = re.search(r'LOG_PATH\s*(?::\s*\w+)?\s*=\s*["\']([^"\']+)["\']', logging_text)
+        if path_m:
+            declared = path_m.group(1)
+            if declared.startswith(("/var/log", "/root", "/sys", "/proc")) and any(
+                token in joined_errors
+                for token in ("log_path", "restricted system directory", "/var/log", "cannot write", "unwritable")
+            ):
+                line_no = _find_line_number(logging_text, r'LOG_PATH\s*(?::\s*\w+)?\s*=')
+                clues.append(
+                    "Config issue in services/api/logging_config.py:"
+                    f"{line_no}: LOG_PATH default {declared!r} points to a restricted system directory."
+                )
+
+        level_m = re.search(r'LOG_LEVEL\s*(?::\s*\w+)?\s*=\s*["\']([A-Z]+)["\']', logging_text)
+        if level_m:
+            level = level_m.group(1)
+            if level == "CRITICAL" and any(
+                token in joined_errors
+                for token in ("log_level", "critical", "silences all log output", "silent")
+            ):
+                line_no = _find_line_number(logging_text, r'LOG_LEVEL\s*(?::\s*\w+)?\s*=')
+                clues.append(
+                    "Config issue in services/api/logging_config.py:"
+                    f"{line_no}: LOG_LEVEL is hardcoded to {level!r}, which silences normal log output."
+                )
+
+        if "json.dumps" not in logging_text and any(
+            token in joined_errors
+            for token in ("formatter", "json", "valid json", "malformed")
+        ):
+            line_no = _find_line_number(logging_text, r"return\s+")
+            clues.append(
+                "Config issue in services/api/logging_config.py:"
+                f"{line_no}: formatter does not call json.dumps(), so logs will not be valid JSON."
+            )
+
+        if "RotatingFileHandler" not in logging_text and any(
+            token in joined_errors
+            for token in ("rotation", "rotatingfilehandler", "filehandler", "unbounded")
+        ):
+            line_no = _find_line_number(logging_text, r"FileHandler|RotatingFileHandler")
+            clues.append(
+                "Config issue in services/api/logging_config.py:"
+                f"{line_no}: RotatingFileHandler is missing, so logs can grow without rotation."
+            )
+
+    routes_rel = "services/api/routes.py"
+    routes_text = read_workspace_file(workspace_dir, routes_rel)
+    if (
+        not routes_text.startswith("[File not found")
+        and any(token in joined_errors for token in ("pii", "credential", "token", "routes.py", "log call"))
+    ):
+        pii_patterns = [
+            r"sk-live",
+            r"sk-test",
+            r"AKIA",
+            r"log_pii_leak",
+        ]
+        for pattern in pii_patterns:
+            if re.search(pattern, routes_text):
+                line_no = _find_line_number(routes_text, pattern)
+                clues.append(
+                    "Config issue in services/api/routes.py:"
+                    f"{line_no}: a log call may emit credential values (PII leak risk)."
+                )
+                break
+
+    compose_text = read_workspace_file(workspace_dir, "docker-compose.yml")
+    if (
+        not compose_text.startswith("[File not found")
+        and "./logs:/app/logs" not in compose_text
+        and any(token in joined_errors for token in ("log file not found", "logs volume", "/app/logs", "log_path"))
+    ):
+        line_no = _find_line_number(compose_text, r"/app/logs|volumes:|log_volume_missing")
+        clues.append(
+            "Config issue in docker-compose.yml:"
+            f"{line_no}: the ./logs:/app/logs volume mount is missing."
+        )
 
     return clues
 

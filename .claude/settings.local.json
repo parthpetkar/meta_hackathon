@@ -15,7 +15,8 @@
       "Bash(python -c \"import os; print\\(repr\\(os.getenv\\('CICD_GYM_MODE'\\)\\)\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('server/environment.py'\\).read\\(\\)\\); ast.parse\\(open\\('agent/prompts.py'\\).read\\(\\)\\); print\\('syntax ok'\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('cicd/observation_builder.py'\\).read\\(\\)\\); print\\('syntax ok'\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('agent/runner.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('agent/runner.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('agent/runner.py', doraise=True\\); print\\('OK'\\)\")"
     ]
   }
 }

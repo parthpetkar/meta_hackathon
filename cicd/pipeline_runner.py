@@ -269,6 +269,12 @@ class PipelineRunner:
         for root, _dirs, files in os.walk(workspace_dir):
             if ".git" in root:
                 continue
+            # Skip scripts/ — those files define scanning patterns and contain
+            # the same token prefixes (e.g. "AKIA", "sk-live") as literals inside
+            # regex strings, which causes false positives on every episode.
+            rel_root = os.path.relpath(root, workspace_dir).replace("\\", "/")
+            if rel_root.startswith("scripts"):
+                continue
             for fname in files:
                 ext = os.path.splitext(fname)[1]
                 if ext not in (".py", ".yml", ".yaml", ".json", ".env", ".cfg"):

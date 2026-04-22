@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -101,6 +102,18 @@ SAMPLE_APP_TEMPLATE = os.path.join(
     "sample-app",
 )
 
+KNOWN_CONFIG_PATHS = (
+    "Dockerfile",
+    "docker-compose.yml",
+    ".env",
+    "services/api/requirements.txt",
+    "services/api/routes.py",
+    "services/api/app.py",
+    "services/api/logging_config.py",
+    "tests/test_api.py",
+    ".github/ci.yml",
+)
+
 
 @dataclass
 class State:
@@ -171,6 +184,67 @@ class EpisodeState:
     episode_seed: int = 0
     procedural_mode: bool = False
     drift_detected: bool = False
+
+
+def _extract_config_path_from_text(text: str) -> str:
+    patterns = [
+        r" in ([^:]+):\d+:",
+        r"\b((?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:py|ya?ml|txt|env))\b",
+        r"\b(Dockerfile)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        candidate = match.group(1).strip().strip(".,)")
+        candidate = candidate.replace("\\", "/")
+        if candidate in KNOWN_CONFIG_PATHS or "/" in candidate or candidate in {"Dockerfile", ".env"}:
+            return candidate
+    return ""
+
+
+def _resolve_episode_config_target(ep: EpisodeState, target: str) -> str:
+    filepath = target.replace("\\", "/").lstrip("./")
+    if not filepath:
+        return filepath
+
+    direct_path = os.path.join(ep.workspace_dir, filepath)
+    if os.path.exists(direct_path):
+        return filepath
+
+    normalized_target = filepath.split("/")[-1].lower()
+
+    if normalized_target in STAGE_ORDER:
+        surfaced_errors = build_surfaced_errors(ep.pipeline_result or PipelineResult(), ep.workspace_dir)
+        for err in surfaced_errors:
+            candidate = _extract_config_path_from_text(str(err))
+            if candidate and os.path.exists(os.path.join(ep.workspace_dir, candidate)):
+                return candidate
+
+        if ep.last_fix_result and ep.last_fix_result.files_modified:
+            candidate = ep.last_fix_result.files_modified[0].replace("\\", "/")
+            if os.path.exists(os.path.join(ep.workspace_dir, candidate)):
+                return candidate
+
+        if ep.fault_metadata:
+            for candidate in ep.fault_metadata.affected_files:
+                normalized_candidate = candidate.replace("\\", "/")
+                if os.path.exists(os.path.join(ep.workspace_dir, normalized_candidate)):
+                    return normalized_candidate
+
+    for cfg in KNOWN_CONFIG_PATHS:
+        if normalized_target == os.path.basename(cfg).lower() or normalized_target in cfg.lower():
+            return cfg
+
+    for root, dirs, files in os.walk(ep.workspace_dir):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        for file_name in files:
+            if file_name.lower() == normalized_target:
+                return os.path.relpath(
+                    os.path.join(root, file_name), ep.workspace_dir
+                ).replace("\\", "/")
+
+    return filepath
 
 
 def _canonical_operation(operation: str) -> str:
@@ -507,7 +581,7 @@ class RealCICDRepairEnvironment(Environment):
             max_steps_map = {"easy": 16, "medium": 20, "network": 20, "security": 20, "hard": 25}
             max_steps = max_steps_map.get(difficulty, 15)
 
-        if operation == "finalize" and episode.verified_for_latest_rerun:
+        if operation == "finalize":
             done = True
         elif self._state.step_count >= max_steps:
             done = True
@@ -556,14 +630,7 @@ class RealCICDRepairEnvironment(Environment):
 
         # If target specified, only read that file; otherwise read all
         if target:
-            # Try the target as-is, then search in standard config paths
-            filepath = target
-            if not os.path.exists(os.path.join(ep.workspace_dir, filepath)):
-                for cfg in ["Dockerfile", "docker-compose.yml", ".env", "services/api/requirements.txt",
-                           "services/api/routes.py", "services/api/app.py", ".github/ci.yml"]:
-                    if target.lower() in cfg.lower():
-                        filepath = cfg
-                        break
+            filepath = _resolve_episode_config_target(ep, target)
             content = read_workspace_file(ep.workspace_dir, filepath)
             configs = {filepath: content}
         else:
@@ -788,10 +855,16 @@ class RealCICDRepairEnvironment(Environment):
 
         if progressed:
             ep.fix_hits += 1
-            ep.findings.append(
-                "Pipeline PASSED. Call verify_fix next (required before finalize) — "
-                "then immediately call finalize. Do not apply more fixes."
-            )
+            if new_result.status == PipelineStatus.PASSED:
+                ep.findings.append(
+                    "Pipeline PASSED. Call verify_fix next (required before finalize) — "
+                    "then immediately call finalize. Do not apply more fixes."
+                )
+            else:
+                ep.findings.append(
+                    "Pipeline progressed but is not yet passing. Call verify_fix next, "
+                    "then continue investigation if unresolved."
+                )
             return 0.18
         return 0.05
 

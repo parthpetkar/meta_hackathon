@@ -22,7 +22,7 @@ except ImportError:
 
 _DB_PATH = Path(__file__).parent / "agent_memory.db"
 
-_EMA_ALPHA = float(os.getenv("CURRICULUM_EMA_ALPHA", "0.15"))
+_EMA_ALPHA = float(os.getenv("CURRICULUM_EMA_ALPHA", "0.20"))
 _UCB_C = float(os.getenv("CURRICULUM_UCB_C", "0.5"))
 _WARMUP_EPISODES = int(os.getenv("CURRICULUM_WARMUP", "2"))
 _DIFFICULTY_MIN = 0.20
@@ -198,15 +198,18 @@ class CurriculumController:
     def _compute_ema(self, db: sqlite3.Connection, new_score: float) -> float:
         """
         EMA maps score trend → difficulty.
-        Target: 0.3 + (score - 0.5) * 1.2  → clamped to [0.2, 0.95].
-        High score → harder next episode; low score → easier.
+        Target: linearly maps score ∈ [0, 1] to [DIFFICULTY_MIN, DIFFICULTY_MAX].
+          score=0   → target=0.20 (floor)
+          score=0.5 → target=0.575 (neutral — holds middle difficulty)
+          score=1.0 → target=0.95 (ceiling)
+        Any score above 0.5 pushes difficulty up; below 0.5 pulls it down.
         """
         row = db.execute(
             "SELECT value FROM curriculum_state WHERE key = 'ema_difficulty'"
         ).fetchone()
         current = float(row[0]) if row else 0.40
 
-        target = 0.30 + (new_score - 0.50) * 1.20
+        target = _DIFFICULTY_MIN + new_score * (_DIFFICULTY_MAX - _DIFFICULTY_MIN)
         target = max(_DIFFICULTY_MIN, min(_DIFFICULTY_MAX, target))
         new_ema = (1.0 - _EMA_ALPHA) * current + _EMA_ALPHA * target
         return round(max(_DIFFICULTY_MIN, min(_DIFFICULTY_MAX, new_ema)), 4)

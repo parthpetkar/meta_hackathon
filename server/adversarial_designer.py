@@ -149,6 +149,15 @@ class AdversarialDesigner:
                 max_tokens=1400,
             ).choices[0].message.content or "{}"
 
+            raw = raw.strip()
+            if raw.startswith("```json"):
+                raw = raw[7:]
+            elif raw.startswith("```"):
+                raw = raw[3:]
+            if raw.endswith("```"):
+                raw = raw[:-3]
+            raw = raw.strip()
+
             data = json.loads(raw)
             scenario = AdversarialCICDScenario(**data)
             # Validate: ensure root_cause_fault is actually marked is_root_cause

@@ -75,6 +75,38 @@ def apply_fix(workspace: str, fix_text: str, target: str = "") -> FixResult:
 
 # ── Strategy A: Structured JSON ────────────────────────────────────────────
 
+_PATH_SEARCH_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv"}
+
+
+def _resolve_workspace_path(workspace: str, rel: str, create_ok: bool = False) -> Optional[str]:
+    """Resolve a user-supplied path against the workspace.
+
+    If the path exists as given, return it unchanged. Otherwise search the
+    workspace for a file with the same basename and return its relative path
+    if exactly one match is found. For create_ok=True (write action) with no
+    match, fall back to the original path so a new file can be created.
+    """
+    rel_norm = rel.replace("\\", "/").lstrip("./")
+    direct = os.path.join(workspace, rel_norm)
+    if os.path.exists(direct):
+        return rel_norm
+
+    basename = os.path.basename(rel_norm)
+    matches: List[str] = []
+    for root, dirs, files in os.walk(workspace):
+        dirs[:] = [d for d in dirs if d not in _PATH_SEARCH_SKIP_DIRS]
+        if basename in files:
+            matches.append(os.path.relpath(os.path.join(root, basename), workspace).replace("\\", "/"))
+            if len(matches) > 1:
+                break
+
+    if len(matches) == 1:
+        return matches[0]
+    if create_ok:
+        return rel_norm
+    return None
+
+
 def _try_structured_fix(workspace: str, fix_text: str) -> Optional[FixResult]:
     """Parse a JSON fix object (or list) and apply it to real files."""
     json_str = fix_text.strip()
@@ -103,8 +135,12 @@ def _try_structured_fix(workspace: str, fix_text: str) -> Optional[FixResult]:
         if not isinstance(fix_obj, dict) or "file" not in fix_obj:
             continue
         last_obj = fix_obj
-        filepath = os.path.join(workspace, fix_obj["file"])
         action = fix_obj.get("action", "replace")
+        resolved_rel = _resolve_workspace_path(workspace, fix_obj["file"], create_ok=(action == "write"))
+        if resolved_rel is None:
+            continue
+        fix_obj["file"] = resolved_rel
+        filepath = os.path.join(workspace, resolved_rel)
         try:
             if action == "replace":
                 old, new = fix_obj.get("old", ""), fix_obj.get("new", "")
@@ -170,6 +206,30 @@ def _apply_heuristic_fix(workspace: str, fix_text: str, target: str = "") -> Fix
     elif any(kw in fix_lower for kw in ["flaky", "retry", "test isolation", "timing", "intermittent"]):
         modified = _fix_flaky_test(workspace)
         description = "Removed flaky timing-sensitive test"
+
+    elif any(kw in fix_lower for kw in ["pii", "log call", "token_in_log", "log.*sk-", "routes.*log", "logging.*pii", "log.*credential"]):
+        modified = _fix_log_pii_leak(workspace)
+        description = "Removed PII-leaking log call from routes.py"
+
+    elif any(kw in fix_lower for kw in ["json.dumps", "str(payload", "formatter", "log_bad_config", "malformed", "not valid json"]):
+        modified = _fix_log_bad_config(workspace)
+        description = "Restored json.dumps in logging formatter"
+
+    elif any(kw in fix_lower for kw in ["log_path", "var/log", "restricted", "log_path_unwritable", "cannot write", "unwritable"]):
+        modified = _fix_log_path(workspace)
+        description = "Restored LOG_PATH to writable application directory"
+
+    elif any(kw in fix_lower for kw in ["rotatingfilehandler", "rotation", "log_rotation", "unbounded", "filehandler"]):
+        modified = _fix_log_rotation(workspace)
+        description = "Restored RotatingFileHandler for log rotation"
+
+    elif any(kw in fix_lower for kw in ["critical", "log_level", "log_disabled", "silenced", "silent", "log level"]):
+        modified = _fix_log_disabled(workspace)
+        description = "Restored LOG_LEVEL to INFO from CRITICAL"
+
+    elif any(kw in fix_lower for kw in ["log volume", "volume mount", "log_volume", "./logs"]):
+        modified = _fix_log_volume(workspace)
+        description = "Restored log volume mount in docker-compose.yml"
 
     elif any(kw in fix_lower for kw in ["permission", "network", "external", "compose", "volume"]):
         modified = _fix_missing_permission(workspace)
@@ -355,11 +415,125 @@ def _fix_secret_exposure(workspace: str) -> List[str]:
     return modified
 
 
+def _fix_log_pii_leak(workspace: str) -> List[str]:
+    """Remove _log.warning/error calls that embed a plaintext sk-live- token."""
+    path = os.path.join(workspace, "services", "api", "routes.py")
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    # Remove the injected warning block and the FAULT comment above it
+    cleaned = re.sub(
+        r'\n# FAULT\(log_pii_leak\)[^\n]*\n_log\.\w+\s*\(\n[^)]*\),?\n\)\n',
+        '\n',
+        content,
+    )
+    # Broader fallback: remove any _log call that embeds a sk-live/sk-test/AKIA token
+    cleaned = re.sub(
+        r'_log\.\w+\s*\(\s*\n?\s*["\'][^"\']*(?:sk-live|sk-test|AKIA)[^"\']*["\']\s*,?\s*\n?\s*\)',
+        '',
+        cleaned,
+    )
+    if cleaned == content:
+        return []
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(cleaned)
+    return ["services/api/routes.py"]
+
+
+def _fix_log_bad_config(workspace: str) -> List[str]:
+    path = os.path.join(workspace, "services", "api", "logging_config.py")
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    cleaned = content.replace(
+        "return str(payload)  # FAULT(log_bad_config): not valid JSON output",
+        "return json.dumps(payload, ensure_ascii=False)",
+    )
+    if cleaned == content:
+        return []
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(cleaned)
+    return ["services/api/logging_config.py"]
+
+
+def _fix_log_path(workspace: str) -> List[str]:
+    path = os.path.join(workspace, "services", "api", "logging_config.py")
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    cleaned = re.sub(
+        r'LOG_PATH\s*:\s*str\s*=\s*["\'][/][^"\']+["\'].*#.*FAULT\(log_path_unwritable\)[^\n]*',
+        'LOG_PATH: str = os.environ.get("LOG_PATH", "/app/logs/app.log")',
+        content,
+    )
+    if cleaned == content:
+        return []
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(cleaned)
+    return ["services/api/logging_config.py"]
+
+
+def _fix_log_rotation(workspace: str) -> List[str]:
+    path = os.path.join(workspace, "services", "api", "logging_config.py")
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    cleaned = content.replace(
+        'logging.FileHandler(\n            str(path), encoding="utf-8"\n        )',
+        'logging.handlers.RotatingFileHandler(\n            str(path), maxBytes=MAX_BYTES, backupCount=BACKUP_COUNT, encoding="utf-8"\n        )',
+    )
+    if cleaned == content:
+        return []
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(cleaned)
+    return ["services/api/logging_config.py"]
+
+
+def _fix_log_disabled(workspace: str) -> List[str]:
+    path = os.path.join(workspace, "services", "api", "logging_config.py")
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    cleaned = re.sub(
+        r'LOG_LEVEL\s*:\s*str\s*=\s*["\']CRITICAL["\'].*#.*FAULT\(log_disabled\)[^\n]*',
+        'LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO").upper()',
+        content,
+    )
+    if cleaned == content:
+        return []
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(cleaned)
+    return ["services/api/logging_config.py"]
+
+
+def _fix_log_volume(workspace: str) -> List[str]:
+    path = os.path.join(workspace, "docker-compose.yml")
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    cleaned = content.replace(
+        "      # FAULT(log_volume_missing): log volume mount removed\n      # - ./logs:/app/logs",
+        "      - ./logs:/app/logs",
+    )
+    if cleaned == content:
+        return []
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(cleaned)
+    return ["docker-compose.yml"]
+
+
 # ── Strategy C: Generic auto-repair ────────────────────────────────────────
 
 _SOURCE_FILES = [
     "services/api/routes.py",
     "services/api/app.py",
+    "services/api/logging_config.py",
     "services/api/requirements.txt",
     "Dockerfile",
     "docker-compose.yml",
@@ -385,7 +559,9 @@ def _auto_repair_workspace(workspace: str, error_hint: str = "") -> FixResult:
     Applies multiple passes in order of specificity:
       1. Merge conflict markers in any file
       2. Python syntax errors (attempts structural cleanup)
-      3. Hardcoded secrets / credentials
+      3. Hardcoded secrets / credentials in _SOURCE_FILES
+      3b. Logging faults (PII leak, bad config, path, rotation, disabled, volume)
+      3c. Missing requirements.txt at workspace root
       4. requirements.txt with pinned-to-broken versions
       5. Dockerfile ordering (COPY before RUN pip)
       6. docker-compose network/healthcheck issues
@@ -434,7 +610,27 @@ def _auto_repair_workspace(workspace: str, error_hint: str = "") -> FixResult:
                 f.write(content)
             modified.append(rel_path)
 
-    # Pass 3b — missing requirements.txt at workspace root (Dockerfile COPY target)
+    # Pass 3b — logging faults (applied before generic passes to avoid false rewrites)
+    if not modified:
+        routes_modified = _fix_log_pii_leak(workspace)
+        modified.extend(routes_modified)
+    if not modified:
+        lc_modified = _fix_log_bad_config(workspace)
+        modified.extend(lc_modified)
+    if not modified:
+        lc_modified = _fix_log_path(workspace)
+        modified.extend(lc_modified)
+    if not modified:
+        lc_modified = _fix_log_rotation(workspace)
+        modified.extend(lc_modified)
+    if not modified:
+        lc_modified = _fix_log_disabled(workspace)
+        modified.extend(lc_modified)
+    if not modified:
+        dc_modified = _fix_log_volume(workspace)
+        modified.extend(dc_modified)
+
+    # Pass 3c — missing requirements.txt at workspace root (Dockerfile COPY target)
     # Common when agents experiment: they create/delete files and break the build context.
     # If a canonical services/api/requirements.txt exists, mirror it to the root so
     # `COPY requirements.txt .` Dockerfiles succeed.
