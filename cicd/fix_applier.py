@@ -29,6 +29,10 @@ class FixResult:
     strategy_used: str = ""
     error: str = ""
     description: str = ""
+    # True when the agent's own JSON/text was what caused the fix.
+    # False when the server's fault-type routing or auto-repair fired instead.
+    # Surfaced in the observation so the agent knows whether its fix was correct.
+    agent_intent_matched: bool = True
 
 
 # ── Git helpers ────────────────────────────────────────────────────────────
@@ -185,6 +189,7 @@ def _apply_fault_type_fix(workspace: str, fault_type: str) -> FixResult:
     return FixResult(
         success=True, files_modified=modified, commit_sha=sha,
         strategy_used="fault_type_route", description=description,
+        agent_intent_matched=False,  # server routed this, not the agent's text
     )
 
 

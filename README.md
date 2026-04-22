@@ -41,15 +41,15 @@ Runtime architecture (current):
 
 - `server/environment.py` hosts `RealCICDRepairEnvironment` and action dispatch.
 - `server/rubric_judge.py` provides delayed reward rubric scoring with provider-aware fallback.
-- `server/agent_memory.py` stores persistent cross-episode fix memory in SQLite.
-- `server/curriculum.py` adapts difficulty from episode outcomes.
-- `server/adversarial_designer.py` composes LLM-designed multi-fault incidents.
+- `server/agent_memory.py` stores persistent cross-episode fix memory in SQLite with semantic retrieval.
+- `server/curriculum.py` adapts difficulty from episode outcomes, tracked per (fault_type, difficulty_bucket).
+- `server/adversarial_designer.py` composes LLM-designed multi-fault incidents with constrained generation.
 - `server/adversarial_judge.py` applies phase-aware adversarial reward shaping.
-- `cicd/fault_injector.py` injects task faults into the episode workspace.
+- `cicd/fault_injector.py` injects task faults into the episode workspace; each fault carries `expected_error_patterns` derived from its actual mutations.
 - `cicd/pipeline_runner.py` executes `clone -> build -> test -> deploy` via subprocess.
 - `cicd/observation_builder.py` builds surfaced errors/logs/config snapshots.
-- `cicd/drift_injector.py` performs opt-in mid-episode drift mutations.
-- `cicd/fix_applier.py` applies structured JSON or heuristic fixes and commits successful changes.
+- `cicd/drift_injector.py` performs opt-in mid-episode drift mutations targeting the active compose file.
+- `cicd/fix_applier.py` applies structured JSON or fault-type-routed fixes; surfaces `agent_intent_matched` so the agent knows which strategy fired.
 
 ## Architecture
 
@@ -143,12 +143,14 @@ When `META_HACKATHON_AUDIT_TRAIL=true`, observation metadata also includes deter
 
 ## Reward structure
 
+Per-step rewards are small shaping signals. The terminal outcome is the dominant learning signal (0.60 max for full resolution), making it harder for agents to game the reward by performing the correct ritual without actually fixing the pipeline.
+
 Per-step reward schema:
 
 | Action type                                           | Reward  |
 | ----------------------------------------------------- | ------- |
-| `set_hypothesis` (correct, first try)                 | `+0.22` |
-| `set_hypothesis` (correct, retry)                     | `+0.10` |
+| `set_hypothesis` (correct, first try)                 | `+0.18` |
+| `set_hypothesis` (correct, retry)                     | `+0.08` |
 | `set_hypothesis` (wrong)                              | `-0.10` |
 | `inspect_*` (relevant stage)                          | `+0.12` |
 | `inspect_*` (irrelevant stage)                        | `-0.05` |
@@ -164,11 +166,34 @@ Per-step reward schema:
 | `finalize` (partial resolution)                       | `+0.20` |
 | `finalize` (incorrect state)                          | `-0.15` |
 
+Terminal score components (dominant signal):
+
+| Outcome                                    | Score   |
+| ------------------------------------------ | ------- |
+| Resolved + verified (genuine work)         | `+0.60` |
+| Resolved, not verified                     | `+0.40` |
+| Partial progress (pipeline advanced)       | `+0.20` |
+| Hypothesis correct                         | `+0.10` |
+| Fix hits > 0                               | `+0.05` |
+| Efficiency bonus (steps used vs budget)    | `+0.10` |
+
 Additional runtime scoring rules:
 
 - Repeating an identical `operation:target:value` gets a redundancy penalty (reward is clamped to at most `-0.08`).
 - Final score is computed at episode end in `server/environment.py` and is clipped to `[0.0, 1.0]`.
-- Final score components include: resolution status, hypothesis quality, fix hits, efficiency bonus, and penalties for redundant/destructive/wrong fixes.
+- `score_provenance` in observation metadata shows the deterministic score, rubric score, blend weight, and whether the rubric judge was reliable.
+
+## Hypothesis scoring
+
+Hypothesis scoring uses a **hybrid semantic + keyword** approach:
+
+1. **Semantic similarity** (primary): cosine similarity between the hypothesis embedding and the fault description + keywords, using `sentence-transformers/all-MiniLM-L6-v2`. Handles synonyms and paraphrasing. Requires `sentence-transformers` to be installed; falls back gracefully to keyword-only if unavailable.
+2. **Keyword matching** (floor): counts how many `FAULT_KEYWORDS` appear in the hypothesis text.
+3. **File mention** (bonus): checks if the affected file is named in the hypothesis.
+
+A hypothesis passes if `semantic_score >= 0.55` OR `keyword_hits >= 1` OR the affected file is mentioned. The finding shown to the agent includes both signals: `"Hypothesis aligns (semantic=72%, keywords=3/6)"`.
+
+Keywords in `FAULT_KEYWORDS` are supplemented by `expected_error_patterns` in `FaultMetadata`, which are derived from the actual fault mutations rather than maintained separately.
 
 ## Curriculum and LLM adversarial training
 

@@ -156,16 +156,73 @@ class AdversarialDesigner:
         }
 
         try:
-            raw = self._client.chat.completions.create(
-                model=self._model,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": ADVERSARIAL_DESIGNER_PROMPT},
-                    {"role": "user", "content": json.dumps(payload)},
-                ],
-                temperature=0.7,
-                max_tokens=1400,
-            ).choices[0].message.content or "{}"
+            # Build a JSON schema that constrains fault_type to the known enum.
+            # This prevents the LLM from hallucinating fault names at generation time
+            # rather than catching them in post-hoc validation.
+            scenario_schema = {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "narrative": {"type": "string"},
+                    "alert_message": {"type": "string"},
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "fault_type": {"type": "string", "enum": list(FAULT_TYPES)},
+                                "effect": {"type": "string"},
+                                "order": {"type": "integer", "minimum": 1},
+                                "is_root_cause": {"type": "boolean"},
+                                "depends_on": {"type": "array", "items": {"type": "integer"}},
+                            },
+                            "required": ["fault_type", "effect", "order", "is_root_cause", "depends_on"],
+                        },
+                    },
+                    "expected_triage": {"type": "array", "items": {"type": "string"}},
+                    "expected_investigation": {"type": "array", "items": {"type": "string"}},
+                    "expected_hypothesis_terms": {"type": "array", "items": {"type": "string"}},
+                    "expected_fix_sequence": {"type": "array", "items": {"type": "string"}},
+                    "expected_verification": {"type": "array", "items": {"type": "string"}},
+                    "red_herrings": {"type": "array", "items": {"type": "string"}},
+                    "root_cause_explanation": {"type": "string"},
+                    "difficulty": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "db_backend": {"type": "string", "enum": ["sqlite", "postgres"]},
+                    "db_faults": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["title", "narrative", "alert_message", "steps",
+                             "expected_hypothesis_terms", "red_herrings",
+                             "root_cause_explanation", "difficulty"],
+                "additionalProperties": False,
+            }
+
+            # Try constrained generation first (json_schema enforces fault_type enum)
+            try:
+                raw = self._client.chat.completions.create(
+                    model=self._model,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {"name": "cicd_scenario", "schema": scenario_schema, "strict": True},
+                    },
+                    messages=[
+                        {"role": "system", "content": ADVERSARIAL_DESIGNER_PROMPT},
+                        {"role": "user", "content": json.dumps(payload)},
+                    ],
+                    temperature=0.7,
+                    max_tokens=1400,
+                ).choices[0].message.content or "{}"
+            except Exception:
+                # Provider doesn't support json_schema — fall back to json_object
+                raw = self._client.chat.completions.create(
+                    model=self._model,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": ADVERSARIAL_DESIGNER_PROMPT},
+                        {"role": "user", "content": json.dumps(payload)},
+                    ],
+                    temperature=0.7,
+                    max_tokens=1400,
+                ).choices[0].message.content or "{}"
 
             raw = raw.strip()
             if raw.startswith("```json"):
@@ -184,10 +241,22 @@ class AdversarialDesigner:
                 data["db_faults"] = []
 
             scenario = AdversarialCICDScenario(**data)
-            # Validate: ensure root_cause_fault is actually marked is_root_cause
+
+            # Validate 1: root_cause_fault must be marked is_root_cause
             if not any(s.is_root_cause and s.fault_type == root_cause_fault for s in scenario.steps):
                 LOGGER.warning("LLM ignored root_cause_fault=%s; using fallback", root_cause_fault)
                 return self._fallback_scenario(root_cause_fault, difficulty)
+
+            # Validate 2: all fault_types must exist in the known fault registry
+            valid_faults = set(FAULT_TYPES)
+            invalid = [s.fault_type for s in scenario.steps if s.fault_type not in valid_faults]
+            if invalid:
+                LOGGER.warning(
+                    "LLM returned unknown fault type(s) %s for root=%s; using fallback",
+                    invalid, root_cause_fault,
+                )
+                return self._fallback_scenario(root_cause_fault, difficulty)
+
             return scenario
 
         except Exception as exc:

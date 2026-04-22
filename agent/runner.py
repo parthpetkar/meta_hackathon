@@ -54,6 +54,24 @@ def _normalize_hypothesis(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").strip().lower())
 
 
+# Typed guardrail keys — prevents string collision bugs where two different
+# guardrails accidentally share the same deduplication key.
+from enum import Enum, auto
+
+class _GK(Enum):
+    """Guardrail key enum. Each variant is a distinct deduplication slot."""
+    FIX_HINT        = auto()   # structured JSON fix hint after hypothesis accepted
+    SURFACED_FILE   = auto()   # "inspect this file first" nudge
+    HYP_SURFACED    = auto()   # "inspect before hypothesis" nudge
+    DUP_HYPOTHESIS  = auto()   # duplicate hypothesis block
+    DUP_ACTION      = auto()   # duplicate action block
+
+
+def _gk(kind: _GK, qualifier: str = "") -> str:
+    """Build a unique string key from a typed enum + optional qualifier."""
+    return f"{kind.name}:{qualifier}"
+
+
 # Structured JSON fix template injected as a hint after hypothesis is accepted.
 _STRUCTURED_FIX_HINT = (
     "Hypothesis accepted. Now apply the fix using modify_config with a structured JSON value:\n"
@@ -309,7 +327,7 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                 surfaced_file = _extract_primary_surfaced_error_file(observation)
 
                 # Inject surfaced-file guardrail at most once per unique file
-                _sf_key = f"sf:{surfaced_file}"
+                _sf_key = _gk(_GK.SURFACED_FILE, surfaced_file)
                 if (
                     surfaced_file
                     and surfaced_file not in inspected_config_targets
@@ -328,7 +346,7 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                     )
                     should_resample = True
 
-                _hyp_sf_key = f"hyp_sf:{surfaced_file}"
+                _hyp_sf_key = _gk(_GK.HYP_SURFACED, surfaced_file)
                 if (
                     operation == "set_hypothesis"
                     and surfaced_file
@@ -350,7 +368,7 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                 if operation == "set_hypothesis":
                     normalized_hypothesis = _normalize_hypothesis(value)
                     if normalized_hypothesis and normalized_hypothesis in attempted_hypotheses:
-                        _dup_hyp_key = f"dup_hyp:{normalized_hypothesis}"
+                        _dup_hyp_key = _gk(_GK.DUP_HYPOTHESIS, normalized_hypothesis)
                         if _dup_hyp_key not in injected_guardrails:
                             injected_guardrails.add(_dup_hyp_key)
                             messages.append(
@@ -371,7 +389,7 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                     and not (operation == "rerun_pipeline" and fix_applied_since_rerun)
                 )
                 if rerun_blocked:
-                    _dup_act_key = f"dup_act:{operation}:{target}"
+                    _dup_act_key = _gk(_GK.DUP_ACTION, f"{operation}:{target}")
                     if _dup_act_key not in injected_guardrails:
                         injected_guardrails.add(_dup_act_key)
                         messages.append(
@@ -459,8 +477,8 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
             if operation == "inspect_config" and target:
                 inspected_config_targets.add(target)
                 # Re-enable surfaced-file guardrail if a new file appears later
-                injected_guardrails.discard(f"sf:{target}")
-                injected_guardrails.discard(f"hyp_sf:{target}")
+                injected_guardrails.discard(_gk(_GK.SURFACED_FILE, target))
+                injected_guardrails.discard(_gk(_GK.HYP_SURFACED, target))
             if operation in {"modify_config", "add_dependency"} and value:
                 fix_applied_since_rerun = True
                 # After any fix, push the agent to rerun immediately so it sees the
@@ -481,8 +499,8 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                     attempted_hypotheses.add(normalized_hypothesis)
                 if reward > 0:
                     hypothesis_accepted = True
-                    if "fix_hint_sent" not in injected_guardrails:
-                        injected_guardrails.add("fix_hint_sent")
+                    if _gk(_GK.FIX_HINT) not in injected_guardrails:
+                        injected_guardrails.add(_gk(_GK.FIX_HINT))
                         forced_messages.append(_STRUCTURED_FIX_HINT)
                 elif reward < 0:
                     forced_messages.append(

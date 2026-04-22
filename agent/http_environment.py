@@ -109,12 +109,16 @@ def format_obs_for_llm(observation: MetaHackathonObservation, step_num: int) -> 
 
     def _redact_secrets(text: str) -> str:
         """Replace token-like values with a placeholder so they don't trip content filters."""
-        # Matches common secret prefixes followed by hex/alphanumeric token bodies
         return _re.sub(
             r"(sk-live-|sk-test-|sk_live_|sk_test_|AKIA|ghp_|gho_|github_pat_|whsec_|gsk_)[A-Za-z0-9_\-]{8,}",
             r"\1[REDACTED]",
             text,
         )
+
+    # Hard character budget for the entire observation string.
+    # Keeps the serialised observation well under typical 8k-token context limits
+    # even at high difficulty with many findings and long log tails.
+    _OBS_BUDGET = 3000
 
     parts: List[str] = []
     errors = observation.surfaced_errors or []
@@ -151,7 +155,11 @@ def format_obs_for_llm(observation: MetaHackathonObservation, step_num: int) -> 
     if observation.drift_detected:
         parts.append("*** WORLD DRIFT DETECTED - re-triage active failure before finalizing ***")
 
-    return "\n".join(parts)
+    # Enforce total size budget: truncate from the end, keeping the most recent parts.
+    result = "\n".join(parts)
+    if len(result) > _OBS_BUDGET:
+        result = result[:_OBS_BUDGET] + "\n... [observation truncated to fit context budget]"
+    return result
 
 
 def trim_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

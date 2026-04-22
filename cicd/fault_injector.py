@@ -25,6 +25,12 @@ class FaultMetadata:
     affected_apps: List[str] = field(default_factory=list)
     cascade_faults: List[str] = field(default_factory=list)
     red_herring: str = ""
+    # Strings actually injected into files — used to derive keywords from
+    # fault behavior rather than a separate hand-maintained list.
+    injected_strings: List[str] = field(default_factory=list)
+    # Regex patterns that will appear in pipeline output when this fault fires.
+    # Hypothesis scoring can match against these instead of FAULT_KEYWORDS.
+    expected_error_patterns: List[str] = field(default_factory=list)
 
 
 FAULT_TYPES = [
@@ -121,6 +127,28 @@ FAULT_AFFECTED_APPS: Dict[str, List[str]] = {
     "dependency_version_drift": ["api-service", "worker"],
 }
 
+# Regex patterns that will appear in real pipeline output when each fault fires.
+# These are derived from the actual mutations, not hand-maintained separately.
+# Used by semantic/hybrid hypothesis scoring as ground-truth signal.
+FAULT_ERROR_PATTERNS: Dict[str, List[str]] = {
+    "merge_conflict":        [r"SyntaxError", r"<<<<<<", r"invalid syntax"],
+    "dependency_conflict":   [r"ResolutionImpossible", r"urllib3", r"requests.*2\.28"],
+    "docker_order":          [r"COPY.*requirements", r"no such file.*requirements"],
+    "flaky_test":            [r"test_response_time", r"elapsed.*expected"],
+    "missing_permission":    [r"network.*not found", r"corp-internal-network"],
+    "secret_exposure":       [r"SECRET SCAN FAILED", r"sk-live-", r"hardcoded"],
+    "env_drift":             [r"not-a-number", r"invalid.*port", r"PORT"],
+    "log_bad_config":        [r"str\(payload\)", r"not valid JSON", r"malformed"],
+    "log_path_unwritable":   [r"/var/log/restricted", r"Permission denied", r"LOG_PATH"],
+    "log_volume_missing":    [r"log volume mount removed", r"logs:/app/logs", r"FAULT\(log_volume"],
+    "log_rotation_missing":  [r"FileHandler", r"RotatingFileHandler", r"rotation"],
+    "log_pii_leak":          [r"sk-live-", r"Auth token received", r"FAULT\(log_pii"],
+    "log_disabled":          [r"CRITICAL", r"FAULT\(log_disabled\)", r"log_level"],
+    "shared_secret_rotation": [r"AUTH_SECRET", r"rotated-secret", r"401"],
+    "infra_port_conflict":   [r"5000:8000.*FAULT", r"port.*conflict", r"address already in use"],
+    "dependency_version_drift": [r"fastapi", r"pydantic", r"ResolutionImpossible"],
+}
+
 
 # ── Git helpers ────────────────────────────────────────────────────────────
 
@@ -190,6 +218,7 @@ def inject_fault(workspace: str, fault_type: str) -> FaultMetadata:
     metadata.expected_fail_stage = FAULT_STAGE_MAP[fault_type]
     metadata.keywords = FAULT_KEYWORDS[fault_type]
     metadata.affected_apps = FAULT_AFFECTED_APPS.get(fault_type, [])
+    metadata.expected_error_patterns = FAULT_ERROR_PATTERNS.get(fault_type, [])
     return metadata
 
 
@@ -437,13 +466,16 @@ def _inject_log_bad_config(workspace: str) -> FaultMetadata:
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    # Replace the JSON serialisation call — logs become non-JSON, breaking check_logs
-    content = content.replace(
-        "return json.dumps(payload, ensure_ascii=False)",
-        "return str(payload)  # FAULT(log_bad_config): not valid JSON output",
-    )
+    old = "return json.dumps(payload, ensure_ascii=False)"
+    new = "return str(payload)  # FAULT(log_bad_config): not valid JSON output"
+    new_content = content.replace(old, new)
+    if new_content == content:
+        raise RuntimeError(
+            "_inject_log_bad_config: target string not found in logging_config.py — "
+            "template may have drifted from expected content"
+        )
     with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+        f.write(new_content)
 
     sha = _commit(workspace, "refactor: simplify log formatter for performance", [path])
     return FaultMetadata(
@@ -460,13 +492,16 @@ def _inject_log_path_unwritable(workspace: str) -> FaultMetadata:
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    # Hardcode LOG_PATH to bypass the env override and point to an unwritable system dir
-    content = content.replace(
-        'LOG_PATH: str = os.environ.get("LOG_PATH", "/app/logs/app.log")',
-        'LOG_PATH: str = "/var/log/restricted/app.log"  # FAULT(log_path_unwritable)',
-    )
+    old = 'LOG_PATH: str = os.environ.get("LOG_PATH", "/app/logs/app.log")'
+    new = 'LOG_PATH: str = "/var/log/restricted/app.log"  # FAULT(log_path_unwritable)'
+    new_content = content.replace(old, new)
+    if new_content == content:
+        raise RuntimeError(
+            "_inject_log_path_unwritable: LOG_PATH line not found in logging_config.py — "
+            "template may have drifted from expected content"
+        )
     with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+        f.write(new_content)
 
     sha = _commit(workspace, "ops: centralise log output to system log directory", [path])
     return FaultMetadata(
@@ -512,15 +547,20 @@ def _inject_log_rotation_missing(workspace: str) -> FaultMetadata:
         content = f.read()
 
     import re as _re
-    content = _re.sub(
+    new_content = _re.sub(
         r"logging\.handlers\.RotatingFileHandler\(\s*\n?"
         r"\s*str\(path\), maxBytes=MAX_BYTES, backupCount=BACKUP_COUNT, encoding=\"utf-8\"\s*\n?"
         r"\s*\)",
         'logging.FileHandler(\n            str(path), encoding="utf-8"\n        )',
         content,
     )
+    if new_content == content:
+        raise RuntimeError(
+            "_inject_log_rotation_missing: RotatingFileHandler pattern not found in logging_config.py — "
+            "template may have drifted from expected content"
+        )
     with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+        f.write(new_content)
 
     sha = _commit(workspace, "chore: simplify file handler — remove unused rotation config", [path])
     return FaultMetadata(
@@ -537,19 +577,21 @@ def _inject_log_pii_leak(workspace: str) -> FaultMetadata:
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    # Insert after the module-level logger assignment
+    anchor = '_log = logging.getLogger("api.routes")'
+    if anchor not in content:
+        raise RuntimeError(
+            "_inject_log_pii_leak: logger assignment not found in routes.py — "
+            "template may have drifted from expected content"
+        )
     leak_line = (
         '\n# FAULT(log_pii_leak): credential value logged directly\n'
         '_log.warning(\n'
         '    "Auth token received: sk-live-4f3c2a1b0e9d8c7f6a5b4e3d2c1a0f9e8d7c6b5a",\n'
         ')\n'
     )
-    content = content.replace(
-        '_log = logging.getLogger("api.routes")',
-        '_log = logging.getLogger("api.routes")' + leak_line,
-    )
+    new_content = content.replace(anchor, anchor + leak_line)
     with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+        f.write(new_content)
 
     sha = _commit(workspace, "debug: add auth diagnostics for token validation", [path])
     return FaultMetadata(
@@ -566,12 +608,16 @@ def _inject_log_disabled(workspace: str) -> FaultMetadata:
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    content = content.replace(
-        'LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO").upper()',
-        'LOG_LEVEL: str = "CRITICAL"  # FAULT(log_disabled): hardcoded, overrides env var',
-    )
+    old = 'LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO").upper()'
+    new = 'LOG_LEVEL: str = "CRITICAL"  # FAULT(log_disabled): hardcoded, overrides env var'
+    new_content = content.replace(old, new)
+    if new_content == content:
+        raise RuntimeError(
+            "_inject_log_disabled: LOG_LEVEL line not found in logging_config.py — "
+            "template may have drifted from expected content"
+        )
     with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+        f.write(new_content)
 
     sha = _commit(workspace, "perf: suppress non-critical log output in production", [path])
     return FaultMetadata(

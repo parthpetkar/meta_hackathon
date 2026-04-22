@@ -192,6 +192,14 @@ class EpisodeState:
     procedural_mode: bool = False
     drift_detected: bool = False
 
+    # Path index: maps basename and relative path → canonical relative path.
+    # Built once at episode start; used by _resolve_episode_config_target for
+    # O(1) lookup instead of a heuristic filesystem walk.
+    path_index: Dict[str, str] = field(default_factory=dict)
+
+    # Episode step budget — stored here so reset() and step() always agree.
+    max_steps: int = 20
+
 
 def _extract_config_path_from_text(text: str) -> str:
     patterns = [
@@ -210,74 +218,164 @@ def _extract_config_path_from_text(text: str) -> str:
     return ""
 
 
+def _semantic_hypothesis_score(hypothesis: str, fault_metadata: "FaultMetadata") -> float:
+    """Compute cosine similarity between the hypothesis and the fault description.
+
+    Uses sentence-transformers (all-MiniLM-L6-v2) when available.
+    Falls back to 0.0 gracefully so keyword scoring takes over.
+
+    The reference text is the fault description + keywords joined together,
+    which is derived from the actual fault behavior rather than a separate
+    hand-maintained list.
+    """
+    try:
+        from sentence_transformers import SentenceTransformer  # type: ignore
+        import numpy as np  # type: ignore
+    except ImportError:
+        return 0.0
+
+    # Lazy-load and cache the model at module level to avoid reloading per call
+    global _SEMANTIC_MODEL
+    if _SEMANTIC_MODEL is None:
+        try:
+            _SEMANTIC_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+        except Exception:
+            return 0.0
+
+    # Build reference text from fault description + keywords + error patterns
+    reference_parts = [fault_metadata.description]
+    reference_parts.extend(fault_metadata.keywords)
+    reference_parts.extend(fault_metadata.expected_error_patterns)
+    reference = " ".join(p for p in reference_parts if p)
+
+    if not reference.strip():
+        return 0.0
+
+    try:
+        h_emb = _SEMANTIC_MODEL.encode(hypothesis, convert_to_numpy=True)
+        r_emb = _SEMANTIC_MODEL.encode(reference, convert_to_numpy=True)
+        # Cosine similarity
+        sim = float(np.dot(h_emb, r_emb) / (np.linalg.norm(h_emb) * np.linalg.norm(r_emb) + 1e-9))
+        return max(0.0, min(1.0, sim))
+    except Exception:
+        return 0.0
+
+
+# Module-level cache for the sentence transformer model
+_SEMANTIC_MODEL = None
+
+
+def _build_path_index(workspace_dir: str) -> Dict[str, str]:
+    """Build a mapping of basename → canonical relative path for every file in the workspace.
+
+    This replaces the heuristic filesystem walk in _resolve_episode_config_target with
+    an O(1) dict lookup. Built once at episode start so the cost is paid upfront.
+
+    Rules:
+    - Exact relative path always wins (e.g. "services/api/routes.py" → itself).
+    - Basename maps to the relative path of the last file with that name found during
+      the walk (deeper paths win over shallower ones for disambiguation).
+    - .git directory is excluded.
+    """
+    index: Dict[str, str] = {}
+    skip = {".git", "__pycache__", ".venv", "node_modules"}
+    for root, dirs, files in os.walk(workspace_dir):
+        dirs[:] = [d for d in dirs if d not in skip]
+        for fname in files:
+            abs_path = os.path.join(root, fname)
+            rel = os.path.relpath(abs_path, workspace_dir).replace("\\", "/")
+            # Exact relative path lookup
+            index[rel] = rel
+            # Basename lookup (last writer wins — deeper paths preferred)
+            index[fname] = rel
+            # Also index partial paths like "api/routes.py" → "services/api/routes.py"
+            parts = rel.split("/")
+            for i in range(1, len(parts)):
+                partial = "/".join(parts[i:])
+                if partial not in index:
+                    index[partial] = rel
+    return index
+
+
 def _resolve_episode_config_target(ep: EpisodeState, target: str) -> str:
-    filepath = target.replace("\\", "/").lstrip("./")
-    if not filepath:
-        return filepath
+    """Resolve an agent-supplied path to a canonical relative path in the workspace.
 
-    direct_path = os.path.join(ep.workspace_dir, filepath)
-    if os.path.exists(direct_path):
-        return filepath
+    Uses the pre-built path_index for O(1) lookup. Falls back to the raw target
+    if nothing matches (the file may not exist yet, e.g. for a write action).
+    """
+    if not target:
+        return target
 
-    normalized_target = filepath.split("/")[-1].lower()
+    # Normalise: strip leading ./ and backslashes
+    normalised = target.replace("\\", "/").lstrip("./").strip()
 
-    if normalized_target in STAGE_ORDER:
-        surfaced_errors = build_surfaced_errors(ep.pipeline_result or PipelineResult(), ep.workspace_dir)
-        for err in surfaced_errors:
-            candidate = _extract_config_path_from_text(str(err))
-            if candidate and os.path.exists(os.path.join(ep.workspace_dir, candidate)):
-                return candidate
+    # 1. Direct hit in index (exact rel path, basename, or partial path)
+    if normalised in ep.path_index:
+        return ep.path_index[normalised]
 
-        if ep.last_fix_result and ep.last_fix_result.files_modified:
-            candidate = ep.last_fix_result.files_modified[0].replace("\\", "/")
-            if os.path.exists(os.path.join(ep.workspace_dir, candidate)):
-                return candidate
+    # 2. Case-insensitive fallback
+    lower = normalised.lower()
+    for key, val in ep.path_index.items():
+        if key.lower() == lower:
+            return val
 
-        if ep.fault_metadata:
-            for candidate in ep.fault_metadata.affected_files:
-                normalized_candidate = candidate.replace("\\", "/")
-                if os.path.exists(os.path.join(ep.workspace_dir, normalized_candidate)):
-                    return normalized_candidate
+    # 3. Stage name → use fault metadata to find the affected file
+    if normalised in STAGE_ORDER and ep.fault_metadata:
+        for candidate in ep.fault_metadata.affected_files:
+            rel = candidate.replace("\\", "/")
+            if rel in ep.path_index:
+                return ep.path_index[rel]
 
-    for cfg in KNOWN_CONFIG_PATHS:
-        if normalized_target == os.path.basename(cfg).lower() or normalized_target in cfg.lower():
-            return cfg
-
-    for root, dirs, files in os.walk(ep.workspace_dir):
-        dirs[:] = [d for d in dirs if d != ".git"]
-        for file_name in files:
-            if file_name.lower() == normalized_target:
-                return os.path.relpath(
-                    os.path.join(root, file_name), ep.workspace_dir
-                ).replace("\\", "/")
-
-    return filepath
+    # 4. Return as-is (may be a new file path for write actions)
+    return normalised
 
 
 def _canonical_operation(operation: str) -> str:
-    """Normalize operation name to canonical form."""
+    """Normalize operation name to canonical form using fuzzy matching.
+
+    Handles underscores, hyphens, spaces, camelCase, and common abbreviations
+    so the agent is never penalized for minor formatting variation.
+    """
+    if not operation:
+        return operation
+
+    # Step 1: camelCase → snake_case
+    s = re.sub(r"([a-z])([A-Z])", r"\1_\2", operation.strip()).lower()
+    # Step 2: collapse any separator (space, hyphen, dot) to underscore
+    s = re.sub(r"[\s\-\.]+", "_", s)
+    # Step 3: strip leading/trailing underscores
+    s = s.strip("_")
+
+    # Step 4: exact match against canonical set
+    if s in CANONICAL_OPERATIONS:
+        return s
+
+    # Step 5: explicit alias table for common abbreviations / typos
     aliases = {
-        "view-logs": "view_logs",
-        "viewlogs": "view_logs",
-        "inspect-config": "inspect_config",
-        "inspectconfig": "inspect_config",
-        "inspect-dockerfile": "inspect_dockerfile",
-        "inspectdockerfile": "inspect_dockerfile",
-        "inspect-permissions": "inspect_permissions",
+        "viewlogs":           "view_logs",
+        "view_log":           "view_logs",
+        "inspectconfig":      "inspect_config",
+        "inspect_cfg":        "inspect_config",
+        "inspectdockerfile":  "inspect_dockerfile",
+        "inspect_docker":     "inspect_dockerfile",
         "inspectpermissions": "inspect_permissions",
-        "set-hypothesis": "set_hypothesis",
-        "sethypothesis": "set_hypothesis",
-        "modify-config": "modify_config",
-        "modifyconfig": "modify_config",
-        "add-dependency": "add_dependency",
-        "adddependency": "add_dependency",
-        "rerun-pipeline": "rerun_pipeline",
-        "rerunpipeline": "rerun_pipeline",
-        "verify-fix": "verify_fix",
-        "verifyfix": "verify_fix",
+        "inspect_perms":      "inspect_permissions",
+        "sethypothesis":      "set_hypothesis",
+        "set_hyp":            "set_hypothesis",
+        "hypothesis":         "set_hypothesis",
+        "modifyconfig":       "modify_config",
+        "modify_cfg":         "modify_config",
+        "edit_config":        "modify_config",
+        "adddependency":      "add_dependency",
+        "add_dep":            "add_dependency",
+        "rerunpipeline":      "rerun_pipeline",
+        "rerun":              "rerun_pipeline",
+        "run_pipeline":       "rerun_pipeline",
+        "verifyfix":          "verify_fix",
+        "verify":             "verify_fix",
+        "check_fix":          "verify_fix",
     }
-    op = operation.lower().strip()
-    return aliases.get(op, op)
+    return aliases.get(s, s)
 
 
 try:
@@ -509,6 +607,8 @@ class RealCICDRepairEnvironment(Environment):
             curriculum_difficulty=curriculum_difficulty,
             episode_seed=episode_seed,
             procedural_mode=use_procedural_style,
+            path_index=_build_path_index(repo_dir),
+            max_steps=self._get_max_steps(fault_type),
         )
         self._episode = episode
 
@@ -604,7 +704,6 @@ class RealCICDRepairEnvironment(Environment):
 
         # Build max_steps — single source of truth via _get_max_steps
         max_steps = self._get_max_steps(fault_type)
-
         obs_dict = build_observation(
             pipeline_result=pipeline_result,
             workspace_dir=repo_dir,
@@ -711,7 +810,7 @@ class RealCICDRepairEnvironment(Environment):
         # Determine if episode is done
         done = False
         fault_type_for_steps = episode.fault_metadata.fault_type if episode.fault_metadata else "unknown"
-        max_steps = self._get_max_steps(fault_type_for_steps)
+        max_steps = episode.max_steps  # single source of truth — set at reset()
 
         if operation == "finalize":
             done = True
@@ -838,7 +937,17 @@ class RealCICDRepairEnvironment(Environment):
         return -0.05
 
     def _handle_set_hypothesis(self, ep: EpisodeState, value: str) -> float:
-        """Store hypothesis and score against real fault metadata."""
+        """Store hypothesis and score against real fault metadata.
+
+        Scoring uses a hybrid approach:
+          1. Semantic similarity — cosine similarity between hypothesis embedding
+             and the fault description (handles synonyms and paraphrasing).
+          2. Keyword matching — fallback floor using FAULT_KEYWORDS.
+          3. File mention — bonus signal if the affected file is named.
+
+        The semantic score is the primary signal; keywords provide a hard floor
+        so the scorer degrades gracefully when embeddings are unavailable.
+        """
         ep.current_hypothesis = value
         ep.hypothesis_history.append(value)
         ep.hypothesis_attempts += 1
@@ -846,14 +955,11 @@ class RealCICDRepairEnvironment(Environment):
         if not ep.fault_metadata:
             return -0.10
 
-        # Hypothesis is scored ONLY against the root cause fault's keywords.
-        # Accepting cascade-fault keywords here would give false-positive rewards
-        # when the agent guesses a secondary fault instead of the root cause,
-        # corrupting both the learning signal and the rubric score.
+        hypothesis_lower = value.lower()
+
+        # Build keyword pool (root cause only — not cascade faults)
         if ep.adversarial_scenario is not None:
-            # Use the scenario's declared hypothesis terms (root cause only)
             keywords = list(ep.adversarial_scenario.expected_hypothesis_terms)
-            # Also accept the root cause fault's own keyword list as a fallback
             root_fault_type = ep.fault_metadata.fault_type
             for kw in FAULT_KEYWORDS.get(root_fault_type, []):
                 if kw not in keywords:
@@ -861,27 +967,44 @@ class RealCICDRepairEnvironment(Environment):
         else:
             keywords = ep.fault_metadata.keywords or FAULT_KEYWORDS.get(ep.fault_metadata.fault_type, [])
 
-        match_count = sum(1 for kw in keywords if kw.lower() in hypothesis_lower)
-        match_ratio = match_count / max(len(keywords), 1)
+        # ── Semantic similarity (primary signal) ──────────────────────────
+        semantic_score = 0.0
+        try:
+            semantic_score = _semantic_hypothesis_score(value, ep.fault_metadata)
+        except Exception:
+            pass  # fall through to keyword-only scoring
 
-        # Also check if affected files are mentioned
+        # ── Keyword matching (floor / fallback) ───────────────────────────
+        keyword_hits = sum(1 for kw in keywords if kw.lower() in hypothesis_lower)
+        match_ratio = keyword_hits / max(len(keywords), 1)
+
+        # ── File mention bonus ────────────────────────────────────────────
         file_mentioned = any(
             os.path.basename(f).lower() in hypothesis_lower
             for f in ep.fault_metadata.affected_files
         )
 
-        # 1+ keyword OR file mentioned = correct (lenient to avoid misleading the agent)
-        if match_count >= 1 or file_mentioned:
+        # Passes if semantic similarity is high OR 1+ keywords hit OR file named
+        passes = semantic_score >= 0.55 or keyword_hits >= 1 or file_mentioned
+
+        if passes:
             ep.hypothesis_correct = True
-            ep.findings.append(f"Hypothesis partially aligns (matched {match_count}/{len(keywords)} keywords). Apply the fix.")
+            # Richer feedback: show both signals
+            sem_pct = int(semantic_score * 100)
+            ep.findings.append(
+                f"Hypothesis aligns (semantic={sem_pct}%, keywords={keyword_hits}/{len(keywords)}). Apply the fix."
+            )
             if ep.hypothesis_attempts == 1:
-                return 0.18 if match_ratio >= 0.4 else 0.12
-            return 0.08 if match_ratio >= 0.4 else 0.05
+                return 0.18 if (semantic_score >= 0.65 or match_ratio >= 0.4) else 0.12
+            return 0.08 if (semantic_score >= 0.65 or match_ratio >= 0.4) else 0.05
         else:
-            # Give a hint using the ROOT CAUSE fault's keywords (not cascading fault's)
             root_fault = ep.fault_metadata.fault_type
             hint_keywords = FAULT_KEYWORDS.get(root_fault, keywords)[:3]
-            ep.findings.append("Hypothesis does not match current evidence. Try mentioning: " + ", ".join(hint_keywords))
+            ep.findings.append(
+                f"Hypothesis does not match (semantic={int(semantic_score*100)}%, "
+                f"keywords={keyword_hits}/{len(keywords)}). "
+                "Try mentioning: " + ", ".join(hint_keywords)
+            )
             return -0.10
 
     def _handle_modify(self, ep: EpisodeState, operation: str, target: str, value: str) -> float:
@@ -905,7 +1028,11 @@ class RealCICDRepairEnvironment(Environment):
         ep.last_fix_result = fix_result
 
         if fix_result.success:
-            ep.findings.append(f"Fix applied: {fix_result.description}")
+            intent_note = (
+                "" if fix_result.agent_intent_matched
+                else f" (via {fix_result.strategy_used} — your JSON patch did not match file content)"
+            )
+            ep.findings.append(f"Fix applied{intent_note}: {fix_result.description}")
             ep.pending_fix_outcome = "applied"
             return 0.10
         else:
@@ -1152,7 +1279,6 @@ class RealCICDRepairEnvironment(Environment):
                 resolved=ep.incident_resolved,
                 steps_used=self._state.step_count,
             )
-
         pipeline_result = ep.pipeline_result or PipelineResult()
 
         return build_observation(
@@ -1194,6 +1320,17 @@ class RealCICDRepairEnvironment(Environment):
                 "supported_operations": CANONICAL_OPERATIONS,
                 "canonical_operations": CANONICAL_OPERATIONS,
                 "rubric_enabled": self._rubric_judge.is_active(),
+                # ScoreProvenance: explicit breakdown so agent/evaluator knows
+                # which scoring path fired and how reliable the score is.
+                "score_provenance": {
+                    "deterministic": round(deterministic_score, 3),
+                    "rubric": round(rubric_score, 3) if rubric_judge_used else None,
+                    "rubric_model": self._rubric_model if rubric_judge_used else None,
+                    "rubric_error": rubric_judge_error or None,
+                    "final": round(final_score, 3),
+                    "blend_weight": round(self._rubric_weight, 2) if rubric_judge_used else 0.0,
+                    "reliable": rubric_judge_used and not rubric_judge_error,
+                },
             },
         )
 
@@ -1224,46 +1361,52 @@ class RealCICDRepairEnvironment(Environment):
         }
 
     def _compute_final_score(self, ep: EpisodeState) -> float:
-        """Compute final episode score from real outcomes."""
+        """Compute final episode score from real outcomes.
+
+        Terminal reward is dominant (0.60 max) to make the agent optimize for
+        actually fixing the pipeline, not for performing the correct ritual.
+        Per-step rewards are small shaping signals; the terminal outcome is what
+        drives the learning signal.
+        """
         score = 0.0
 
         genuine_work = ep.fix_hits > 0 and ep.rerun_attempts > 0
 
-        # Base score from resolution — only credited if real repair work happened
+        # ── Terminal outcome (dominant signal, 0.60 max) ──────────────────
         if genuine_work and ep.incident_resolved and ep.verified_for_latest_rerun:
-            score += 0.50
+            score += 0.60   # full resolution on first verified pass
         elif genuine_work and ep.incident_resolved:
-            score += 0.30
+            score += 0.40   # resolved but not verified
         elif genuine_work and ep.last_rerun_progressed:
-            score += 0.20
+            score += 0.20   # partial progress
 
-        # Hypothesis quality
+        # ── Hypothesis quality (0.10 max) ─────────────────────────────────
         if ep.hypothesis_correct:
-            score += 0.15
-
-        # Fix quality
-        if ep.fix_hits > 0:
             score += 0.10
 
-        # Efficiency bonus
+        # ── Fix quality (0.05 max) ────────────────────────────────────────
+        if ep.fix_hits > 0:
+            score += 0.05
+
+        # ── Efficiency bonus (0.10 max) ───────────────────────────────────
         step_count = self._state.step_count
-        max_steps_map = {"easy": 16, "medium": 20, "network": 20, "security": 20, "hard": 25}
         difficulty = self._get_difficulty(ep.fault_metadata.fault_type if ep.fault_metadata else "medium")
-        max_steps = max_steps_map.get(difficulty, 15)
+        max_steps_map = {"easy": 16, "medium": 20, "network": 20, "security": 20, "hard": 25}
+        max_steps = max_steps_map.get(difficulty, 20)
         efficiency = max(0.0, 1.0 - (step_count / max_steps))
         score += efficiency * 0.10
 
-        # Penalties
+        # ── Penalties ─────────────────────────────────────────────────────
         score -= ep.redundant_actions * 0.02
         score -= ep.destructive_actions * 0.10
         score -= ep.wrong_fixes * 0.05
 
-        # Pipeline health factor
+        # ── Pipeline health factor ────────────────────────────────────────
         score *= ep.pipeline_health
 
         # Hard cap when no genuine repair work was performed
         if not genuine_work:
-            score = min(score, 0.15)
+            score = min(score, 0.10)
 
         final = round(max(0.0, min(1.0, score)), 3)
         logger.debug(

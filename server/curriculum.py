@@ -34,16 +34,22 @@ def _conn() -> sqlite3.Connection:
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("""
         CREATE TABLE IF NOT EXISTS curriculum_episodes (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            fault_type  TEXT    NOT NULL,
-            difficulty  REAL    NOT NULL DEFAULT 0.5,
-            final_score REAL    NOT NULL DEFAULT 0.0,
-            resolved    INTEGER NOT NULL DEFAULT 0,
-            steps_used  INTEGER NOT NULL DEFAULT 0,
-            gym_mode    TEXT    NOT NULL DEFAULT 'standard',
-            created_at  REAL    NOT NULL
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            fault_type      TEXT    NOT NULL,
+            difficulty      REAL    NOT NULL DEFAULT 0.5,
+            difficulty_bucket TEXT  NOT NULL DEFAULT 'medium',
+            final_score     REAL    NOT NULL DEFAULT 0.0,
+            resolved        INTEGER NOT NULL DEFAULT 0,
+            steps_used      INTEGER NOT NULL DEFAULT 0,
+            gym_mode        TEXT    NOT NULL DEFAULT 'standard',
+            created_at      REAL    NOT NULL
         )
     """)
+    # Add difficulty_bucket column to existing databases that predate this schema
+    try:
+        db.execute("ALTER TABLE curriculum_episodes ADD COLUMN difficulty_bucket TEXT NOT NULL DEFAULT 'medium'")
+    except Exception:
+        pass  # column already exists
     db.execute("""
         CREATE TABLE IF NOT EXISTS curriculum_state (
             key   TEXT PRIMARY KEY,
@@ -52,6 +58,15 @@ def _conn() -> sqlite3.Connection:
     """)
     db.commit()
     return db
+
+
+def _difficulty_bucket(difficulty: float) -> str:
+    """Map a continuous difficulty value to a coarse bucket for UCB1 tracking."""
+    if difficulty < 0.40:
+        return "easy"
+    if difficulty < 0.70:
+        return "medium"
+    return "hard"
 
 
 class CurriculumController:
@@ -72,13 +87,14 @@ class CurriculumController:
         steps_used: int,
     ) -> None:
         """Persist episode outcome and update EMA difficulty."""
+        bucket = _difficulty_bucket(difficulty)
         db = _conn()
         try:
             db.execute(
                 "INSERT INTO curriculum_episodes "
-                "(fault_type, difficulty, final_score, resolved, steps_used, gym_mode, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (fault_type, difficulty, final_score, int(resolved), steps_used, "unified", time.time()),
+                "(fault_type, difficulty, difficulty_bucket, final_score, resolved, steps_used, gym_mode, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (fault_type, difficulty, bucket, final_score, int(resolved), steps_used, "unified", time.time()),
             )
             new_ema = self._compute_ema(db, final_score)
             db.execute(
@@ -104,16 +120,23 @@ class CurriculumController:
     def select_fault_type(self) -> str:
         """
         UCB1 selection: balances exploiting agent weaknesses vs. exploring all faults.
-        Falls back to round-robin until every fault has _WARMUP_EPISODES episodes.
+
+        Tracks win-rate per (fault_type, difficulty_bucket) so the curriculum
+        distinguishes between an agent that solves easy merge_conflict episodes
+        but fails hard ones. Falls back to round-robin during warmup.
         """
+        current_difficulty = self.get_difficulty()
+        current_bucket = _difficulty_bucket(current_difficulty)
+
         db = _conn()
         try:
-            stats = self._per_fault_stats(db)
+            stats = self._per_fault_stats(db, current_bucket)
             total = sum(s["attempts"] for s in stats.values())
         finally:
             db.close()
 
         # Warmup: ensure each fault type is seen at least _WARMUP_EPISODES times
+        # at the current difficulty bucket before switching to UCB1.
         for ft in FAULT_TYPES:
             if stats.get(ft, {}).get("attempts", 0) < _WARMUP_EPISODES:
                 return ft
@@ -133,11 +156,14 @@ class CurriculumController:
     def get_skill_profile(self) -> Dict[str, dict]:
         """
         Per-fault-type stats shaped for the adversarial designer.
+        Stats are scoped to the current difficulty bucket so the designer
+        sees the agent's actual weakness at the current challenge level.
         Mastery: low (<0.4 win_rate) / medium / high (>=0.7).
         """
+        current_bucket = _difficulty_bucket(self.get_difficulty())
         db = _conn()
         try:
-            stats = self._per_fault_stats(db)
+            stats = self._per_fault_stats(db, current_bucket)
         finally:
             db.close()
 
@@ -190,11 +216,24 @@ class CurriculumController:
 
     # ── internals ──────────────────────────────────────────────────────────
 
-    def _per_fault_stats(self, db: sqlite3.Connection) -> Dict[str, dict]:
-        rows = db.execute(
-            "SELECT fault_type, COUNT(*), AVG(final_score), SUM(resolved) "
-            "FROM curriculum_episodes GROUP BY fault_type"
-        ).fetchall()
+    def _per_fault_stats(self, db: sqlite3.Connection, difficulty_bucket: str = "") -> Dict[str, dict]:
+        """Return per-fault stats, optionally filtered to a specific difficulty bucket.
+
+        When difficulty_bucket is provided, only episodes at that bucket are counted.
+        This prevents easy-difficulty wins from masking hard-difficulty weaknesses.
+        """
+        if difficulty_bucket:
+            rows = db.execute(
+                "SELECT fault_type, COUNT(*), AVG(final_score), SUM(resolved) "
+                "FROM curriculum_episodes WHERE difficulty_bucket = ? "
+                "GROUP BY fault_type",
+                (difficulty_bucket,),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                "SELECT fault_type, COUNT(*), AVG(final_score), SUM(resolved) "
+                "FROM curriculum_episodes GROUP BY fault_type"
+            ).fetchall()
         return {
             ft: {
                 "attempts": attempts,
