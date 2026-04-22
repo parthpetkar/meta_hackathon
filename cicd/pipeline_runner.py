@@ -127,12 +127,14 @@ class PipelineRunner:
         image_tag: str = "",
         timeout_per_stage: int = 300,
         secret_scan_enabled: bool = True,
+        log_config_check_enabled: bool = True,
     ):
         self.repo_path = os.path.abspath(repo_path)
         self.workspace_base = workspace_base or tempfile.mkdtemp(prefix="pipeline-ws-")
         self.image_tag = image_tag or f"sample-app-pipeline-{uuid.uuid4().hex[:8]}"
         self.timeout = timeout_per_stage
         self.secret_scan_enabled = secret_scan_enabled
+        self.log_config_check_enabled = log_config_check_enabled
         self._result: Optional[PipelineResult] = None
         self._lock = threading.Lock()
         self._running = False
@@ -253,7 +255,40 @@ class PipelineRunner:
         cmd = ["docker", "build", "-t", result.image_tag, workspace_dir]
         result.stages["build"].command = " ".join(cmd)
         exit_code, stdout, stderr = _run_subprocess(cmd, cwd=workspace_dir, timeout=self.timeout)
-        return exit_code, all_stdout + stdout, all_stderr + stderr
+        all_stdout += stdout
+        all_stderr += stderr
+        if exit_code != 0:
+            return exit_code, all_stdout, all_stderr
+
+        if self.log_config_check_enabled:
+            chk_exit, chk_out, chk_err = self._log_config_check(workspace_dir, result.image_tag)
+            all_stdout += chk_out
+            all_stderr += chk_err
+            if chk_exit != 0:
+                return chk_exit, all_stdout, all_stderr
+
+        return 0, all_stdout, all_stderr
+
+    def _log_config_check(self, workspace_dir: str, image_tag: str) -> tuple[int, str, str]:
+        """Run check_logs.py --config-only inside the freshly built image.
+
+        Validates logging_config.py and routes.py for structural correctness and
+        PII-logging patterns without needing a live container or log file.
+        Skipped gracefully when the workspace has no scripts/check_logs.py.
+        """
+        script = os.path.join(workspace_dir, "scripts", "check_logs.py")
+        if not os.path.exists(script):
+            return 0, "Log config check skipped: scripts/check_logs.py not in workspace.\n", ""
+
+        cmd = [
+            "docker", "run", "--rm", image_tag,
+            "python", "scripts/check_logs.py", "--config-only",
+        ]
+        exit_code, stdout, stderr = _run_subprocess(cmd, timeout=self.timeout)
+        if exit_code != 0:
+            header = "LOG CONFIG CHECK FAILED\n"
+            return exit_code, stdout, header + stderr
+        return 0, stdout, stderr
 
     def _secret_scan(self, workspace_dir: str) -> tuple[int, str, str]:
         """Scan source files for hardcoded secrets before docker build."""

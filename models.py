@@ -38,6 +38,10 @@ class AdversarialCICDScenario:
     root_cause_explanation: str
     difficulty: float = 0.5
     alert_message: str = ""
+    # Database settings chosen for the scenario. "sqlite" or "postgres".
+    db_backend: str = "sqlite"
+    # Optional list of DB-specific faults to inject for this scenario.
+    db_faults: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # Deserialize nested IncidentStep dicts when loaded from JSON

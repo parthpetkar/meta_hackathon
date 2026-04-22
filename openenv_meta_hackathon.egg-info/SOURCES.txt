@@ -11,6 +11,7 @@ pyproject.toml
 ./eval_runner.py
 ./inference.py
 ./models.py
+./reset_sqlite_db.py
 agent/__init__.py
 agent/actions.py
 agent/config.py
@@ -21,10 +22,12 @@ agent/runner.py
 agent/tool_schemas.py
 agent/trajectory_logging.py
 cicd/__init__.py
+cicd/drift_injector.py
 cicd/fault_injector.py
 cicd/fix_applier.py
 cicd/observation_builder.py
 cicd/pipeline_runner.py
+cicd/procedural_generator.py
 openenv_meta_hackathon.egg-info/PKG-INFO
 openenv_meta_hackathon.egg-info/SOURCES.txt
 openenv_meta_hackathon.egg-info/dependency_links.txt

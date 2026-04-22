@@ -48,8 +48,26 @@ FAULT_TYPES = [
     "dependency_version_drift",
 ]
 
+# Database-specific faults (used when scenario requests DB-targeted failures)
+DB_FAULT_TYPES = [
+    "bad_migration_sql",
+    "schema_drift",
+    "wrong_db_url",
+    "init_order_race",
+    "missing_volume_mount",
+]
+
+# Expose combined fault types for generators that want the full set
+FAULT_TYPES = FAULT_TYPES + DB_FAULT_TYPES
+
 # Which pipeline stage each fault causes to fail
 FAULT_STAGE_MAP: Dict[str, str] = {
+    # DB faults
+    "bad_migration_sql": "build",
+    "schema_drift": "build",
+    "wrong_db_url": "deploy",
+    "init_order_race": "deploy",
+    "missing_volume_mount": "deploy",
     "merge_conflict": "test",       # SyntaxError surfaces when pytest imports routes.py
     "dependency_conflict": "build",
     "docker_order": "build",
@@ -72,6 +90,11 @@ FAULT_STAGE_MAP: Dict[str, str] = {
 
 # Keywords the agent's hypothesis should contain to score positively
 FAULT_KEYWORDS: Dict[str, List[str]] = {
+    "bad_migration_sql": ["sql", "syntax", "migration"],
+    "schema_drift": ["schema", "mismatch", "column"],
+    "wrong_db_url": ["database", "url", "connection"],
+    "init_order_race": ["startup", "race", "dependency"],
+    "missing_volume_mount": ["volume", "mount", "database"],
     "merge_conflict": ["merge", "conflict", "markers", "routes"],
     "dependency_conflict": ["dependency", "incompatible", "requests", "urllib3", "pip", "version"],
     "docker_order": ["docker", "order", "copy", "install", "layer", "dockerfile"],
@@ -153,6 +176,12 @@ def inject_fault(workspace: str, fault_type: str) -> FaultMetadata:
         "shared_secret_rotation":   _inject_shared_secret_rotation,
         "infra_port_conflict":      _inject_infra_port_conflict,
         "dependency_version_drift": _inject_dependency_version_drift,
+        # DB faults
+        "bad_migration_sql":    _inject_bad_migration_sql,
+        "schema_drift":         _inject_schema_drift,
+        "wrong_db_url":         _inject_wrong_db_url,
+        "init_order_race":      _inject_init_order_race,
+        "missing_volume_mount": _inject_missing_volume_mount,
     }
     if fault_type not in injectors:
         raise ValueError(f"Unknown fault type: {fault_type!r}. Valid: {FAULT_TYPES}")
@@ -550,105 +579,4 @@ def _inject_log_disabled(workspace: str) -> FaultMetadata:
         affected_files=["services/api/logging_config.py"],
         injected_at_commit_sha=sha,
         description="LOG_LEVEL hardcoded to CRITICAL — effective logging disabled, check_logs config check fails",
-    )
-
-
-# ── Multi-app cross-service fault injectors ────────────────────────────────
-#
-# These faults mutate files under shared-infra/ or sibling app directories,
-# causing failures that cascade across multiple services.
-
-
-def _inject_shared_secret_rotation(workspace: str) -> FaultMetadata:
-    """Rotate AUTH_SECRET in shared-infra/.env without updating dependent services."""
-    path = os.path.join(workspace, "shared-infra", ".env")
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    content = content.replace(
-        "AUTH_SECRET=initial-shared-secret-value-abc123",
-        "AUTH_SECRET=rotated-secret-xyz789-NEW  # FAULT(shared_secret_rotation)",
-    )
-    if "rotated-secret-xyz789-NEW" not in content:
-        raise RuntimeError(
-            "_inject_shared_secret_rotation: expected AUTH_SECRET line not found in shared-infra/.env"
-        )
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-
-    sha = _commit(workspace, "ops: rotate shared authentication secret for compliance", [path])
-    return FaultMetadata(
-        fault_type="shared_secret_rotation",
-        affected_files=["shared-infra/.env"],
-        injected_at_commit_sha=sha,
-        description=(
-            "AUTH_SECRET rotated in shared-infra/.env but running api-service and worker "
-            "still hold the old value — all authenticated requests fail with 401"
-        ),
-        cascade_faults=["auth_token_mismatch", "worker_api_call_rejected"],
-        red_herring=(
-            "frontend shows HTTP 503 (downstream of api-service auth failure, not root cause)"
-        ),
-    )
-
-
-def _inject_infra_port_conflict(workspace: str) -> FaultMetadata:
-    """Remap api-service to port 5000, conflicting with the frontend binding."""
-    path = os.path.join(workspace, "shared-infra", "docker-compose.yml")
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    content = content.replace(
-        '      - "8000:8000"',
-        '      - "5000:8000"  # FAULT(infra_port_conflict): clashes with frontend port',
-    )
-    if "FAULT(infra_port_conflict)" not in content:
-        raise RuntimeError(
-            "_inject_infra_port_conflict: api-service port line not found in shared-infra/docker-compose.yml"
-        )
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-
-    sha = _commit(workspace, "infra: standardize all service ports to single range", [path])
-    return FaultMetadata(
-        fault_type="infra_port_conflict",
-        affected_files=["shared-infra/docker-compose.yml"],
-        injected_at_commit_sha=sha,
-        description=(
-            "api-service host port changed to 5000, conflicting with frontend — "
-            "docker compose up fails to bind; frontend cannot reach api-service"
-        ),
-        cascade_faults=["port_bind_failure", "frontend_502_bad_gateway"],
-        red_herring=(
-            "api-service container logs show SIGTERM (killed due to port conflict, not a code bug)"
-        ),
-    )
-
-
-def _inject_dependency_version_drift(workspace: str) -> FaultMetadata:
-    """Pin fastapi==0.68.0 + pydantic>=2.0.0 in api-service — incompatible versions."""
-    path = os.path.join(workspace, "api-service", "requirements.txt")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(
-            "fastapi==0.68.0\n"
-            "uvicorn>=0.23.0\n"
-            "httpx>=0.24.0\n"
-            "pydantic>=2.0.0\n"
-            "# FAULT(dependency_version_drift): fastapi 0.68 requires pydantic<2\n"
-        )
-
-    sha = _commit(workspace, "deps: pin fastapi version for security audit compliance", [path])
-    return FaultMetadata(
-        fault_type="dependency_version_drift",
-        affected_files=["api-service/requirements.txt"],
-        injected_at_commit_sha=sha,
-        description=(
-            "fastapi==0.68.0 requires pydantic<2 but pydantic>=2.0.0 is pinned — "
-            "pip resolution impossible; api-service build fails, worker loses its upstream"
-        ),
-        cascade_faults=["pip_resolution_impossible", "worker_cannot_reach_api_service"],
-        red_herring=(
-            "worker logs show ConnectionRefusedError (downstream of api-service build failure, "
-            "not a worker bug)"
-        ),
     )
