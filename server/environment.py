@@ -319,8 +319,52 @@ class RealCICDRepairEnvironment(Environment):
 
         # Curriculum + adversarial always active together
         self._curriculum = CurriculumController()
+
+        # Resolve the API key and base URL using the same provider logic as the agent,
+        # so the designer works with whichever provider (groq, openrouter, hf) is active.
+        _llm_provider = os.getenv("LLM_PROVIDER", "hf").strip().lower()
+
+        def _server_resolve_api_key() -> str:
+            explicit = (os.getenv("API_KEY") or "").strip()
+            if explicit:
+                return explicit
+            if _llm_provider == "openrouter":
+                return (
+                    os.getenv("OPENROUTER_API_KEY")
+                    or os.getenv("OPENAI_API_KEY")
+                    or os.getenv("HF_TOKEN")
+                    or os.getenv("GROQ_API_KEY")
+                    or ""
+                )
+            if _llm_provider == "groq":
+                return (
+                    os.getenv("GROQ_API_KEY")
+                    or os.getenv("OPENAI_API_KEY")
+                    or os.getenv("HF_TOKEN")
+                    or os.getenv("OPENROUTER_API_KEY")
+                    or ""
+                )
+            return (
+                os.getenv("HF_TOKEN")
+                or os.getenv("OPENAI_API_KEY")
+                or os.getenv("OPENROUTER_API_KEY")
+                or os.getenv("GROQ_API_KEY")
+                or ""
+            )
+
+        def _server_resolve_base_url() -> str:
+            explicit = (os.getenv("CICD_ADV_BASE_URL") or os.getenv("API_BASE_URL") or "").strip()
+            if explicit:
+                return explicit
+            if _llm_provider == "openrouter":
+                return "https://openrouter.ai/api/v1"
+            if _llm_provider == "groq":
+                return "https://api.groq.com/openai/v1"
+            return "https://router.huggingface.co/v1"
+
         self._adv_designer = AdversarialDesigner(
-            api_key=os.getenv("OPENROUTER_API_KEY") or os.getenv("API_KEY"),
+            api_key=_server_resolve_api_key(),
+            base_url=_server_resolve_base_url(),
         )
         self._adv_judge = AdversarialJudge()
 
@@ -372,11 +416,10 @@ class RealCICDRepairEnvironment(Environment):
 
         episode_seed = int(uuid.UUID(episode_id).int & 0xFFFFFFFF)
 
-        # LLM adversarial designer picks the root cause fault + composes scenario.
-        # Use a random fault as the prompt seed; LLM is free to use it or ignore it.
-        # (In practice, LLM always respects the root_cause_fault field per its prompt.)
-        import random as _random
-        seed_fault = _random.choice(FAULT_TYPES)
+        # Curriculum UCB1 selects the seed fault based on past episode performance
+        # (weakness score + exploration bonus), so the adversarial designer is steered
+        # toward fault types the agent has struggled with most.
+        seed_fault = self._curriculum.select_fault_type()
         adversarial_scenario = self._adv_designer.design(
             root_cause_fault=seed_fault,
             difficulty=curriculum_difficulty,
@@ -398,6 +441,14 @@ class RealCICDRepairEnvironment(Environment):
             injected = self._adv_designer.inject(repo_dir, adversarial_scenario)
 
         fault_type = adversarial_scenario.steps[0].fault_type if adversarial_scenario.steps else "merge_conflict"
+        cascade_types = [s.fault_type for s in adversarial_scenario.steps[1:]] if adversarial_scenario.steps else []
+        fail_stage = FAULT_STAGE_MAP.get(fault_type, "unknown")
+        print(
+            f"[EPISODE] fault={fault_type}  cascades={cascade_types}  "
+            f"fail_stage={fail_stage}  difficulty={curriculum_difficulty:.2f}  "
+            f"mode={'procedural' if use_procedural_style else 'llm-adversarial'}",
+            flush=True,
+        )
 
         fault_metadata = injected[0] if injected else inject_fault(repo_dir, fault_type)
         cascading_faults: list = injected[1:] if len(injected) > 1 else []
@@ -426,7 +477,7 @@ class RealCICDRepairEnvironment(Environment):
                     fault_metadata = fallback_fault
                 pipeline_result = runner.run(workspace_dir=repo_dir)
         except Exception as _exc:
-            logger.error("[reset] Fault injection retry failed: %s. Continuing with current state.", _exc)
+            logger.exception("[reset] Fault injection retry failed — continuing with current state.")
 
         if pipeline_result.status == PipelineStatus.PASSED:
             logger.error(
@@ -762,8 +813,10 @@ class RealCICDRepairEnvironment(Environment):
             ep.findings.append("Unsafe fix worsened system stability and increased recovery cost.")
             return -0.30
 
-        # Apply the fix
-        fix_result = apply_fix(ep.workspace_dir, value, target)
+        # Apply the fix — pass fault_type so the engine can route directly
+        # without relying on keyword matching of the agent's value string.
+        fault_type = ep.fault_metadata.fault_type if ep.fault_metadata else ""
+        fix_result = apply_fix(ep.workspace_dir, value, target, fault_type=fault_type)
         ep.last_fix_result = fix_result
 
         if fix_result.success:

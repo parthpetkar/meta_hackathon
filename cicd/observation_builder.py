@@ -412,6 +412,8 @@ def build_observation(
             "",
         )
 
+    _logs_per_app = build_visible_logs(pipeline_result)
+
     return {
         "task_id": task_id,
         "task_title": task_title,
@@ -426,7 +428,8 @@ def build_observation(
             "rerun_pipeline", "verify_fix", "finalize",
         ],
         "visible_alerts": build_visible_alerts(pipeline_result),
-        "visible_logs": build_visible_logs(pipeline_result),
+        "visible_logs_per_app": _logs_per_app,
+        "visible_logs": [line for lines in _logs_per_app.values() for line in lines],
         "affected_apps": affected_apps or [],
         "service_dependency_graph": service_dependency_graph if service_dependency_graph is not None else _DEFAULT_SERVICE_DEPENDENCY_GRAPH,
         "logs_by_stage": build_logs_by_stage(pipeline_result),

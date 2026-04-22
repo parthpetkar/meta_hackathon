@@ -197,19 +197,30 @@ class CurriculumController:
 
     def _compute_ema(self, db: sqlite3.Connection, new_score: float) -> float:
         """
-        EMA maps score trend → difficulty.
-        Target: linearly maps score ∈ [0, 1] to [DIFFICULTY_MIN, DIFFICULTY_MAX].
-          score=0   → target=0.20 (floor)
-          score=0.5 → target=0.575 (neutral — holds middle difficulty)
-          score=1.0 → target=0.95 (ceiling)
-        Any score above 0.5 pushes difficulty up; below 0.5 pulls it down.
+        EMA difficulty scheduler anchored to current difficulty.
+
+        The target is computed relative to the current difficulty so that:
+          - score >= 0.6  → push difficulty up   (agent is succeeding)
+          - score == 0.6  → hold current difficulty (neutral threshold)
+          - score <  0.6  → pull difficulty down  (agent is struggling)
+
+        The step size scales with how far the score is from the neutral threshold,
+        capped at ±STEP_CAP per episode to prevent wild swings.
+
+        This means the EMA can always climb past any plateau as long as the agent
+        keeps scoring above the neutral threshold, regardless of absolute score value.
         """
+        _NEUTRAL_THRESHOLD = 0.60   # score at which difficulty holds steady
+        _STEP_CAP = 0.08            # max difficulty change per episode
+
         row = db.execute(
             "SELECT value FROM curriculum_state WHERE key = 'ema_difficulty'"
         ).fetchone()
         current = float(row[0]) if row else 0.40
 
-        target = _DIFFICULTY_MIN + new_score * (_DIFFICULTY_MAX - _DIFFICULTY_MIN)
-        target = max(_DIFFICULTY_MIN, min(_DIFFICULTY_MAX, target))
-        new_ema = (1.0 - _EMA_ALPHA) * current + _EMA_ALPHA * target
+        # Delta: positive when agent succeeds, negative when struggling
+        delta = (new_score - _NEUTRAL_THRESHOLD) * _STEP_CAP / (1.0 - _NEUTRAL_THRESHOLD)
+        delta = max(-_STEP_CAP, min(_STEP_CAP, delta))
+
+        new_ema = (1.0 - _EMA_ALPHA) * current + _EMA_ALPHA * (current + delta)
         return round(max(_DIFFICULTY_MIN, min(_DIFFICULTY_MAX, new_ema)), 4)

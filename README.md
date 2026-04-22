@@ -64,7 +64,7 @@ The runtime follows a layered architecture to keep OpenEnv APIs stable while evo
 
 - `cicd/pipeline_runner.py`: real subprocess pipeline (`clone -> build -> test -> deploy`).
 - `cicd/fault_injector.py`: file-level fault mutations with git commits.
-- `cicd/fix_applier.py`: structured JSON edits + heuristic/auto fixes.
+- `cicd/fix_applier.py`: structured JSON edits + fault-type direct dispatch + heuristic/auto fixes.
 
 ### 3) Evidence Layer
 
@@ -129,9 +129,10 @@ Reset observations already include the initial alert and a first batch of real f
 
 Fix payload format for `modify_config`:
 
-- Preferred: JSON string with `file`, `action`, and content fields (for example `replace` with `old` and `new`).
-- Supported actions in the fix engine: `replace`, `delete_lines`, and `write`.
-- Fallback exists for plain-English heuristic fixes, but structured JSON is more reliable.
+- Preferred and required: structured JSON string with `file`, `action`, and content fields.
+- Supported actions: `replace` (old→new), `delete_lines` (remove lines matching pattern), `write` (overwrite file).
+- The fix engine applies fixes in priority order: (A) structured JSON patch, (B) fault-type direct dispatch (server knows the active fault and routes to the correct fix function automatically), (C) keyword heuristic fallback, (D) generic auto-repair scan.
+- Because the server always knows the active fault type, the agent does not need to use magic phrases — any structured JSON patch describing the correct file change will succeed.
 
 When `META_HACKATHON_AUDIT_TRAIL=true`, observation metadata also includes deterministic provenance fields:
 
@@ -190,6 +191,7 @@ Key controls:
 - Curriculum: `CURRICULUM_EMA_ALPHA`, `CURRICULUM_UCB_C`, `CURRICULUM_WARMUP`
 - Adversarial designer endpoint/model: `CICD_ADV_BASE_URL`, `CICD_ADV_MODEL`
 - Adversarial provider headers/keys: `OPENROUTER_API_KEY`, `OPENROUTER_REFERER`, `OPENROUTER_TITLE`
+- Adversarial designer also respects `LLM_PROVIDER` — set `GROQ_API_KEY` or `HF_TOKEN` and the designer uses the same provider as the agent automatically.
 - Drift: `META_HACKATHON_DRIFT_ENABLED`, `META_HACKATHON_DRIFT_PROBABILITY`
 - Episode count for inference/evaluation loops: `META_HACKATHON_NUM_EPISODES`
 

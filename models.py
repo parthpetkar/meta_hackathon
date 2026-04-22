@@ -93,7 +93,11 @@ class MetaHackathonObservation(Observation):
         default_factory=list,
         description="Visible alert summaries.",
     )
-    visible_logs: Dict[str, List[str]] = Field(
+    visible_logs: List[str] = Field(
+        default_factory=list,
+        description="Visible log lines (flattened across all apps, for backward compat).",
+    )
+    visible_logs_per_app: Dict[str, List[str]] = Field(
         default_factory=dict,
         description="Visible log lines per app: {'frontend': [...], 'api-service': [...], ...}.",
     )

@@ -54,28 +54,13 @@ def _normalize_hypothesis(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").strip().lower())
 
 
-# Maps error signatures → canonical fix phrases that fix_applier.py recognizes
-_FIX_PHRASE_RULES: List[Tuple[List[str], str]] = [
-    (["merge conflict", "<<<<<<<", "conflict marker", "<<<", "⚠ merge"], "resolve merge conflict markers"),
-    # Cache-checksum / missing-file errors (Docker build context desync) come before
-    # dependency rules so they don't get captured by the generic "requirements" match.
-    (["failed to compute cache key", "failed to calculate checksum", "no such file or directory: 'requirements"], "reorder dockerfile install steps"),
-    (["requests", "urllib3", "dependency", "version conflict", "incompatible", "resolutionimpossible"], "pin compatible requests urllib3 versions"),
-    (["dockerfile", "install order", "layer order", "copy before install"], "reorder dockerfile install steps"),
-    (["flaky", "timing", "intermittent", "response_time", "test_response_time"], "add flaky test retry wrapper"),
-    (["permission", "network", "compose network", "volume"], "fix docker compose network permission"),
-    (["secret", "credential", "api_key", "hardcoded", "plaintext"], "remove hardcoded secrets from source"),
-]
-
-
-def _infer_fix_phrase(surfaced_errors: List[str], hypothesis: str = "", findings: List[str] | None = None) -> str:
-    """Return a fix phrase matching the failure signature, or 'auto' for generic repair."""
-    combined = " ".join(surfaced_errors + [hypothesis] + (findings or [])).lower()
-    for keywords, phrase in _FIX_PHRASE_RULES:
-        if any(kw in combined for kw in keywords):
-            return phrase
-    # Unknown fault type — signal the generic auto-repair strategy
-    return "auto" if combined.strip() else ""
+# Structured JSON fix template injected as a hint after hypothesis is accepted.
+_STRUCTURED_FIX_HINT = (
+    "Hypothesis accepted. Now apply the fix using modify_config with a structured JSON value:\n"
+    '{"file": "<path/to/file>", "action": "replace", "old": "<exact broken lines>", "new": "<fixed lines>"}\n'
+    "Use the file content you already inspected to fill in the exact old/new strings. "
+    "Do not inspect or view_logs again — go straight to the fix."
+)
 
 
 def _extract_primary_surfaced_error_file(observation: MetaHackathonObservation) -> str:
@@ -162,7 +147,6 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
     inspected_config_targets: set[str] = set()
     injected_guardrails: set[str] = set()  # deduplicate guardrail messages
     fix_applied_since_rerun: bool = False   # allow rerun after a new fix
-    fix_phrase: str = ""                    # canonical phrase inferred from errors
     hypothesis_accepted: bool = False       # True once set_hypothesis scores > 0
     steps_taken = 0
     score = 0.0
@@ -191,7 +175,6 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
             task_max_steps = max(task_max_steps, int(observed.get("max_steps", MAX_STEPS)))
         initial_surfaced_errors = [str(item) for item in (observation.surfaced_errors or [])]
         last_memory_key = fingerprint(initial_surfaced_errors) if fingerprint is not None else ""
-        fix_phrase = _infer_fix_phrase(initial_surfaced_errors, findings=list(observation.findings or []))
 
         messages = [{"role": "system", "content": build_system_prompt(task_name)}]
 
@@ -208,6 +191,14 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
 
         task_title = observation.task_title or task_name
         fault_type = _fault_type_from_observation(observation, task_name)
+        _meta = observation.metadata if isinstance(observation.metadata, dict) else {}
+        print(
+            f"[EPISODE START] label={fallback_task_name}  fault={fault_type}  "
+            f"stage={_meta.get('expected_fail_stage', '?')}  "
+            f"difficulty={observation.difficulty or '?'}  "
+            f"max_steps={task_max_steps}",
+            flush=True,
+        )
         memory_hint, memory_log = _memory_hint(initial_surfaced_errors, fault_type)
         if memory_log:
             log_memory(memory_log)
@@ -490,29 +481,9 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                     attempted_hypotheses.add(normalized_hypothesis)
                 if reward > 0:
                     hypothesis_accepted = True
-                    # Refresh fix phrase using the accepted hypothesis text + current errors
-                    obs_errors = [str(e) for e in (observation.surfaced_errors or [])]
-                    obs_findings = [str(f) for f in (observation.findings or [])]
-                    inferred = _infer_fix_phrase(obs_errors, hypothesis=value, findings=obs_findings)
-                    if inferred:
-                        fix_phrase = inferred
-                    if fix_phrase and f"fix_hint:{fix_phrase}" not in injected_guardrails:
-                        injected_guardrails.add(f"fix_hint:{fix_phrase}")
-                        is_dep = any(kw in fix_phrase for kw in ["pin", "dependency", "urllib3", "requests"])
-                        fix_op = "add_dependency" if is_dep else "modify_config"
-                        if fix_phrase == "auto":
-                            forced_messages.append(
-                                "Hypothesis accepted. The fault type is unknown — apply a structured JSON fix. "
-                                "Call 'modify_config' with a JSON value like: "
-                                '{"file": "<path>", "action": "replace", "old": "<broken code>", "new": "<fixed code>"}. '
-                                "Use the file content you inspected to fill in the exact old/new strings."
-                            )
-                        else:
-                            forced_messages.append(
-                                f"Hypothesis accepted. Now apply the fix immediately. "
-                                f"Call tool '{fix_op}' with value='{fix_phrase}'. "
-                                f"Do not inspect or view_logs again — go straight to the fix."
-                            )
+                    if "fix_hint_sent" not in injected_guardrails:
+                        injected_guardrails.add("fix_hint_sent")
+                        forced_messages.append(_STRUCTURED_FIX_HINT)
                 elif reward < 0:
                     forced_messages.append(
                         "Your last hypothesis was incorrect (negative reward). "
@@ -523,12 +494,6 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
             messages.append(assistant_message)
             tool_result = format_obs_for_llm(observation, step)
             observation_errors = [str(item) for item in (observation.surfaced_errors or [])]
-            # Refresh fix_phrase from latest observation if not yet determined
-            if not fix_phrase or not hypothesis_accepted:
-                obs_findings = [str(f) for f in (observation.findings or [])]
-                inferred = _infer_fix_phrase(observation_errors, findings=obs_findings)
-                if inferred:
-                    fix_phrase = inferred
             current_memory_key = fingerprint(observation_errors) if fingerprint is not None else ""
             observation_fault_type = _fault_type_from_observation(observation, task_name)
             memory_hint, memory_log = (
@@ -602,6 +567,14 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                 remember(memory_errors, last_fix_value, success)
             except Exception:
                 pass
+    except Exception as _episode_exc:
+        import traceback as _tb
+        print(
+            f"\n[EPISODE ERROR] {type(_episode_exc).__name__}: {_episode_exc}",
+            flush=True,
+        )
+        _tb.print_exc()
+        raise
     finally:
         log_end(
             success=success,
@@ -640,7 +613,7 @@ def main() -> None:
     with requests.Session() as session:
         session.headers.update({"Accept": "application/json"})
         task_scores: List[Tuple[str, float, bool]] = []
-        print(f"[INFERENCE] Running {NUM_EPISODES} episodes — faults chosen by LLM adversarial, difficulty scheduled by curriculum.", flush=True)
+        print(f"[INFERENCE] Running {NUM_EPISODES} episodes — fault seed selected per-episode by curriculum UCB1 (based on prior scores), scenario composed by LLM adversarial designer.", flush=True)
         for episode_label in TASK_ORDER:
             # episode_label is just a slot name ("episode_1", etc.).
             # The actual fault/scenario is generated fresh by LLM for each reset.

@@ -59,18 +59,133 @@ def _commit_fix(workspace: str, message: str) -> str:
 
 # ── Public API ─────────────────────────────────────────────────────────────
 
-def apply_fix(workspace: str, fix_text: str, target: str = "") -> FixResult:
+def apply_fix(workspace: str, fix_text: str, target: str = "", fault_type: str = "") -> FixResult:
     """Apply a fix to the workspace.
-    Tries (A) structured JSON, (B) keyword heuristics, (C) generic auto-repair.
+
+    Tries strategies in order:
+      A) Structured JSON  — agent emits {"file":..., "action":..., "old":..., "new":...}
+      B) Fault-type route — server knows the active fault; dispatch directly, no text parsing
+      C) Heuristic        — keyword scan of fix_text as last resort
+      D) Auto-repair      — generic workspace scan when nothing else matches
     """
+    # Strategy A: structured JSON patch — most reliable, no language interpretation
     result = _try_structured_fix(workspace, fix_text)
     if result is not None:
         return result
+
+    # Strategy B: fault-type-aware direct dispatch — bypasses all text matching
+    if fault_type:
+        result = _apply_fault_type_fix(workspace, fault_type)
+        if result.success:
+            return result
+
+    # Strategy C: heuristic keyword fallback
     result = _apply_heuristic_fix(workspace, fix_text, target)
     if result.success:
         return result
-    # Strategy C: generic auto-repair — no fault-type knowledge required
+
+    # Strategy D: generic auto-repair
     return _auto_repair_workspace(workspace, error_hint=fix_text)
+
+
+# ── Strategy B: Fault-type direct dispatch ─────────────────────────────────
+
+_FAULT_FIX_MAP = {
+    "merge_conflict":        lambda ws: _fix_merge_conflict(ws),
+    "dependency_conflict":   lambda ws: _fix_dependency_conflict(ws),
+    "docker_order":          lambda ws: _fix_docker_order(ws),
+    "flaky_test":            lambda ws: _fix_flaky_test(ws),
+    "missing_permission":    lambda ws: _fix_missing_permission(ws),
+    "secret_exposure":       lambda ws: _fix_secret_exposure(ws),
+    "env_drift":             lambda ws: _fix_missing_permission(ws),
+    "log_bad_config":        lambda ws: _fix_log_bad_config(ws),
+    "log_path_unwritable":   lambda ws: _fix_log_path(ws),
+    "log_volume_missing":    lambda ws: _fix_log_volume(ws),
+    "log_rotation_missing":  lambda ws: _fix_log_rotation(ws),
+    "log_pii_leak":          lambda ws: _fix_log_pii_leak(ws),
+    "log_disabled":          lambda ws: _fix_log_disabled(ws),
+    "shared_secret_rotation": lambda ws: _fix_shared_secret_rotation(ws),
+    "infra_port_conflict":   lambda ws: _fix_infra_port_conflict(ws),
+    "dependency_version_drift": lambda ws: _fix_dependency_conflict(ws),
+}
+
+_FAULT_FIX_DESCRIPTIONS = {
+    "merge_conflict":        "Resolved merge conflict markers",
+    "dependency_conflict":   "Fixed dependency version pins",
+    "docker_order":          "Fixed Dockerfile instruction order",
+    "flaky_test":            "Removed flaky timing-sensitive test",
+    "missing_permission":    "Fixed docker-compose network/volume configuration",
+    "secret_exposure":       "Removed hardcoded secrets",
+    "env_drift":             "Fixed docker-compose env/port configuration",
+    "log_bad_config":        "Restored json.dumps in logging formatter",
+    "log_path_unwritable":   "Restored LOG_PATH to writable application directory",
+    "log_volume_missing":    "Restored log volume mount in docker-compose.yml",
+    "log_rotation_missing":  "Restored RotatingFileHandler for log rotation",
+    "log_pii_leak":          "Removed PII-leaking log call from routes.py",
+    "log_disabled":          "Restored LOG_LEVEL to INFO from CRITICAL",
+    "shared_secret_rotation": "Restored AUTH_SECRET consistency across services",
+    "infra_port_conflict":   "Resolved port conflict in shared-infra/docker-compose.yml",
+    "dependency_version_drift": "Fixed dependency version drift across services",
+}
+
+
+def _fix_shared_secret_rotation(workspace: str) -> List[str]:
+    """Restore the original AUTH_SECRET in shared-infra/.env."""
+    path = os.path.join(workspace, "shared-infra", ".env")
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    cleaned = re.sub(
+        r'AUTH_SECRET=rotated-secret-xyz789-NEW[^\n]*',
+        'AUTH_SECRET=original-shared-secret-abc123',
+        content,
+    )
+    if cleaned == content:
+        return []
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(cleaned)
+    return ["shared-infra/.env"]
+
+
+def _fix_infra_port_conflict(workspace: str) -> List[str]:
+    """Restore api-service port to 8000 in shared-infra/docker-compose.yml."""
+    path = os.path.join(workspace, "shared-infra", "docker-compose.yml")
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    cleaned = content.replace(
+        '      - "5000:8000"  # FAULT(infra_port_conflict): clashes with frontend port',
+        '      - "8000:8000"',
+    )
+    if cleaned == content:
+        return []
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(cleaned)
+    return ["shared-infra/docker-compose.yml"]
+
+
+def _apply_fault_type_fix(workspace: str, fault_type: str) -> FixResult:
+    """Dispatch directly to the correct fix function using the known fault type."""
+    fn = _FAULT_FIX_MAP.get(fault_type)
+    if fn is None:
+        return FixResult(
+            success=False, files_modified=[], strategy_used="fault_type_route",
+            error=f"No direct fix registered for fault_type={fault_type!r}",
+        )
+    modified = fn(workspace)
+    if not modified:
+        return FixResult(
+            success=False, files_modified=[], strategy_used="fault_type_route",
+            error=f"Fault-type fix for {fault_type!r} found nothing to change (already fixed?)",
+        )
+    description = _FAULT_FIX_DESCRIPTIONS.get(fault_type, f"Fixed {fault_type}")
+    sha = _commit_fix(workspace, f"agent fix: {description}"[:72])
+    return FixResult(
+        success=True, files_modified=modified, commit_sha=sha,
+        strategy_used="fault_type_route", description=description,
+    )
 
 
 # ── Strategy A: Structured JSON ────────────────────────────────────────────
@@ -227,11 +342,11 @@ def _apply_heuristic_fix(workspace: str, fix_text: str, target: str = "") -> Fix
         modified = _fix_log_disabled(workspace)
         description = "Restored LOG_LEVEL to INFO from CRITICAL"
 
-    elif any(kw in fix_lower for kw in ["log volume", "volume mount", "log_volume", "./logs"]):
+    elif any(kw in fix_lower for kw in ["log volume", "volume mount", "log_volume", "./logs", "../logs", "logs:/app/logs", "log file", "log mount"]):
         modified = _fix_log_volume(workspace)
         description = "Restored log volume mount in docker-compose.yml"
 
-    elif any(kw in fix_lower for kw in ["permission", "network", "external", "compose", "volume"]):
+    elif any(kw in fix_lower for kw in ["permission", "network", "external", "compose"]):
         modified = _fix_missing_permission(workspace)
         description = "Fixed docker-compose network/volume configuration"
 
@@ -512,20 +627,21 @@ def _fix_log_disabled(workspace: str) -> List[str]:
 
 
 def _fix_log_volume(workspace: str) -> List[str]:
-    path = os.path.join(workspace, "docker-compose.yml")
+    # The volume mount lives in shared-infra/docker-compose.yml
+    path = os.path.join(workspace, "shared-infra", "docker-compose.yml")
     if not os.path.exists(path):
         return []
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
     cleaned = content.replace(
-        "      # FAULT(log_volume_missing): log volume mount removed\n      # - ./logs:/app/logs",
-        "      - ./logs:/app/logs",
+        "      # FAULT(log_volume_missing): log volume mount removed\n      # - ../logs:/app/logs",
+        "      - ../logs:/app/logs",
     )
     if cleaned == content:
         return []
     with open(path, "w", encoding="utf-8") as f:
         f.write(cleaned)
-    return ["docker-compose.yml"]
+    return ["shared-infra/docker-compose.yml"]
 
 
 # ── Strategy C: Generic auto-repair ────────────────────────────────────────

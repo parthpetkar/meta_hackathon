@@ -450,21 +450,27 @@ def _inject_log_path_unwritable(workspace: str) -> FaultMetadata:
 
 def _inject_log_volume_missing(workspace: str) -> FaultMetadata:
     """Comment out the logs volume mount so the log file is inaccessible from the host."""
-    path = os.path.join(workspace, "docker-compose.yml")
+    # The volume mount lives in shared-infra/docker-compose.yml, not the root compose file
+    path = os.path.join(workspace, "shared-infra", "docker-compose.yml")
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    content = content.replace(
-        "      - ./logs:/app/logs",
-        "      # FAULT(log_volume_missing): log volume mount removed\n      # - ./logs:/app/logs",
+    new_content = content.replace(
+        "      - ../logs:/app/logs",
+        "      # FAULT(log_volume_missing): log volume mount removed\n      # - ../logs:/app/logs",
     )
+    if new_content == content:
+        raise RuntimeError(
+            "_inject_log_volume_missing: volume mount line not found in shared-infra/docker-compose.yml — "
+            "template may have drifted from expected content"
+        )
     with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+        f.write(new_content)
 
     sha = _commit(workspace, "infra: remove ephemeral log volume (logs now in container only)", [path])
     return FaultMetadata(
         fault_type="log_volume_missing",
-        affected_files=["docker-compose.yml"],
+        affected_files=["shared-infra/docker-compose.yml"],
         injected_at_commit_sha=sha,
         description="Log volume mount commented out — check_logs cannot reach the log file from the host",
     )

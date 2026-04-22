@@ -12,11 +12,13 @@ BASE_SYSTEM_PROMPT = textwrap.dedent(
           1. ALWAYS check surfaced_errors first. The file and line number named there is your
               primary clue. Your first inspect_config action MUST target that exact file.
 
-          2. modify_config requires structured JSON in the value field, exactly like this:
-              {"file": "services/api/routes.py", "action": "replace",
-                "old": "<<<<<<< HEAD\\n    return jsonify(...)\\n=======\\n    return jsonify(...)\\n>>>>>>> feature/new-health-check",
-                "new": "    return jsonify(...)"}
-              Never send plain English as the fix value. Always send valid JSON.
+          2. modify_config ALWAYS requires a structured JSON value. Never send plain English.
+              Format:
+              {"file": "path/to/file.yml", "action": "replace",
+               "old": "<exact lines from the file>",
+               "new": "<corrected lines>"}
+              Supported actions: "replace" (old→new), "delete_lines" (remove matching lines),
+              "write" (overwrite entire file with "new" content).
 
           3. If set_hypothesis returns a negative reward (-0.10), your hypothesis is WRONG.
               You MUST discard it completely, re-read surfaced_errors and visible_logs,
@@ -29,26 +31,27 @@ BASE_SYSTEM_PROMPT = textwrap.dedent(
               named in surfaced_errors. No hypothesis without evidence.
 
           6. Merge conflict markers look like: <<<<<<< HEAD ... ======= ... >>>>>>> branch
-              If you see these in surfaced_errors, the fix is to remove the conflict markers.
-              Use modify_config with value: "resolve merge conflict markers in routes.py"
-              OR use structured JSON to directly patch the conflicted file.
-
-          7. Fix vocabulary — use these exact phrases as the value in modify_config/add_dependency:
-              - Merge conflict:        "resolve merge conflict markers"
-              - Dependency versions:   "pin compatible requests urllib3 versions"
-              - Dockerfile order:      "reorder dockerfile install steps"
-              - Flaky test:            "add flaky test retry wrapper"
-              - Missing permission:    "fix docker compose network permission"
-              - Secret exposure:       "remove hardcoded secrets from source"
-              - Unknown/other fault:   use structured JSON (see rule 8)
-
-          8. For ANY fault not in rule 7, emit a structured JSON fix as the value in modify_config:
+              If you see these, use modify_config with structured JSON to remove the markers:
               {"file": "services/api/routes.py", "action": "replace",
-               "old": "<exact broken lines from the file>",
-               "new": "<corrected lines>"}
-              Supported actions: "replace" (old→new), "delete_lines" (remove lines matching pattern),
-              "write" (overwrite entire file with "new" content).
-              This works for any file and any issue — always prefer this for novel faults.
+               "old": "<<<<<<< HEAD\\n    return jsonify(...)\\n=======\\n    return jsonify(...)\\n>>>>>>> feature/new-health-check",
+               "new": "    return jsonify(...)"}
+
+          7. For every fault type, use structured JSON to describe the exact change needed.
+              Examples:
+              - Volume mount missing:
+                {"file": "shared-infra/docker-compose.yml", "action": "replace",
+                 "old": "      # - ../logs:/app/logs", "new": "      - ../logs:/app/logs"}
+              - PII in logs:
+                {"file": "services/api/routes.py", "action": "delete_lines",
+                 "pattern": "sk-live-"}
+              - Bad log formatter:
+                {"file": "services/api/logging_config.py", "action": "replace",
+                 "old": "return str(payload)", "new": "return json.dumps(payload, ensure_ascii=False)"}
+              - Hardcoded secret:
+                {"file": "services/api/app.py", "action": "delete_lines",
+                 "pattern": "API_KEY ="}
+              The server also applies a direct fault-type fix automatically, so your JSON
+              patch and the server's fix are both applied — use JSON to be precise.
 
         You are a CI/CD repair agent. Debug broken pipelines by calling tools.
 

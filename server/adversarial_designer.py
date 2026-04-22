@@ -27,6 +27,21 @@ LOGGER = logging.getLogger(__name__)
 _DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 _DEFAULT_OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct"
 
+# Provider-aware model defaults
+_PROVIDER_DEFAULT_MODELS = {
+    "groq": "llama-3.3-70b-versatile",
+    "openrouter": "meta-llama/llama-3.3-70b-instruct",
+    "hf": "meta-llama/Llama-3.3-70B-Instruct",
+}
+
+
+def _default_model_for_provider() -> str:
+    provider = os.getenv("LLM_PROVIDER", "hf").strip().lower()
+    explicit = os.getenv("CICD_ADV_MODEL", "").strip()
+    if explicit:
+        return explicit
+    return _PROVIDER_DEFAULT_MODELS.get(provider, _DEFAULT_OPENROUTER_MODEL)
+
 ADVERSARIAL_DESIGNER_PROMPT = """You are a CI/CD chaos engineer designing realistic
 production incidents for SRE training on a Flask+Docker pipeline (stages: build → test → deploy).
 
@@ -97,7 +112,7 @@ class AdversarialDesigner:
             or os.getenv("API_KEY")
             or ""
         )
-        self._model = model or os.getenv("CICD_ADV_MODEL") or _DEFAULT_OPENROUTER_MODEL
+        self._model = model or _default_model_for_provider()
         self._base_url = base_url or os.getenv("CICD_ADV_BASE_URL") or _DEFAULT_OPENROUTER_BASE_URL
         self._timeout = timeout_seconds
         self._client = OpenAI(

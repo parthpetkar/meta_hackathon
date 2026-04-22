@@ -1,6 +1,7 @@
 """LLM tool-call translation for the inference runner."""
 
 import json
+import re
 from typing import Any, Dict, Optional, Tuple
 
 from .config import MAX_TOKENS, MODEL_NAME, TEMPERATURE
@@ -18,6 +19,22 @@ def _parse_tool_arguments(arguments: Any) -> Dict[str, Any]:
         except json.JSONDecodeError:
             return {}
     return {}
+
+
+def _parse_xml_tool_call(text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """
+    Parse the XML-style tool call format some models emit instead of native tool calls.
+    Handles: <function=tool_name {"arg": "val"}</function>
+             <function=tool_name>{"arg": "val"}</function>
+    Returns (tool_name, args_dict) or None if not matched.
+    """
+    pattern = r"<function=(\w+)\s*>?\s*(\{.*?\})\s*(?:</function>|$)"
+    m = re.search(pattern, text, re.DOTALL)
+    if not m:
+        return None
+    tool_name = m.group(1).strip()
+    args = _parse_tool_arguments(m.group(2).strip())
+    return tool_name, args
 
 
 def _tool_call_to_action_parts(tool_name: str, tool_args: Dict[str, Any]) -> Tuple[str, str, str]:
@@ -60,15 +77,54 @@ def get_model_action(
     step: int,
     messages: list[Dict[str, Any]],
 ) -> Tuple[str, str, str, Dict[str, Any], Optional[str]]:
-    completion = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=messages,
-        tools=TOOL_SCHEMAS,
-        tool_choice="auto",
-        temperature=TEMPERATURE,
-        max_tokens=MAX_TOKENS,
-        stream=False,
-    )
+    try:
+        completion = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=messages,
+            tools=TOOL_SCHEMAS,
+            tool_choice="auto",
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+            stream=False,
+        )
+    except Exception as exc:
+        # Groq (and some other providers) return a 400 BadRequestError when the
+        # model emits a malformed tool call (e.g. XML-style <function=...> syntax).
+        # The raw generation is attached to the error body under 'failed_generation'.
+        # Try to salvage a valid action from it before giving up.
+        raw_generation = ""
+        try:
+            body = exc.response.json() if hasattr(exc, "response") else {}
+            err = body.get("error", {})
+            raw_generation = err.get("failed_generation", "")
+        except Exception:
+            pass
+
+        if raw_generation:
+            parsed = _parse_xml_tool_call(raw_generation)
+            if parsed:
+                tool_name, tool_args = parsed
+                operation, target, value = _tool_call_to_action_parts(tool_name, tool_args)
+                tool_call_id = f"call_recovered_{step}"
+                assistant_message: Dict[str, Any] = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": tool_call_id,
+                            "type": "function",
+                            "function": {
+                                "name": tool_name,
+                                "arguments": json.dumps(tool_args, ensure_ascii=True, separators=(",", ":")),
+                            },
+                        }
+                    ],
+                }
+                return operation, target, value, assistant_message, tool_call_id
+
+        # Could not recover — return empty so the retry loop can handle it
+        assistant_message = {"role": "assistant", "content": ""}
+        return "", "", "", assistant_message, None
 
     message = completion.choices[0].message
     if message.tool_calls:

@@ -105,12 +105,23 @@ def step_env(
 
 
 def format_obs_for_llm(observation: MetaHackathonObservation, step_num: int) -> str:
+    import re as _re
+
+    def _redact_secrets(text: str) -> str:
+        """Replace token-like values with a placeholder so they don't trip content filters."""
+        # Matches common secret prefixes followed by hex/alphanumeric token bodies
+        return _re.sub(
+            r"(sk-live-|sk-test-|sk_live_|sk_test_|AKIA|ghp_|gho_|github_pat_|whsec_|gsk_)[A-Za-z0-9_\-]{8,}",
+            r"\1[REDACTED]",
+            text,
+        )
+
     parts: List[str] = []
     errors = observation.surfaced_errors or []
     if errors:
         parts.append("⚠️  ACTIVE ERRORS (start here):")
         for item in errors[:5]:
-            parts.append(f"  - {item}")
+            parts.append(f"  - {_redact_secrets(str(item))}")
         parts.append("")
 
     status = observation.pipeline_status or "?"
