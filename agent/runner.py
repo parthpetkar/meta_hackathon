@@ -37,14 +37,16 @@ except ImportError:  # pragma: no cover - direct script execution
     from models import MetaHackathonObservation
 
 try:
-    from server.agent_memory import fingerprint, recall, remember
+    from server.agent_memory import fingerprint, recall, remember, remember_optimal_path, recall_optimal_path
 except ImportError:  # pragma: no cover - direct script execution
     try:
-        from .server.agent_memory import fingerprint, recall, remember  # type: ignore[attr-defined]
+        from .server.agent_memory import fingerprint, recall, remember, remember_optimal_path, recall_optimal_path  # type: ignore[attr-defined]
     except Exception:  # pragma: no cover - memory is optional
         fingerprint = None  # type: ignore[assignment]
         recall = None  # type: ignore[assignment]
         remember = None  # type: ignore[assignment]
+        remember_optimal_path = None  # type: ignore[assignment]
+        recall_optimal_path = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:
     from openai import OpenAI
@@ -138,6 +140,52 @@ def _repetition_escape_action(
     return ("view_logs", stage, "")
 
 
+def _step_rationale(operation: str, target: str, value: str, reward: float) -> str:
+    """Produce a one-sentence explanation of why this step was useful."""
+    if operation == "inspect_config":
+        return f"Inspect '{target}' to read current file content and spot the fault."
+    if operation == "view_logs":
+        return f"View '{target}' stage logs to identify which error is blocking the pipeline."
+    if operation == "inspect_dockerfile":
+        return "Read Dockerfile to check layer ordering and COPY/RUN sequencing."
+    if operation == "inspect_permissions":
+        return "Check file/directory permissions that may block deploy or runtime."
+    if operation == "set_hypothesis":
+        verdict = "correct hypothesis" if reward > 0 else "incorrect hypothesis"
+        return f"Formulate {verdict} about root cause before attempting a fix."
+    if operation in {"modify_config", "add_dependency"}:
+        return f"Apply fix to '{target}' — change the broken configuration or dependency."
+    if operation == "rerun_pipeline":
+        return "Rerun the pipeline to verify whether the applied fix resolved the failure."
+    if operation == "verify_fix":
+        return "Confirm the pipeline passed and the incident is resolved before finalising."
+    if operation == "finalize":
+        return "Finalise the episode after the fix is verified."
+    return f"Execute {operation} step."
+
+
+def _build_optimal_path(
+    step_trace: List[Dict[str, Any]],
+    resolved: bool,
+) -> List[Dict[str, Any]]:
+    """Distil the full step trace into the positive-reward steps worth teaching.
+
+    Only steps with reward >= 0 are kept, and only the sequence up to and
+    including the first 'finalize' (or the last step if there is none).
+    This strips wasted/redundant moves so the stored path is a clean template.
+    """
+    if not resolved or not step_trace:
+        return []
+    positive = [s for s in step_trace if s["reward"] >= 0]
+    # Truncate at finalize
+    result: List[Dict[str, Any]] = []
+    for s in positive:
+        result.append(s)
+        if s["operation"] == "finalize":
+            break
+    return result
+
+
 def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: str) -> Tuple[str, bool, int, float]:
     history: List[str] = []
     rewards: List[float] = []
@@ -165,6 +213,9 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
     last_fix_value: str = ""
     errors_at_last_fix: List[str] = []   # errors active when the last fix was applied
     last_memory_key: str = ""
+    fault_type_for_memory: str = ""
+    # Structured trace of every step taken — used to record the optimal path.
+    step_trace: List[Dict[str, Any]] = []
 
     try:
         observation = reset_env(session)
@@ -191,6 +242,7 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
 
         task_title = observation.task_title or task_name
         fault_type = _fault_type_from_observation(observation, task_name)
+        fault_type_for_memory = fault_type
         _meta = observation.metadata if isinstance(observation.metadata, dict) else {}
         print(
             f"[EPISODE START] label={fallback_task_name}  fault={fault_type}  "
@@ -202,9 +254,29 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
         memory_hint, memory_log = _memory_hint(initial_surfaced_errors, fault_type)
         if memory_log:
             log_memory(memory_log)
+
+        # Inject optimal-path hint from a prior successful episode for this fault type.
+        optimal_path_hint = ""
+        if recall_optimal_path is not None:
+            prior_path = recall_optimal_path(fault_type)
+            if prior_path:
+                path_lines = "\n".join(
+                    f"  {i+1}. [{s['operation']}] target={s.get('target','') or '—'}  "
+                    f"{'value=' + repr(s['value'][:60]) + '  ' if s.get('value') else ''}"
+                    f"→ {s.get('rationale', '')}"
+                    for i, s in enumerate(prior_path)
+                )
+                optimal_path_hint = (
+                    f"Optimal path learned from a prior successful episode for fault_type={fault_type}:\n"
+                    f"{path_lines}\n"
+                    "Follow this sequence closely — it resolved the incident efficiently."
+                )
+
         task_intro = f"Task: {task_title}\n\n{format_obs_for_llm(observation, 0)}"
         if memory_hint:
             task_intro += f"\n\n{memory_hint}"
+        if optimal_path_hint:
+            task_intro += f"\n\n{optimal_path_hint}"
         messages.append(
             {
                 "role": "user",
@@ -273,7 +345,7 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                             "Model failed to emit required tool calls repeatedly. "
                             "Strict tool-calling is mandatory and fallback is disabled."
                         )
-                    if guard_attempts < 4:
+                    if guard_attempts < 3:  # reduced from 4 to 3 for faster failure
                         messages = trim_messages(messages)
                         continue
                     raise RuntimeError(
@@ -385,7 +457,7 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                         )
                     should_resample = True
 
-                if should_resample and guard_attempts < 4:
+                if should_resample and guard_attempts < 3:  # reduced from 4 to 3
                     messages = trim_messages(messages)
                     continue
 
@@ -442,7 +514,7 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                 last_fix_value = value
                 if pre_fix_errors:
                     errors_at_last_fix = pre_fix_errors
-            
+
             action_text = f"{operation}|{target}|{value}"
             log_step(step=step, action=action_text, reward=reward, done=done, error=error, llm_thought=llm_thought)
             if INFERENCE_VERBOSE:
@@ -456,6 +528,13 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                 )
             history.append(f"{action_text} -> reward {reward:+.2f}")
             action_history.append((operation, target, value))
+            step_trace.append({
+                "operation": operation,
+                "target": target,
+                "value": value[:120] if value else "",
+                "reward": round(reward, 3),
+                "rationale": _step_rationale(operation, target, value, reward),
+            })
             if operation == "inspect_config" and target:
                 inspected_config_targets.add(target)
                 # Re-enable surfaced-file guardrail if a new file appears later
@@ -565,6 +644,18 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
         if remember is not None and memory_errors and last_fix_value:
             try:
                 remember(memory_errors, last_fix_value, success)
+            except Exception:
+                pass
+        if remember_optimal_path is not None and resolved and fault_type_for_memory:
+            try:
+                optimal = _build_optimal_path(step_trace, resolved)
+                if optimal:
+                    remember_optimal_path(fault_type_for_memory, optimal)
+                    print(
+                        f"[MEMORY] Stored optimal path for fault_type={fault_type_for_memory} "
+                        f"({len(optimal)} steps)",
+                        flush=True,
+                    )
             except Exception:
                 pass
     except Exception as _episode_exc:

@@ -32,6 +32,7 @@ from cicd.pipeline_runner import (
     StageStatus,
     STAGE_ORDER,
     cleanup_pipeline,
+    cleanup_cache_image,
     setup_repo_from_template,
 )
 from cicd.fault_injector import (
@@ -1321,6 +1322,13 @@ class RealCICDRepairEnvironment(Environment):
         if ep.pipeline_result and ep.pipeline_result not in ep.all_pipeline_results:
             try:
                 cleanup_pipeline(ep.pipeline_result)
+            except Exception:
+                pass
+
+        # Remove the shared cache image now that the episode is fully done.
+        if ep.pipeline_runner:
+            try:
+                cleanup_cache_image(ep.pipeline_runner._cache_tag)
             except Exception:
                 pass
 

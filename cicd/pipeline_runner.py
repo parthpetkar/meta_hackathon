@@ -57,6 +57,7 @@ class PipelineResult:
     total_duration_seconds: float = 0.0
     workspace_dir: str = ""
     image_tag: str = ""
+    cache_tag: str = ""
 
     def __post_init__(self):
         if not self.stages:
@@ -138,6 +139,10 @@ class PipelineRunner:
         self._result: Optional[PipelineResult] = None
         self._lock = threading.Lock()
         self._running = False
+        # Stable tag used as a BuildKit cache source across reruns within this episode.
+        # The requirements layer (the slow pip install) is reused as long as
+        # requirements.txt hasn't changed, which is the common case on reruns.
+        self._cache_tag = f"{self.image_tag}-cache"
 
     @property
     def result(self) -> Optional[PipelineResult]:
@@ -158,8 +163,10 @@ class PipelineRunner:
             pipeline_id=pipeline_id,
             status=PipelineStatus.RUNNING,
             workspace_dir=ws_dir,
-            # Unique tag per run so Docker always builds a fresh image
+            # Unique tag per run so cleanup only removes this run's image,
+            # not the shared cache image.
             image_tag=f"{self.image_tag}-{pipeline_id}",
+            cache_tag=self._cache_tag,
         )
 
         with self._lock:
@@ -252,13 +259,27 @@ class PipelineRunner:
                 result.stages["build"].command = "secret-scan"
                 return scan_exit, all_stdout, all_stderr
 
-        cmd = ["docker", "build", "-t", result.image_tag, workspace_dir]
+        # Build with cache-from so the requirements/pip-install layer is reused
+        # on reruns within the same episode (the cache image is never deleted
+        # by cleanup_pipeline — only the per-run image_tag is removed).
+        cmd = ["docker", "build", "-t", result.image_tag]
+        if result.cache_tag:
+            cmd += ["--cache-from", result.cache_tag]
+        cmd.append(workspace_dir)
         result.stages["build"].command = " ".join(cmd)
         exit_code, stdout, stderr = _run_subprocess(cmd, cwd=workspace_dir, timeout=self.timeout)
         all_stdout += stdout
         all_stderr += stderr
         if exit_code != 0:
             return exit_code, all_stdout, all_stderr
+
+        # Promote successful build to the stable cache tag so the next rerun
+        # can reuse its layers (this is a local tag operation, nearly instant).
+        if result.cache_tag:
+            _run_subprocess(
+                ["docker", "tag", result.image_tag, result.cache_tag],
+                timeout=30,
+            )
 
         if self.log_config_check_enabled:
             chk_exit, chk_out, chk_err = self._log_config_check(workspace_dir, result.image_tag)
@@ -368,7 +389,12 @@ class PipelineRunner:
 
 
 def cleanup_pipeline(result: PipelineResult) -> None:
-    """Remove Docker image and stop compose services created by a pipeline run."""
+    """Remove the per-run Docker image and stop compose services.
+
+    The cache image (result.cache_tag) is intentionally left intact so that
+    subsequent reruns within the same episode can reuse its layers.
+    Call cleanup_cache_image() after the episode ends to remove it.
+    """
     if result.image_tag:
         try:
             subprocess.run(["docker", "rmi", "-f", result.image_tag], capture_output=True, timeout=30)
@@ -387,6 +413,16 @@ def cleanup_pipeline(result: PipelineResult) -> None:
             )
         except Exception:
             pass
+
+
+def cleanup_cache_image(cache_tag: str) -> None:
+    """Remove the stable cache image after an episode ends."""
+    if not cache_tag:
+        return
+    try:
+        subprocess.run(["docker", "rmi", "-f", cache_tag], capture_output=True, timeout=30)
+    except Exception:
+        pass
 
 
 def setup_repo_from_template(template_dir: str, target_dir: str) -> str:

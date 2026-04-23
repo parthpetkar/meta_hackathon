@@ -60,13 +60,17 @@ BASE_SYSTEM_PROMPT = textwrap.dedent(
         - Gather evidence (view_logs/inspect_*) before setting a new hypothesis
         - Inspect only relevant stages (wrong stage = penalty)
         - Only rerun_pipeline AFTER applying a fix
-        - Always run verify_fix after rerun_pipeline and before finalize
+        - MANDATORY: Always run verify_fix after rerun_pipeline shows PASSED before finalize
+        - NEVER call finalize without calling verify_fix first (penalty: -0.05)
         - Only finalize when ALL issues are resolved and verification has passed
         - Avoid redundant or repeated actions
 
-        Tool sequence guidance:
+        Tool sequence guidance (FOLLOW THIS EXACTLY):
         view_logs -> inspect relevant config/dockerfile/permissions -> set_hypothesis ->
         apply fix (modify_config or add_dependency) -> rerun_pipeline -> verify_fix -> finalize
+        
+        CRITICAL: If pipeline PASSED after rerun_pipeline, your NEXT action MUST be verify_fix.
+        Do NOT skip verify_fix. Do NOT call finalize directly after rerun_pipeline.
     """
 ).strip()
 

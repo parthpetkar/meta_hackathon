@@ -106,7 +106,7 @@ class AdversarialDesigner:
         api_key: Optional[str] = None,
         model: Optional[str] = None,
         base_url: Optional[str] = None,
-        timeout_seconds: int = 30,
+        timeout_seconds: int = 15,  # reduced from 30 to 15
     ) -> None:
         self._api_key = (
             api_key
@@ -164,7 +164,7 @@ class AdversarialDesigner:
                     {"role": "user", "content": json.dumps(payload)},
                 ],
                 temperature=0.7,
-                max_tokens=1400,
+                max_tokens=1200,  # reduced from 1400 to 1200 (1000 was too aggressive)
             ).choices[0].message.content or "{}"
 
             raw = raw.strip()
@@ -176,7 +176,34 @@ class AdversarialDesigner:
                 raw = raw[:-3]
             raw = raw.strip()
 
-            data = json.loads(raw)
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as json_err:
+                # If JSON is truncated (unterminated string), retry with more tokens
+                if "Unterminated string" in str(json_err) or "Expecting" in str(json_err):
+                    LOGGER.warning("JSON truncated, retrying with max_tokens=1400")
+                    raw = self._client.chat.completions.create(
+                        model=self._model,
+                        response_format={"type": "json_object"},
+                        messages=[
+                            {"role": "system", "content": ADVERSARIAL_DESIGNER_PROMPT},
+                            {"role": "user", "content": json.dumps(payload)},
+                        ],
+                        temperature=0.7,
+                        max_tokens=1400,  # retry with original limit
+                    ).choices[0].message.content or "{}"
+                    
+                    raw = raw.strip()
+                    if raw.startswith("```json"):
+                        raw = raw[7:]
+                    elif raw.startswith("```"):
+                        raw = raw[3:]
+                    if raw.endswith("```"):
+                        raw = raw[:-3]
+                    raw = raw.strip()
+                    data = json.loads(raw)
+                else:
+                    raise
             # Ensure DB choices exist; fall back to curriculum-style defaults if missing
             if "db_backend" not in data:
                 data["db_backend"] = "sqlite" if difficulty < 0.45 else "postgres"
