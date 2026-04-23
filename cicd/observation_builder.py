@@ -202,6 +202,10 @@ def build_surfaced_errors(pipeline_result: PipelineResult, workspace_dir: str = 
             # since they are downstream symptoms of the conflict, not root causes
             if conflict_errors and any(skip in line for skip in ["SyntaxError", "IndentationError"]):
                 continue
+            # Filter registry cache noise — this is a benign Docker BuildKit cache miss
+            # that appears in every build regardless of fault type and always misleads the agent.
+            if "failed to configure registry cache importer" in line or "insufficient_scope" in line:
+                continue
             stage_errors.append(line)
 
     clue_errors = _build_config_clues(stage_errors, workspace_dir)

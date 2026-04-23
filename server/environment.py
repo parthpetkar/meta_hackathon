@@ -445,7 +445,11 @@ class RealCICDRepairEnvironment(Environment):
             adversarial_scenario = procedural_scenario
             injected = inject_procedural(repo_dir, adversarial_scenario)
         else:
-            # LLM-generated scenario as-is
+            # LLM-generated scenario as-is — but only inject cascade faults when
+            # difficulty is high enough; otherwise strip them from the scenario
+            # before injection so they never land in the workspace.
+            if curriculum_difficulty < 0.65 and len(adversarial_scenario.steps) > 1:
+                adversarial_scenario.steps = adversarial_scenario.steps[:1]
             injected = self._adv_designer.inject(repo_dir, adversarial_scenario)
 
         fault_type = adversarial_scenario.steps[0].fault_type if adversarial_scenario.steps else "merge_conflict"
@@ -459,6 +463,7 @@ class RealCICDRepairEnvironment(Environment):
         )
 
         fault_metadata = injected[0] if injected else inject_fault(repo_dir, fault_type)
+        # Cascading faults only enabled for hard difficulty (curriculum >= 0.65).
         cascading_faults: list = injected[1:] if len(injected) > 1 else []
 
         # Run the pipeline — if injection silently failed and pipeline passes,
@@ -610,7 +615,7 @@ class RealCICDRepairEnvironment(Environment):
         difficulty = self._get_difficulty(fault_type)
 
         # Build max_steps — single source of truth via _get_max_steps
-        max_steps = self._get_max_steps(fault_type)
+        max_steps = self._get_max_steps(fault_type, cascade_count=len(cascading_faults))
 
         obs_dict = build_observation(
             pipeline_result=pipeline_result,
@@ -718,7 +723,8 @@ class RealCICDRepairEnvironment(Environment):
         # Determine if episode is done
         done = False
         fault_type_for_steps = episode.fault_metadata.fault_type if episode.fault_metadata else "unknown"
-        max_steps = self._get_max_steps(fault_type_for_steps)
+        cascade_count_for_steps = len(episode.cascading_faults) if episode.cascading_faults else 0
+        max_steps = self._get_max_steps(fault_type_for_steps, cascade_count=cascade_count_for_steps)
 
         if operation == "finalize":
             done = True
@@ -884,12 +890,20 @@ class RealCICDRepairEnvironment(Environment):
             ep.hypothesis_correct = True
             ep.findings.append(f"Hypothesis partially aligns (matched {match_count}/{len(keywords)} keywords). Apply the fix.")
             if ep.hypothesis_attempts == 1:
-                return 0.18 if match_ratio >= 0.4 else 0.12
-            return 0.08 if match_ratio >= 0.4 else 0.05
+                # Scale base reward by difficulty: more keywords = harder problem = higher ceiling.
+                # A 7-keyword fault deserves more reward for a good match than a 3-keyword fault.
+                difficulty_scale = min(1.5, max(1.0, len(keywords) / 4.0))
+                base_high = round(min(0.25, 0.18 * difficulty_scale), 3)
+                base_low  = round(min(0.18, 0.12 * difficulty_scale), 3)
+                return base_high if match_ratio >= 0.4 else base_low
+            # Subsequent attempts: reward scales down but still difficulty-aware
+            difficulty_scale = min(1.4, max(1.0, len(keywords) / 4.0))
+            return round(min(0.12, 0.08 * difficulty_scale), 3) if match_ratio >= 0.4 else round(min(0.08, 0.05 * difficulty_scale), 3)
         else:
-            # Give a hint using the ROOT CAUSE fault's keywords (not cascading fault's)
+            # Give a hint using ALL root-cause keywords (not just first 3) so the agent
+            # isn't playing a truncated guessing game on high-keyword faults.
             root_fault = ep.fault_metadata.fault_type
-            hint_keywords = FAULT_KEYWORDS.get(root_fault, keywords)[:3]
+            hint_keywords = FAULT_KEYWORDS.get(root_fault, keywords)
             ep.findings.append("Hypothesis does not match current evidence. Try mentioning: " + ", ".join(hint_keywords))
             return -0.10
 
@@ -1000,9 +1014,23 @@ class RealCICDRepairEnvironment(Environment):
                     f"Pipeline advanced from '{old_failed_stage}' to '{new_result.failed_stage}'."
                 )
             else:
-                ep.findings.append("Pipeline still failing at the same stage.")
+                msg = "Pipeline still failing at the same stage."
+                # If cascading faults are present, the same-stage failure may be
+                # caused by the next fault in the chain — not the one just fixed.
+                if ep.cascading_faults:
+                    msg += (
+                        " This incident has cascading faults — the previous fix may have "
+                        "resolved the first fault but exposed a second independent fault. "
+                        "Re-read surfaced_errors now and treat the new error as a fresh root cause."
+                    )
+                ep.findings.append(msg)
         elif old_status == PipelineStatus.FAILED and new_result.status == PipelineStatus.FAILED:
-            ep.findings.append("Rerun shows failure unchanged; refine diagnosis.")
+            msg = "Rerun shows failure unchanged; refine diagnosis."
+            if ep.cascading_faults:
+                msg += (
+                    " Note: cascading faults are active — if errors changed, this is a new fault."
+                )
+            ep.findings.append(msg)
 
         ep.last_rerun_progressed = progressed
 
@@ -1103,11 +1131,13 @@ class RealCICDRepairEnvironment(Environment):
         }
         return difficulty_map.get(fault_type, "medium")
 
-    def _get_max_steps(self, fault_type: str) -> int:
+    def _get_max_steps(self, fault_type: str, cascade_count: int = 0) -> int:
         """Single source of truth for max_steps — used by both reset() and step()."""
         difficulty = self._get_difficulty(fault_type)
         max_steps_map = {"easy": 16, "medium": 20, "network": 20, "security": 20, "hard": 25}
-        return max_steps_map.get(difficulty, 20)
+        base = max_steps_map.get(difficulty, 20)
+        # Each cascading fault adds 4 steps — the agent must debug multiple independent faults.
+        return base + cascade_count * 4
 
     def _is_destructive_fix(self, value: str) -> bool:
         normalized = (value or "").strip().lower()
@@ -1262,9 +1292,9 @@ class RealCICDRepairEnvironment(Environment):
 
         # Efficiency bonus
         step_count = self._state.step_count
-        max_steps_map = {"easy": 16, "medium": 20, "network": 20, "security": 20, "hard": 25}
-        difficulty = self._get_difficulty(ep.fault_metadata.fault_type if ep.fault_metadata else "medium")
-        max_steps = max_steps_map.get(difficulty, 15)
+        fault_type_eff = ep.fault_metadata.fault_type if ep.fault_metadata else "medium"
+        cascade_count_eff = len(ep.cascading_faults) if ep.cascading_faults else 0
+        max_steps = self._get_max_steps(fault_type_eff, cascade_count=cascade_count_eff)
         efficiency = max(0.0, 1.0 - (step_count / max_steps))
         score += efficiency * 0.10
 

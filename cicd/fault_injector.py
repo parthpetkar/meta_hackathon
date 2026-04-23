@@ -322,6 +322,11 @@ def _inject_flaky_test(workspace: str) -> FaultMetadata:
 
 def _inject_missing_permission(workspace: str) -> FaultMetadata:
     path = os.path.join(workspace, "docker-compose.yml")
+    # Read existing content to preserve environment variables and volumes
+    with open(path, "r", encoding="utf-8") as f:
+        original = f.read()
+    
+    # Inject external network reference that will cause docker compose to fail
     with open(path, "w", encoding="utf-8") as f:
         f.write(textwrap.dedent("""\
             version: "3.8"
@@ -335,10 +340,13 @@ def _inject_missing_permission(workspace: str) -> FaultMetadata:
                   - "5000:5000"
                 environment:
                   - FLASK_ENV=production
+                  - LOG_PATH=/app/logs/app.log
+                  - LOG_LEVEL=INFO
+                  - SERVICE_NAME=api
                 networks:
                   - restricted_internal_net
                 volumes:
-                  - /opt/nonexistent-shared-data:/app/data:ro
+                  - ./logs:/app/logs
                 healthcheck:
                   test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
                   interval: 30s

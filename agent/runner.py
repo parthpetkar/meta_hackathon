@@ -88,12 +88,10 @@ def _memory_hint(errors: List[str], fault_type: str) -> Tuple[str, str]:
         return "", ""
     confidence = float(suggestion.get("confidence", 0.0) or 0.0)
     times_seen = int(suggestion.get("times_seen", 0) or 0)
-    fix_text = str(suggestion.get("suggested_fix", "")).strip()
+    fix_text = str(suggestion.get("suggested_fix", "")).strip()[:300]  # cap to avoid context overflow
     hint = (
-        "Persistent memory hint from prior episodes:\n"
-        f"- confidence: {confidence:.3f}\n"
-        f"- times_seen: {times_seen}\n"
-        f"- suggested_fix: {fix_text}"
+        "Memory hint (prior episode):\n"
+        f"confidence={confidence:.2f} seen={times_seen}x fix={fix_text}"
     )
     memory_log = str(suggestion.get("memory_log", "") or "")
     return hint, memory_log
@@ -114,9 +112,24 @@ def _repetition_escape_action(
     repeated_action: Tuple[str, str, str],
 ) -> Tuple[str, str, str]:
     stage = observation.current_stage or "build"
+    repeated_op, repeated_target, _ = repeated_action
     repeated_text = "|".join(repeated_action).lower()
 
+    # Build a broad candidate pool — prefer actions that surface new information
+    # rather than immediately jumping to a different fix target.
     candidates: List[Tuple[str, str, str]] = []
+
+    # If the agent is stuck on a fix, first make it re-read the error output so
+    # the model can reason about the actual failure before trying something else.
+    if repeated_op in {"modify_config", "add_dependency", "modify_dockerfile"}:
+        candidates.extend(
+            [
+                ("view_logs", stage, ""),
+                ("view_logs", "build", ""),
+                ("view_logs", "test", ""),
+            ]
+        )
+
     if "requirements" in repeated_text or stage == "build":
         candidates.extend(
             [
@@ -131,12 +144,15 @@ def _repetition_escape_action(
             ("view_logs", stage, ""),
             ("inspect_config", "docker-compose.yml", ""),
             ("inspect_dockerfile", "build", ""),
+            ("inspect_config", "services/api/Dockerfile", ""),
+            ("view_logs", "build", ""),
         ]
     )
 
     for candidate in candidates:
         if candidate != repeated_action and candidate not in action_history:
             return candidate
+    # Last resort: view logs for current stage even if seen before
     return ("view_logs", stage, "")
 
 
@@ -345,7 +361,7 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                             "Model failed to emit required tool calls repeatedly. "
                             "Strict tool-calling is mandatory and fallback is disabled."
                         )
-                    if guard_attempts < 3:  # reduced from 4 to 3 for faster failure
+                    if guard_attempts < MAX_CONSECUTIVE_TOOL_CALL_MISSES:
                         messages = trim_messages(messages)
                         continue
                     raise RuntimeError(
@@ -477,12 +493,17 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                 break
 
             action_tuple = (operation, target, value)
-            if action_history.count(action_tuple) >= 3:
+            # Allow harder episodes (difficulty > 0.4) one extra attempt before forcing
+            # an escape — complex faults sometimes legitimately need 4 identical iterations
+            # (e.g. read → apply → rerun → re-read after a failed fix).
+            difficulty_str = (observation.difficulty or "").lower()
+            repetition_threshold = 4 if difficulty_str in ["hard", "security"] else 3
+            if action_history.count(action_tuple) >= repetition_threshold:
                 operation, target, value = _repetition_escape_action(observation, action_history, action_tuple)
                 assistant_message = {
                     "role": "assistant",
                     "content": (
-                        "Repetition guard triggered: forcing a different action after 3+ identical attempts "
+                        f"Repetition guard triggered: forcing a different action after {repetition_threshold}+ identical attempts "
                         f"-> {operation}|{target}|{value}"
                     ),
                 }

@@ -30,6 +30,13 @@ BASE_SYSTEM_PROMPT = textwrap.dedent(
           5. Before calling set_hypothesis, you must have called inspect_config on the file
               named in surfaced_errors. No hypothesis without evidence.
 
+          5b. CASCADING FAULTS: A single incident may have multiple independent root causes
+              injected in sequence. If rerun_pipeline still fails after you successfully
+              applied a fix, the remaining failure is a NEW fault — not a symptom of the one
+              you just fixed. Re-read surfaced_errors from scratch, form a fresh hypothesis
+              for the new error, apply a separate fix, then rerun again. Treat each new
+              error pattern as a distinct fault to resolve.
+
           6. Merge conflict markers look like: <<<<<<< HEAD ... ======= ... >>>>>>> branch
               If you see these, use modify_config with structured JSON to remove the markers:
               {"file": "services/api/routes.py", "action": "replace",
@@ -104,6 +111,7 @@ TASK_SKILL_CARDS: Dict[str, List[str]] = {
     "medium": [
         "Solve dependency compatibility first (requests/urllib3), then Docker install order.",
         "Use add_dependency for version pinning and modify_config for Docker order corrections.",
+        "Expect cascading faults: after fixing the first error, re-read surfaced_errors for a new independent fault (e.g. logging config, Docker order). Apply a separate fix for each.",
     ],
     "network": [
         "Classify DNS and timeout upload failures as transient external dependency outages when evidence supports it.",
