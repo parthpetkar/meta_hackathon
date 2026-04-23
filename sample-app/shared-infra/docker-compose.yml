@@ -12,7 +12,7 @@ services:
       - LOG_PATH=/app/logs/app.log
       - LOG_LEVEL=INFO
       - SERVICE_NAME=frontend
-      - API_URL=http://api-service:8000
+      - API_URL=http://api-service:8001
     env_file: .env
     volumes:
       - ../logs:/app/logs
@@ -26,7 +26,7 @@ services:
       context: ../api-service
       dockerfile: Dockerfile
     ports:
-      - "8000:8000"
+      - "8001:8001"
     env_file: .env
     networks:
       - app-network
@@ -37,7 +37,7 @@ services:
       dockerfile: Dockerfile
     env_file: .env
     environment:
-      - API_URL=http://api-service:8000
+      - API_URL=http://api-service:8001
     networks:
       - app-network
 

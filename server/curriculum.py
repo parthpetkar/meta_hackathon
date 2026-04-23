@@ -99,7 +99,7 @@ class CurriculumController:
             ).fetchone()
         finally:
             db.close()
-        return float(row[0]) if row else 0.40
+        return float(row[0]) if row else 0.20
 
     def select_fault_type(self) -> str:
         """

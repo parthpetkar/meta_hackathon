@@ -469,6 +469,9 @@ class RealCICDRepairEnvironment(Environment):
             timeout_per_stage=self._pipeline_timeout,
         )
         pipeline_result = runner.run(workspace_dir=repo_dir)
+        
+        # Clean up Docker image after initial build
+        cleanup_pipeline(pipeline_result)
 
         _retry = 0
         try:
@@ -483,6 +486,9 @@ class RealCICDRepairEnvironment(Environment):
                 if fallback_fault:
                     fault_metadata = fallback_fault
                 pipeline_result = runner.run(workspace_dir=repo_dir)
+                
+                # Clean up Docker image after retry build
+                cleanup_pipeline(pipeline_result)
         except Exception as _exc:
             logger.exception("[reset] Fault injection retry failed — continuing with current state.")
 
@@ -937,6 +943,9 @@ class RealCICDRepairEnvironment(Environment):
         ep.all_pipeline_results.append(new_result)
         ep.pipeline_result = new_result
 
+        # Clean up Docker image after build to prevent disk space issues
+        cleanup_pipeline(new_result)
+
         # ── Mid-episode schema/state drift ─────────────────────────────
         # Once the pipeline passes, the *world* may shift: a team rotates an
         # endpoint, infra pins a new dep, ports change. This forces the agent
@@ -959,6 +968,9 @@ class RealCICDRepairEnvironment(Environment):
                 new_result = ep.pipeline_runner.run(workspace_dir=ep.workspace_dir)
                 ep.all_pipeline_results.append(new_result)
                 ep.pipeline_result = new_result
+                
+                # Clean up Docker image after drift rerun
+                cleanup_pipeline(new_result)
 
         # Append per-stage logs so the agent can see what happened
         for stage_name in STAGE_ORDER:
