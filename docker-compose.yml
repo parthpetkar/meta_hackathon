@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 #
 # Fault-injection flags (set in .env or shell before `docker compose up`):
-#   BAD_MIGRATION_SQL=true   SCHEMA_DRIFT=true
+#   BAD_MIGRATION_SQL=true
 # See db/faults.py for the full registry.
 
 services:
@@ -28,7 +28,6 @@ services:
       - LOG_LEVEL=INFO
       - SERVICE_NAME=env-server
       - BAD_MIGRATION_SQL=${BAD_MIGRATION_SQL:-false}
-      - SCHEMA_DRIFT=${SCHEMA_DRIFT:-false}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 10s

@@ -48,7 +48,6 @@ Runtime architecture (current):
 - `cicd/fault_injector.py` injects task faults into the episode workspace (20 fault types across single-app, logging, multi-app, and DB categories).
 - `cicd/pipeline_runner.py` executes `clone -> build -> test -> deploy` via subprocess with BuildKit layer caching.
 - `cicd/observation_builder.py` builds surfaced errors/logs/config snapshots.
-- `cicd/drift_injector.py` performs opt-in mid-episode drift mutations.
 - `cicd/fix_applier.py` applies structured JSON or heuristic fixes and commits successful changes.
 
 ## Architecture
@@ -69,7 +68,6 @@ The runtime follows a layered architecture to keep OpenEnv APIs stable while evo
 ### 3) Evidence Layer
 
 - `cicd/observation_builder.py`: builds surfaced logs/errors/metrics/config snapshots.
-- `cicd/drift_injector.py`: optional post-recovery drift to force re-triage.
 
 ### 4) Adaptation + Scoring Layer
 
@@ -92,9 +90,8 @@ The runtime follows a layered architecture to keep OpenEnv APIs stable while evo
 1. `reset()` creates a workspace from `sample-app`, curriculum selects fault type via UCB1, LLM adversarial designer composes the scenario, faults are injected, pipeline runs, observation returned.
 2. Agent issues inspect/hypothesis/fix/rerun/verify actions via `step()`.
 3. Environment updates state, applies phase shaping + safeguards, and emits next observation.
-4. Optional drift mutates state after a successful rerun, requiring re-triage.
-5. `finalize` is accepted only after a valid `verify_fix`; terminal score blends deterministic + optional rubric.
-6. Episode outcome is recorded in curriculum; optimal fix path is stored in agent memory for future hint injection.
+4. `finalize` is accepted only after a valid `verify_fix`; terminal score blends deterministic + optional rubric.
+5. Episode outcome is recorded in curriculum; optimal fix path is stored in agent memory for future hint injection.
 
 ## Action space
 
@@ -123,7 +120,6 @@ At each step the agent receives structured state including:
 - Config snapshots: `config_files`.
 - Reasoning trace: `findings`, `action_history`, `current_hypothesis`, `attempted_fix`, `hypothesis_history`.
 - Progress indicators: `active_issue_index`, `revealed_issue_count`, `incident_resolved`.
-- World drift signal: `drift_detected` (true after a mid-episode drift event).
 - Safety/cost signals: `pipeline_health`, `recovery_cost`, `redundant_actions`, `destructive_actions`.
 - Episode outputs: `reward`, `done`, `final_score` (terminal), and `metadata`.
 
@@ -186,14 +182,12 @@ The runtime includes adaptive curriculum, adversarial incident generation, and c
 - Curriculum difficulty and skill-profile stats are injected into scenario design on every `reset()`.
 - `server/adversarial_designer.py` uses an LLM to generate multi-fault incidents (root cause + cascades + optional red herring). Timeout is 15 s with automatic retry at higher `max_tokens` if JSON is truncated.
 - `server/adversarial_judge.py` adds phase-aware shaping bonuses/penalties for triage, investigation, hypothesis, fix, and verification.
-- `cicd/drift_injector.py` can mutate the workspace after a successful rerun to simulate live infra/schema drift.
 - `server/agent_memory.py` stores the optimal fix path from each resolved episode and injects it as a hint on the next episode of the same fault type, accelerating convergence.
 
 How this affects episodes:
 
 - Episodes are no longer static one-shot puzzles; they can include cascading failure structure.
 - Agent behavior is rewarded for correct SRE phase progression, not only final pass/fail.
-- Optional drift forces re-triage and adaptation after an apparent recovery.
 - Difficulty increases more aggressively (step cap 0.15 vs previous 0.08) so the curriculum escapes early-difficulty stagnation.
 - Cascading faults are only injected when curriculum difficulty ≥ 0.65, keeping early episodes simple.
 
@@ -203,7 +197,6 @@ Key controls:
 - Adversarial designer endpoint/model: `CICD_ADV_BASE_URL`, `CICD_ADV_MODEL`
 - Adversarial provider headers/keys: `OPENROUTER_API_KEY`, `OPENROUTER_REFERER`, `OPENROUTER_TITLE`
 - Adversarial designer also respects `LLM_PROVIDER` — set `GROQ_API_KEY` or `HF_TOKEN` and the designer uses the same provider as the agent automatically.
-- Drift: `META_HACKATHON_DRIFT_ENABLED`, `META_HACKATHON_DRIFT_PROBABILITY`
 - Episode count for inference/evaluation loops: `META_HACKATHON_NUM_EPISODES`
 
 ## Task descriptions
@@ -417,9 +410,6 @@ META_HACKATHON_RUBRIC_DEBUG=false
 # Optional override for rubric provider specifically
 # RUBRIC_LLM_PROVIDER=openrouter
 
-# Mid-episode state/schema drift injection (experimental world-modeling feature)
-META_HACKATHON_DRIFT_ENABLED=true
-META_HACKATHON_DRIFT_PROBABILITY=0.4
 ```
 
 Optional local inference debug variables:

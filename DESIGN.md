@@ -35,7 +35,6 @@ All architecture changes are implemented behind this contract.
 - Scenario and mutation layer:
   - Fault injection: `cicd/fault_injector.py`
   - Procedural scenario generator: `cicd/procedural_generator.py`
-  - Mid-episode drift: `cicd/drift_injector.py`
 - Evidence layer: `cicd/observation_builder.py`
   - Builds surfaced errors, config snapshots, metrics, and stage-specific logs.
 - Fix execution layer: `cicd/fix_applier.py`
@@ -106,12 +105,6 @@ Fault injection reliability constraints:
 - `flaky_test` uses a deterministic impossibly tight threshold so every episode has a real failure. The agent still sees a timing-sensitive assertion and must diagnose it as a flaky/policy issue.
 - `missing_permission` injects an `external: true` network reference without a `name:` alias, which is reliably rejected by Docker Compose across versions.
 - `infra_port_conflict` targets port `8001:8001` (the current template) with a fallback scan for the legacy `8000:8000` mapping. Both the injector and fix applier maintain this dual-port logic for backward compatibility.
-
-### 5.2 Mid-episode drift
-
-When drift is enabled, a successful rerun may trigger a second mutation (for example compose key/env drift), causing new failure signals and requiring re-triage.
-
-Observation fields include drift indicators (`drift_detected` and drift metadata in `metadata`) so downstream agents/evaluators can attribute behavior.
 
 ## 6. Reward and scoring model
 
@@ -187,7 +180,7 @@ Observation payload surfaces:
 - config file snapshots,
 - reasoning trace (`findings`, action/hypothesis history),
 - scoring diagnostics (`deterministic_score`, `rubric_score`, `delayed_reward`),
-- drift and verification readiness metadata.
+- verification readiness metadata.
 
 ### 9.2 Audit trail and reproducibility
 
@@ -200,7 +193,6 @@ Generated artifacts in `results/` capture deterministic evaluation and inference
 Preferred extension points:
 
 - Add new fault types in `cicd/fault_injector.py` (and register in `FAULT_TYPES`, `FAULT_STAGE_MAP`, `FAULT_KEYWORDS`) and clue extraction in `cicd/observation_builder.py`.
-- Add new drift strategies in `cicd/drift_injector.py`.
 - Tune rewards/terminal components in `server/environment.py`.
 - Extend semantic judging policy in `server/rubric_judge.py`.
 - Add agent guards/strategies in `agent/actions.py` and `agent/runner.py`.
