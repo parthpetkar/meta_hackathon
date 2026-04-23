@@ -36,25 +36,14 @@ FAULT_TYPES = [
     "secret_exposure",
     "env_drift",
     # Logging / observability faults
-    "log_bad_config",
-    "log_path_unwritable",
-    "log_volume_missing",
-    "log_rotation_missing",
     "log_pii_leak",
     "log_disabled",
-    # Multi-app cross-service faults
-    "shared_secret_rotation",
-    "infra_port_conflict",
-    "dependency_version_drift",
 ]
 
 # Database-specific faults (used when scenario requests DB-targeted failures)
 DB_FAULT_TYPES = [
     "bad_migration_sql",
     "schema_drift",
-    "wrong_db_url",
-    "init_order_race",
-    "missing_volume_mount",
 ]
 
 # Expose combined fault types for generators that want the full set
@@ -65,9 +54,6 @@ FAULT_STAGE_MAP: Dict[str, str] = {
     # DB faults
     "bad_migration_sql": "build",
     "schema_drift": "build",
-    "wrong_db_url": "deploy",
-    "init_order_race": "deploy",
-    "missing_volume_mount": "deploy",
     "merge_conflict": "test",       # SyntaxError surfaces when pytest imports routes.py
     "dependency_conflict": "build",
     "docker_order": "build",
@@ -75,26 +61,15 @@ FAULT_STAGE_MAP: Dict[str, str] = {
     "missing_permission": "deploy",
     "secret_exposure": "build",
     "env_drift": "deploy",
-    # Logging faults — all caught by check_logs.py running after docker build
-    "log_bad_config":       "build",  # non-JSON output detected by check_logs
-    "log_path_unwritable":  "build",  # LOG_PATH points to restricted dir
-    "log_volume_missing":   "deploy", # log file unreachable from outside container
-    "log_rotation_missing": "build",  # RotatingFileHandler absent — config check fails
+    # Logging faults
     "log_pii_leak":         "build",  # static PII pattern found in routes.py
     "log_disabled":         "build",  # CRITICAL level silences all output
-    # Multi-app cross-service faults
-    "shared_secret_rotation":    "deploy",  # services reject auth after secret rotated in .env
-    "infra_port_conflict":       "deploy",  # port binding fails; frontend can't reach api-service
-    "dependency_version_drift":  "build",   # pip resolution impossible in api-service
 }
 
 # Keywords the agent's hypothesis should contain to score positively
 FAULT_KEYWORDS: Dict[str, List[str]] = {
     "bad_migration_sql": ["sql", "syntax", "migration"],
     "schema_drift": ["schema", "mismatch", "column"],
-    "wrong_db_url": ["database", "url", "connection"],
-    "init_order_race": ["startup", "race", "dependency"],
-    "missing_volume_mount": ["volume", "mount", "database"],
     "merge_conflict": ["merge", "conflict", "markers", "routes"],
     "dependency_conflict": ["dependency", "incompatible", "requests", "urllib3", "pip", "version"],
     "docker_order": ["docker", "order", "copy", "install", "layer", "dockerfile"],
@@ -102,24 +77,12 @@ FAULT_KEYWORDS: Dict[str, List[str]] = {
     "missing_permission": ["permission", "network", "deploy", "compose", "missing"],
     "secret_exposure": ["secret", "credential", "api_key", "hardcoded", "exposed", "scan"],
     "env_drift": ["environment", "variable", "compose", "port", "invalid", "deploy"],
-    "log_bad_config":       ["logging", "config", "json", "formatter", "malformed", "structured"],
-    "log_path_unwritable":  ["logging", "path", "permission", "writable", "log_path", "directory"],
-    "log_volume_missing":   ["logging", "volume", "mount", "compose", "logs", "missing"],
-    "log_rotation_missing": ["logging", "rotation", "rotating", "filehandler", "max_bytes", "unbounded"],
     "log_pii_leak":         ["logging", "pii", "credential", "token", "secret", "leak", "routes"],
     "log_disabled":         ["logging", "level", "critical", "disabled", "silent", "log_level"],
-    # Multi-app cross-service faults
-    "shared_secret_rotation":   ["secret", "auth", "rotation", "env", "shared", ".env", "authentication", "credential"],
-    "infra_port_conflict":      ["port", "conflict", "binding", "docker-compose", "api-service", "frontend", "address"],
-    "dependency_version_drift": ["dependency", "version", "drift", "incompatible", "fastapi", "pydantic", "requirements", "resolution"],
 }
 
 # Apps affected by each multi-app fault (single-app faults leave this empty)
-FAULT_AFFECTED_APPS: Dict[str, List[str]] = {
-    "shared_secret_rotation":   ["api-service", "worker"],
-    "infra_port_conflict":      ["frontend", "api-service"],
-    "dependency_version_drift": ["api-service", "worker"],
-}
+FAULT_AFFECTED_APPS: Dict[str, List[str]] = {}
 
 
 # ── Git helpers ────────────────────────────────────────────────────────────
@@ -166,22 +129,11 @@ def inject_fault(workspace: str, fault_type: str) -> FaultMetadata:
         "missing_permission": _inject_missing_permission,
         "secret_exposure": _inject_secret_exposure,
         "env_drift": _inject_env_drift,
-        "log_bad_config":       _inject_log_bad_config,
-        "log_path_unwritable":  _inject_log_path_unwritable,
-        "log_volume_missing":   _inject_log_volume_missing,
-        "log_rotation_missing": _inject_log_rotation_missing,
-        "log_pii_leak":         _inject_log_pii_leak,
-        "log_disabled":         _inject_log_disabled,
-        # Multi-app cross-service faults
-        "shared_secret_rotation":   _inject_shared_secret_rotation,
-        "infra_port_conflict":      _inject_infra_port_conflict,
-        "dependency_version_drift": _inject_dependency_version_drift,
+        "log_pii_leak":      _inject_log_pii_leak,
+        "log_disabled":      _inject_log_disabled,
         # DB faults
-        "bad_migration_sql":    _inject_bad_migration_sql,
-        "schema_drift":         _inject_schema_drift,
-        "wrong_db_url":         _inject_wrong_db_url,
-        "init_order_race":      _inject_init_order_race,
-        "missing_volume_mount": _inject_missing_volume_mount,
+        "bad_migration_sql": _inject_bad_migration_sql,
+        "schema_drift":      _inject_schema_drift,
     }
     if fault_type not in injectors:
         raise ValueError(f"Unknown fault type: {fault_type!r}. Valid: {FAULT_TYPES}")
@@ -436,109 +388,6 @@ def _inject_env_drift(workspace: str) -> FaultMetadata:
 
 
 # ── Logging / observability fault injectors ────────────────────────────────
-#
-# All six modify files in the workspace and commit the change so the pipeline
-# genuinely fails when check_logs.py (or the app itself) is exercised.
-
-
-def _inject_log_bad_config(workspace: str) -> FaultMetadata:
-    """Replace json.dumps with str() so the formatter emits Python dicts, not JSON."""
-    path = os.path.join(workspace, "services", "api", "logging_config.py")
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    # Replace the JSON serialisation call — logs become non-JSON, breaking check_logs
-    content = content.replace(
-        "return json.dumps(payload, ensure_ascii=False)",
-        "return str(payload)  # FAULT(log_bad_config): not valid JSON output",
-    )
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-
-    sha = _commit(workspace, "refactor: simplify log formatter for performance", [path])
-    return FaultMetadata(
-        fault_type="log_bad_config",
-        affected_files=["services/api/logging_config.py"],
-        injected_at_commit_sha=sha,
-        description="Formatter returns Python str(dict) instead of JSON — check_logs detects malformed records",
-    )
-
-
-def _inject_log_path_unwritable(workspace: str) -> FaultMetadata:
-    """Change LOG_PATH default to a root-owned directory the app process cannot write."""
-    path = os.path.join(workspace, "services", "api", "logging_config.py")
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    # Hardcode LOG_PATH to bypass the env override and point to an unwritable system dir
-    content = content.replace(
-        'LOG_PATH: str = os.environ.get("LOG_PATH", "/app/logs/app.log")',
-        'LOG_PATH: str = "/var/log/restricted/app.log"  # FAULT(log_path_unwritable)',
-    )
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-
-    sha = _commit(workspace, "ops: centralise log output to system log directory", [path])
-    return FaultMetadata(
-        fault_type="log_path_unwritable",
-        affected_files=["services/api/logging_config.py"],
-        injected_at_commit_sha=sha,
-        description="LOG_PATH default changed to /var/log/restricted/app.log — restricted directory, write fails",
-    )
-
-
-def _inject_log_volume_missing(workspace: str) -> FaultMetadata:
-    """Comment out the logs volume mount so the log file is inaccessible from the host."""
-    # The volume mount lives in shared-infra/docker-compose.yml, not the root compose file
-    path = os.path.join(workspace, "shared-infra", "docker-compose.yml")
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    new_content = content.replace(
-        "      - ../logs:/app/logs",
-        "      # FAULT(log_volume_missing): log volume mount removed\n      # - ../logs:/app/logs",
-    )
-    if new_content == content:
-        raise RuntimeError(
-            "_inject_log_volume_missing: volume mount line not found in shared-infra/docker-compose.yml — "
-            "template may have drifted from expected content"
-        )
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(new_content)
-
-    sha = _commit(workspace, "infra: remove ephemeral log volume (logs now in container only)", [path])
-    return FaultMetadata(
-        fault_type="log_volume_missing",
-        affected_files=["shared-infra/docker-compose.yml"],
-        injected_at_commit_sha=sha,
-        description="Log volume mount commented out — check_logs cannot reach the log file from the host",
-    )
-
-
-def _inject_log_rotation_missing(workspace: str) -> FaultMetadata:
-    """Replace RotatingFileHandler with plain FileHandler — logs grow unboundedly."""
-    path = os.path.join(workspace, "services", "api", "logging_config.py")
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    import re as _re
-    content = _re.sub(
-        r"logging\.handlers\.RotatingFileHandler\(\s*\n?"
-        r"\s*str\(path\), maxBytes=MAX_BYTES, backupCount=BACKUP_COUNT, encoding=\"utf-8\"\s*\n?"
-        r"\s*\)",
-        'logging.FileHandler(\n            str(path), encoding="utf-8"\n        )',
-        content,
-    )
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-
-    sha = _commit(workspace, "chore: simplify file handler — remove unused rotation config", [path])
-    return FaultMetadata(
-        fault_type="log_rotation_missing",
-        affected_files=["services/api/logging_config.py"],
-        injected_at_commit_sha=sha,
-        description="RotatingFileHandler replaced with FileHandler — log rotation disabled, disk exhaustion risk",
-    )
 
 
 def _inject_log_pii_leak(workspace: str) -> FaultMetadata:
@@ -589,88 +438,6 @@ def _inject_log_disabled(workspace: str) -> FaultMetadata:
         affected_files=["services/api/logging_config.py"],
         injected_at_commit_sha=sha,
         description="LOG_LEVEL hardcoded to CRITICAL — effective logging disabled, check_logs config check fails",
-    )
-
-
-# ── Multi-app cross-service fault injectors ───────────────────────────────
-
-
-def _inject_shared_secret_rotation(workspace: str) -> FaultMetadata:
-    """Rotate AUTH_SECRET in .env to a new value so api-service and worker reject auth."""
-    path = os.path.join(workspace, "shared-infra", ".env")
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    new_content = content.replace(
-        "AUTH_SECRET=initial-shared-secret-value-abc123",
-        "AUTH_SECRET=rotated-secret-xyz987-new  # FAULT(shared_secret_rotation)",
-    )
-    if new_content == content:
-        # Generic fallback: append a rotated secret line
-        new_content = content.rstrip("\n") + "\nAUTH_SECRET=rotated-secret-xyz987-new  # FAULT(shared_secret_rotation)\n"
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(new_content)
-
-    sha = _commit(workspace, "ops: rotate shared AUTH_SECRET for security compliance", [path])
-    return FaultMetadata(
-        fault_type="shared_secret_rotation",
-        affected_files=["shared-infra/.env"],
-        injected_at_commit_sha=sha,
-        description="AUTH_SECRET rotated in .env but services not restarted — api-service and worker reject auth",
-    )
-
-
-def _inject_infra_port_conflict(workspace: str) -> FaultMetadata:
-    """Change api-service port binding to conflict with frontend, breaking connectivity."""
-    path = os.path.join(workspace, "shared-infra", "docker-compose.yml")
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    new_content = content.replace(
-        '      - "8001:8001"',
-        '      - "5000:8001"  # FAULT(infra_port_conflict): clashes with frontend port',
-    )
-    if new_content == content:
-        # Fallback: try the old port mapping in case template changed
-        new_content = content.replace(
-            '      - "8000:8000"',
-            '      - "5000:8000"  # FAULT(infra_port_conflict): clashes with frontend port',
-        )
-    if new_content == content:
-        raise RuntimeError(
-            "_inject_infra_port_conflict: expected port mapping '8001:8001' (or '8000:8000') not found in "
-            "shared-infra/docker-compose.yml — template may have drifted"
-        )
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(new_content)
-
-    sha = _commit(workspace, "infra: expose api-service on port 5000 for load balancer", [path])
-    return FaultMetadata(
-        fault_type="infra_port_conflict",
-        affected_files=["shared-infra/docker-compose.yml"],
-        injected_at_commit_sha=sha,
-        description="api-service port changed to 5000, conflicting with frontend — docker compose deploy fails",
-    )
-
-
-def _inject_dependency_version_drift(workspace: str) -> FaultMetadata:
-    """Pin incompatible fastapi/pydantic versions in api-service requirements."""
-    path = os.path.join(workspace, "api-service", "requirements.txt")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(
-            "fastapi==0.89.0\n"
-            "pydantic>=2.0.0\n"
-            "uvicorn>=0.23.0\n"
-            "httpx>=0.24.0\n"
-        )
-
-    sha = _commit(workspace, "chore: pin fastapi version for stability", [path])
-    return FaultMetadata(
-        fault_type="dependency_version_drift",
-        affected_files=["api-service/requirements.txt"],
-        injected_at_commit_sha=sha,
-        description="fastapi==0.89.0 requires pydantic<2.0 but pydantic>=2.0.0 is pinned — pip resolution fails",
     )
 
 
@@ -729,90 +496,3 @@ def _inject_schema_drift(workspace: str) -> FaultMetadata:
     )
 
 
-def _inject_wrong_db_url(workspace: str) -> FaultMetadata:
-    """Corrupt the DATABASE_URL with a double-slash making the host unparseable."""
-    path = os.path.join(workspace, "docker-compose.yml")
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    good = "postgresql://app:secret@db:5432/appdb"
-    bad = "postgresql://app:secret@//db:5432/appdb  # FAULT(wrong_db_url)"
-    if good in content:
-        new_content = content.replace(good, bad, 1)
-    else:
-        # Inject a DATABASE_URL env var into the api service environment block
-        new_content = content.replace(
-            "    environment:\n      - FLASK_ENV=production",
-            "    environment:\n"
-            "      - DATABASE_URL=postgresql://app:secret@//db:5432/appdb  # FAULT(wrong_db_url)\n"
-            "      - FLASK_ENV=production",
-            1,
-        )
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(new_content)
-
-    sha = _commit(workspace, "infra: add DATABASE_URL to api service config", [path])
-    return FaultMetadata(
-        fault_type="wrong_db_url",
-        affected_files=["docker-compose.yml"],
-        injected_at_commit_sha=sha,
-        description="DATABASE_URL contains double-slash after scheme — hostname unparseable, connection fails",
-    )
-
-
-def _inject_init_order_race(workspace: str) -> FaultMetadata:
-    """Remove the db healthcheck dependency so the app starts before Postgres is ready."""
-    path = os.path.join(workspace, "docker-compose.yml")
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    import re as _re
-    new_content = _re.sub(
-        r"\s+depends_on:\s*\n(\s+db:\s*\n\s+condition: service_healthy\s*\n(\s+required: false\s*\n)?)",
-        "\n",
-        content,
-        count=1,
-    )
-    if new_content == content:
-        # Fallback: add a comment indicating the race
-        new_content = content + "\n# FAULT(init_order_race): depends_on db removed\n"
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(new_content)
-
-    sha = _commit(workspace, "infra: remove startup ordering to speed up deploy", [path])
-    return FaultMetadata(
-        fault_type="init_order_race",
-        affected_files=["docker-compose.yml"],
-        injected_at_commit_sha=sha,
-        description="depends_on db healthcheck removed — app starts before Postgres is ready, init_db() fails",
-    )
-
-
-def _inject_missing_volume_mount(workspace: str) -> FaultMetadata:
-    """Comment out the pgdata volume mount so Postgres data doesn't persist."""
-    path = os.path.join(workspace, "docker-compose.yml")
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    target = "      - pgdata:/var/lib/postgresql/data"
-    replacement = (
-        "      # FAULT(missing_volume_mount): volume removed — data won't persist\n"
-        "      # - pgdata:/var/lib/postgresql/data"
-    )
-    if target in content:
-        new_content = content.replace(target, replacement, 1)
-    else:
-        # Generic fallback: remove any db volume line
-        new_content = content + "\n# FAULT(missing_volume_mount): pgdata volume not configured\n"
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(new_content)
-
-    sha = _commit(workspace, "infra: remove db volume for ephemeral test environment", [path])
-    return FaultMetadata(
-        fault_type="missing_volume_mount",
-        affected_files=["docker-compose.yml"],
-        injected_at_commit_sha=sha,
-        description="pgdata volume mount removed — Postgres data lost on restart, stateful tests fail",
-    )

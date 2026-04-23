@@ -327,7 +327,7 @@ def _build_logging_fault_clues(joined_errors: str, workspace_dir: str) -> List[s
         and "./logs:/app/logs" not in compose_text
         and any(token in joined_errors for token in ("log file not found", "logs volume", "/app/logs", "log_path"))
     ):
-        line_no = _find_line_number(compose_text, r"/app/logs|volumes:|log_volume_missing")
+        line_no = _find_line_number(compose_text, r"/app/logs|volumes:")
         clues.append(
             "Config issue in docker-compose.yml:"
             f"{line_no}: the ./logs:/app/logs volume mount is missing."
@@ -366,10 +366,7 @@ def build_visible_metrics(pipeline_result: PipelineResult) -> List[str]:
 
 # ── Main observation builder ───────────────────────────────────────────────
 
-_DEFAULT_SERVICE_DEPENDENCY_GRAPH: Dict[str, List[str]] = {
-    "frontend": ["api-service"],
-    "api-service": ["worker", "shared-infra"],
-}
+_DEFAULT_SERVICE_DEPENDENCY_GRAPH: Dict[str, List[str]] = {}
 
 
 def build_observation(
@@ -397,7 +394,6 @@ def build_observation(
     rubric_blend_weight: float = 0.0,
     rubric_judge_used: bool = False,
     rubric_judge_error: str = "",
-    drift_detected: bool = False,
     metadata: Optional[Dict[str, Any]] = None,
     findings: Optional[List[str]] = None,
     affected_apps: Optional[List[str]] = None,
@@ -453,7 +449,6 @@ def build_observation(
         "redundant_actions": redundant_actions,
         "destructive_actions": destructive_actions,
         "incident_resolved": incident_resolved,
-        "drift_detected": drift_detected,
         "final_score": final_score,
         "deterministic_score": deterministic_score,
         "rubric_score": rubric_score,

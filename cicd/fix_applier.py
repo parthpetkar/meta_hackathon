@@ -91,85 +91,32 @@ def apply_fix(workspace: str, fix_text: str, target: str = "", fault_type: str =
 # ── Strategy B: Fault-type direct dispatch ─────────────────────────────────
 
 _FAULT_FIX_MAP = {
-    "merge_conflict":        lambda ws: _fix_merge_conflict(ws),
-    "dependency_conflict":   lambda ws: _fix_dependency_conflict(ws),
-    "docker_order":          lambda ws: _fix_docker_order(ws),
-    "flaky_test":            lambda ws: _fix_flaky_test(ws),
-    "missing_permission":    lambda ws: _fix_missing_permission(ws),
-    "secret_exposure":       lambda ws: _fix_secret_exposure(ws),
-    "env_drift":             lambda ws: _fix_missing_permission(ws),
-    "log_bad_config":        lambda ws: _fix_log_bad_config(ws),
-    "log_path_unwritable":   lambda ws: _fix_log_path(ws),
-    "log_volume_missing":    lambda ws: _fix_log_volume(ws),
-    "log_rotation_missing":  lambda ws: _fix_log_rotation(ws),
-    "log_pii_leak":          lambda ws: _fix_log_pii_leak(ws),
-    "log_disabled":          lambda ws: _fix_log_disabled(ws),
-    "shared_secret_rotation": lambda ws: _fix_shared_secret_rotation(ws),
-    "infra_port_conflict":   lambda ws: _fix_infra_port_conflict(ws),
-    "dependency_version_drift": lambda ws: _fix_dependency_conflict(ws),
+    "merge_conflict":      lambda ws: _fix_merge_conflict(ws),
+    "dependency_conflict": lambda ws: _fix_dependency_conflict(ws),
+    "docker_order":        lambda ws: _fix_docker_order(ws),
+    "flaky_test":          lambda ws: _fix_flaky_test(ws),
+    "missing_permission":  lambda ws: _fix_missing_permission(ws),
+    "secret_exposure":     lambda ws: _fix_secret_exposure(ws),
+    "env_drift":           lambda ws: _fix_missing_permission(ws),
+    "log_pii_leak":        lambda ws: _fix_log_pii_leak(ws),
+    "log_disabled":        lambda ws: _fix_log_disabled(ws),
+    "bad_migration_sql":   lambda ws: _fix_bad_migration_sql(ws),
+    "schema_drift":        lambda ws: _fix_schema_drift(ws),
 }
 
 _FAULT_FIX_DESCRIPTIONS = {
-    "merge_conflict":        "Resolved merge conflict markers",
-    "dependency_conflict":   "Fixed dependency version pins",
-    "docker_order":          "Fixed Dockerfile instruction order",
-    "flaky_test":            "Removed flaky timing-sensitive test",
-    "missing_permission":    "Fixed docker-compose network/volume configuration",
-    "secret_exposure":       "Removed hardcoded secrets",
-    "env_drift":             "Fixed docker-compose env/port configuration",
-    "log_bad_config":        "Restored json.dumps in logging formatter",
-    "log_path_unwritable":   "Restored LOG_PATH to writable application directory",
-    "log_volume_missing":    "Restored log volume mount in docker-compose.yml",
-    "log_rotation_missing":  "Restored RotatingFileHandler for log rotation",
-    "log_pii_leak":          "Removed PII-leaking log call from routes.py",
-    "log_disabled":          "Restored LOG_LEVEL to INFO from CRITICAL",
-    "shared_secret_rotation": "Restored AUTH_SECRET consistency across services",
-    "infra_port_conflict":   "Resolved port conflict in shared-infra/docker-compose.yml",
-    "dependency_version_drift": "Fixed dependency version drift across services",
+    "merge_conflict":      "Resolved merge conflict markers",
+    "dependency_conflict": "Fixed dependency version pins",
+    "docker_order":        "Fixed Dockerfile instruction order",
+    "flaky_test":          "Removed flaky timing-sensitive test",
+    "missing_permission":  "Fixed docker-compose network/volume configuration",
+    "secret_exposure":     "Removed hardcoded secrets",
+    "env_drift":           "Fixed docker-compose env/port configuration",
+    "log_pii_leak":        "Removed PII-leaking log call from routes.py",
+    "log_disabled":        "Restored LOG_LEVEL to INFO from CRITICAL",
+    "bad_migration_sql":   "Fixed SQL syntax error in migration file",
+    "schema_drift":        "Aligned CANONICAL_COLUMNS with database schema",
 }
-
-
-def _fix_shared_secret_rotation(workspace: str) -> List[str]:
-    """Restore the original AUTH_SECRET in shared-infra/.env."""
-    path = os.path.join(workspace, "shared-infra", ".env")
-    if not os.path.exists(path):
-        return []
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-    cleaned = re.sub(
-        r'AUTH_SECRET=rotated-secret-xyz789-NEW[^\n]*',
-        'AUTH_SECRET=original-shared-secret-abc123',
-        content,
-    )
-    if cleaned == content:
-        return []
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(cleaned)
-    return ["shared-infra/.env"]
-
-
-def _fix_infra_port_conflict(workspace: str) -> List[str]:
-    """Restore api-service port in shared-infra/docker-compose.yml."""
-    path = os.path.join(workspace, "shared-infra", "docker-compose.yml")
-    if not os.path.exists(path):
-        return []
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-    # Try 8001 first (current template), then fall back to 8000 (old template)
-    cleaned = content.replace(
-        '      - "5000:8001"  # FAULT(infra_port_conflict): clashes with frontend port',
-        '      - "8001:8001"',
-    )
-    if cleaned == content:
-        cleaned = content.replace(
-            '      - "5000:8000"  # FAULT(infra_port_conflict): clashes with frontend port',
-            '      - "8000:8000"',
-        )
-    if cleaned == content:
-        return []
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(cleaned)
-    return ["shared-infra/docker-compose.yml"]
 
 
 def _apply_fault_type_fix(workspace: str, fault_type: str) -> FixResult:
@@ -332,25 +279,17 @@ def _apply_heuristic_fix(workspace: str, fix_text: str, target: str = "") -> Fix
         modified = _fix_log_pii_leak(workspace)
         description = "Removed PII-leaking log call from routes.py"
 
-    elif any(kw in fix_lower for kw in ["json.dumps", "str(payload", "formatter", "log_bad_config", "malformed", "not valid json"]):
-        modified = _fix_log_bad_config(workspace)
-        description = "Restored json.dumps in logging formatter"
-
-    elif any(kw in fix_lower for kw in ["log_path", "var/log", "restricted", "log_path_unwritable", "cannot write", "unwritable"]):
-        modified = _fix_log_path(workspace)
-        description = "Restored LOG_PATH to writable application directory"
-
-    elif any(kw in fix_lower for kw in ["rotatingfilehandler", "rotation", "log_rotation", "unbounded", "filehandler"]):
-        modified = _fix_log_rotation(workspace)
-        description = "Restored RotatingFileHandler for log rotation"
-
     elif any(kw in fix_lower for kw in ["critical", "log_level", "log_disabled", "silenced", "silent", "log level"]):
         modified = _fix_log_disabled(workspace)
         description = "Restored LOG_LEVEL to INFO from CRITICAL"
 
-    elif any(kw in fix_lower for kw in ["log volume", "volume mount", "log_volume", "./logs", "../logs", "logs:/app/logs", "log file", "log mount"]):
-        modified = _fix_log_volume(workspace)
-        description = "Restored log volume mount in docker-compose.yml"
+    elif any(kw in fix_lower for kw in ["creat table", "migration", "sql syntax", "bad_migration"]):
+        modified = _fix_bad_migration_sql(workspace)
+        description = "Fixed SQL syntax error in migration file"
+
+    elif any(kw in fix_lower for kw in ["artifact_url", "schema_drift", "canonical_columns", "column named"]):
+        modified = _fix_schema_drift(workspace)
+        description = "Aligned CANONICAL_COLUMNS with database schema"
 
     elif any(kw in fix_lower for kw in ["permission", "network", "external", "compose"]):
         modified = _fix_missing_permission(workspace)
@@ -562,58 +501,6 @@ def _fix_log_pii_leak(workspace: str) -> List[str]:
     return ["services/api/routes.py"]
 
 
-def _fix_log_bad_config(workspace: str) -> List[str]:
-    path = os.path.join(workspace, "services", "api", "logging_config.py")
-    if not os.path.exists(path):
-        return []
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-    cleaned = content.replace(
-        "return str(payload)  # FAULT(log_bad_config): not valid JSON output",
-        "return json.dumps(payload, ensure_ascii=False)",
-    )
-    if cleaned == content:
-        return []
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(cleaned)
-    return ["services/api/logging_config.py"]
-
-
-def _fix_log_path(workspace: str) -> List[str]:
-    path = os.path.join(workspace, "services", "api", "logging_config.py")
-    if not os.path.exists(path):
-        return []
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-    cleaned = re.sub(
-        r'LOG_PATH\s*:\s*str\s*=\s*["\'][/][^"\']+["\'].*#.*FAULT\(log_path_unwritable\)[^\n]*',
-        'LOG_PATH: str = os.environ.get("LOG_PATH", "/app/logs/app.log")',
-        content,
-    )
-    if cleaned == content:
-        return []
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(cleaned)
-    return ["services/api/logging_config.py"]
-
-
-def _fix_log_rotation(workspace: str) -> List[str]:
-    path = os.path.join(workspace, "services", "api", "logging_config.py")
-    if not os.path.exists(path):
-        return []
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-    cleaned = content.replace(
-        'logging.FileHandler(\n            str(path), encoding="utf-8"\n        )',
-        'logging.handlers.RotatingFileHandler(\n            str(path), maxBytes=MAX_BYTES, backupCount=BACKUP_COUNT, encoding="utf-8"\n        )',
-    )
-    if cleaned == content:
-        return []
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(cleaned)
-    return ["services/api/logging_config.py"]
-
-
 def _fix_log_disabled(workspace: str) -> List[str]:
     path = os.path.join(workspace, "services", "api", "logging_config.py")
     if not os.path.exists(path):
@@ -632,22 +519,36 @@ def _fix_log_disabled(workspace: str) -> List[str]:
     return ["services/api/logging_config.py"]
 
 
-def _fix_log_volume(workspace: str) -> List[str]:
-    # The volume mount lives in shared-infra/docker-compose.yml
-    path = os.path.join(workspace, "shared-infra", "docker-compose.yml")
+def _fix_bad_migration_sql(workspace: str) -> List[str]:
+    path = os.path.join(workspace, "db", "migrations", "001_init.sql")
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    cleaned = content.replace("CREAT TABLE IF NOT EXISTS builds", "CREATE TABLE IF NOT EXISTS builds", 1)
+    if cleaned == content:
+        return []
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(cleaned)
+    return ["db/migrations/001_init.sql"]
+
+
+def _fix_schema_drift(workspace: str) -> List[str]:
+    path = os.path.join(workspace, "db", "database.py")
     if not os.path.exists(path):
         return []
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
     cleaned = content.replace(
-        "      # FAULT(log_volume_missing): log volume mount removed\n      # - ../logs:/app/logs",
-        "      - ../logs:/app/logs",
+        '"id", "task_key", "status", "started_at", "finished_at", "exit_code", "log_tail", "artifact_url"',
+        '"id", "task_key", "status", "started_at", "finished_at", "exit_code", "log_tail"',
+        1,
     )
     if cleaned == content:
         return []
     with open(path, "w", encoding="utf-8") as f:
         f.write(cleaned)
-    return ["shared-infra/docker-compose.yml"]
+    return ["db/database.py"]
 
 
 # ── Strategy C: Generic auto-repair ────────────────────────────────────────
@@ -734,23 +635,9 @@ def _auto_repair_workspace(workspace: str, error_hint: str = "") -> FixResult:
 
     # Pass 3b — logging faults (applied before generic passes to avoid false rewrites)
     if not modified:
-        routes_modified = _fix_log_pii_leak(workspace)
-        modified.extend(routes_modified)
+        modified.extend(_fix_log_pii_leak(workspace))
     if not modified:
-        lc_modified = _fix_log_bad_config(workspace)
-        modified.extend(lc_modified)
-    if not modified:
-        lc_modified = _fix_log_path(workspace)
-        modified.extend(lc_modified)
-    if not modified:
-        lc_modified = _fix_log_rotation(workspace)
-        modified.extend(lc_modified)
-    if not modified:
-        lc_modified = _fix_log_disabled(workspace)
-        modified.extend(lc_modified)
-    if not modified:
-        dc_modified = _fix_log_volume(workspace)
-        modified.extend(dc_modified)
+        modified.extend(_fix_log_disabled(workspace))
 
     # Pass 3c — missing requirements.txt at workspace root (Dockerfile COPY target)
     # Common when agents experiment: they create/delete files and break the build context.

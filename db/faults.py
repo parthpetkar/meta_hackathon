@@ -23,13 +23,9 @@ from typing import Any, Dict, Tuple, TypedDict
 # ---------------------------------------------------------------------------
 
 _REPO_ROOT   = Path(__file__).parent.parent
-_COMPOSE     = _REPO_ROOT / "docker-compose.yml"
 _MIGRATION   = _REPO_ROOT / "db" / "migrations" / "001_init.sql"
 _DATABASE_PY = _REPO_ROOT / "db" / "database.py"
 
-
-def _compose(wp: Path) -> Path:
-    return wp / "docker-compose.yml"
 
 def _migration(wp: Path) -> Path:
     return wp / "db" / "migrations" / "001_init.sql"
@@ -80,52 +76,6 @@ FAULT_REGISTRY: Dict[str, FaultSpec] = {
         ),
         "affects": "both",
     },
-    "MISSING_VOLUME": {
-        "description": (
-            "The pgdata volume mount is commented out under the db service in "
-            "docker-compose.yml."
-        ),
-        "breaks": (
-            "Postgres starts successfully but all data is lost on every container restart. "
-            "Stateful integration tests fail intermittently depending on restart order."
-        ),
-        "correct_fix": (
-            "Restore the '- pgdata:/var/lib/postgresql/data' line under db.volumes "
-            "in docker-compose.yml."
-        ),
-        "affects": "postgres",
-    },
-    "WRONG_DATABASE_URL": {
-        "description": (
-            "DATABASE_URL in docker-compose.yml contains a double-slash after the "
-            "scheme, making the hostname unparseable: 'postgresql://app:secret@//db:5432/appdb'."
-        ),
-        "breaks": (
-            "Connection attempt fails immediately with 'could not translate host name "
-            "\"\" to address: Name or service not known'. API health check never passes."
-        ),
-        "correct_fix": (
-            "Fix DATABASE_URL: remove the extra slash so it reads "
-            "'postgresql://app:secret@db:5432/appdb'."
-        ),
-        "affects": "both",
-    },
-    "INIT_ORDER_RACE": {
-        "description": (
-            "The 'depends_on: db: condition: service_healthy' guard is removed from "
-            "env-server in docker-compose.yml."
-        ),
-        "breaks": (
-            "env-server starts before Postgres finishes initialising. The first "
-            "init_db() call fails with 'Connection refused', leaving the schema "
-            "uninitialised. Requests fail until the container is manually restarted."
-        ),
-        "correct_fix": (
-            "Re-add 'depends_on: db: condition: service_healthy' (with required: false) "
-            "under env-server in docker-compose.yml."
-        ),
-        "affects": "postgres",
-    },
 }
 
 
@@ -138,11 +88,8 @@ def inject_fault(fault_name: str, workspace_path: Path | None = None) -> None:
     wp = workspace_path or _REPO_ROOT
     _require_known(fault_name)
     {
-        "BAD_MIGRATION_SQL":  _inject_bad_migration,
-        "SCHEMA_DRIFT":       _inject_schema_drift,
-        "MISSING_VOLUME":     _inject_missing_volume,
-        "WRONG_DATABASE_URL": _inject_wrong_database_url,
-        "INIT_ORDER_RACE":    _inject_init_order_race,
+        "BAD_MIGRATION_SQL": _inject_bad_migration,
+        "SCHEMA_DRIFT":      _inject_schema_drift,
     }[fault_name](wp)
 
 
@@ -167,44 +114,6 @@ def _inject_schema_drift(wp: Path) -> None:
     path.write_text(text.replace(old, new, 1), encoding="utf-8")
 
 
-def _inject_missing_volume(wp: Path) -> None:
-    path = _compose(wp)
-    text = path.read_text(encoding="utf-8")
-    target = "      - pgdata:/var/lib/postgresql/data"
-    replacement = "      # FAULT(MISSING_VOLUME): volume mount removed — data will not persist\n      # - pgdata:/var/lib/postgresql/data"
-    if target not in text:
-        raise RuntimeError("MISSING_VOLUME inject: expected volume line not found in docker-compose.yml")
-    path.write_text(text.replace(target, replacement, 1), encoding="utf-8")
-
-
-def _inject_wrong_database_url(wp: Path) -> None:
-    path = _compose(wp)
-    text = path.read_text(encoding="utf-8")
-    good = "postgresql://app:secret@db:5432/appdb"
-    bad  = "postgresql://app:secret@//db:5432/appdb"
-    if good not in text:
-        raise RuntimeError("WRONG_DATABASE_URL inject: expected DATABASE_URL not found in docker-compose.yml")
-    path.write_text(text.replace(good, bad), encoding="utf-8")
-
-
-def _inject_init_order_race(wp: Path) -> None:
-    path = _compose(wp)
-    text = path.read_text(encoding="utf-8")
-    # Remove the db entry from env-server's depends_on block
-    patched = re.sub(
-        r"(\s+depends_on:)(.*?)((\s+db:\n\s+condition: service_healthy\n\s+required: false\n))",
-        lambda m: m.group(1) + m.group(2),
-        text,
-        count=1,
-        flags=re.DOTALL,
-    )
-    if patched == text:
-        raise RuntimeError(
-            "INIT_ORDER_RACE inject: expected depends_on db block not found in docker-compose.yml"
-        )
-    path.write_text(patched, encoding="utf-8")
-
-
 # ---------------------------------------------------------------------------
 # Verification helpers
 # ---------------------------------------------------------------------------
@@ -217,11 +126,8 @@ def verify_fix(fault_name: str, workspace_path: Path | None = None) -> Tuple[boo
     wp = workspace_path or _REPO_ROOT
     _require_known(fault_name)
     return {
-        "BAD_MIGRATION_SQL":  _verify_bad_migration,
-        "SCHEMA_DRIFT":       _verify_schema_drift,
-        "MISSING_VOLUME":     _verify_missing_volume,
-        "WRONG_DATABASE_URL": _verify_wrong_database_url,
-        "INIT_ORDER_RACE":    _verify_init_order_race,
+        "BAD_MIGRATION_SQL": _verify_bad_migration,
+        "SCHEMA_DRIFT":      _verify_schema_drift,
     }[fault_name](wp)
 
 
@@ -249,37 +155,6 @@ def _verify_schema_drift(wp: Path) -> Tuple[bool, str]:
             "database.py CANONICAL_COLUMNS still includes 'artifact_url' but no migration adds it.",
         )
     return True, "Schema and application model are aligned."
-
-
-def _verify_missing_volume(wp: Path) -> Tuple[bool, str]:
-    text = _compose(wp).read_text(encoding="utf-8")
-    # Volume mount must be present and not commented out
-    if "# - pgdata:/var/lib/postgresql/data" in text:
-        return False, "pgdata volume mount is still commented out."
-    if "- pgdata:/var/lib/postgresql/data" not in text:
-        return False, "pgdata volume mount is missing from docker-compose.yml entirely."
-    return True, "Postgres volume mount is correctly configured."
-
-
-def _verify_wrong_database_url(wp: Path) -> Tuple[bool, str]:
-    text = _compose(wp).read_text(encoding="utf-8")
-    if "postgresql://app:secret@//db" in text:
-        return False, "DATABASE_URL still contains the double-slash typo in docker-compose.yml."
-    if "sqlite:///./app_typo.dbb" in text:
-        return False, "DATABASE_URL still contains the broken SQLite path."
-    return True, "DATABASE_URL is well-formed."
-
-
-def _verify_init_order_race(wp: Path) -> Tuple[bool, str]:
-    text = _compose(wp).read_text(encoding="utf-8")
-    has_db_dep   = re.search(r"depends_on:.*?db:\s*\n\s*condition:", text, re.DOTALL)
-    has_healthy  = "condition: service_healthy" in text
-    if not has_db_dep or not has_healthy:
-        return (
-            False,
-            "env-server is missing 'depends_on: db: condition: service_healthy' in docker-compose.yml.",
-        )
-    return True, "Healthcheck dependency is correctly configured."
 
 
 # ---------------------------------------------------------------------------

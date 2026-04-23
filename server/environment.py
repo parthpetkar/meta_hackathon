@@ -57,7 +57,6 @@ from cicd.observation_builder import (
 )
 from cicd.fix_applier import apply_fix, FixResult
 from cicd.procedural_generator import generate_scenario as procedural_generate_scenario, inject_procedural
-from cicd.drift_injector import maybe_drift, drift_enabled
 try:
     from .rubric_judge import DEFAULT_OPENROUTER_MODEL, OpenEnvLLMJudgeAdapter
     from .curriculum import CurriculumController
@@ -113,13 +112,8 @@ KNOWN_CONFIG_PATHS = (
     "services/api/logging_config.py",
     "tests/test_api.py",
     ".github/ci.yml",
-    # Multi-app paths
-    "shared-infra/docker-compose.yml",
-    "shared-infra/.env",
-    "api-service/requirements.txt",
-    "api-service/Dockerfile",
-    "worker/requirements.txt",
-    "worker/Dockerfile",
+    "db/migrations/001_init.sql",
+    "db/database.py",
 )
 
 
@@ -186,12 +180,9 @@ class EpisodeState:
     # Timestamps
     created_at: float = 0.0
 
-    # Drift state
-    drift_events_fired: List[Any] = field(default_factory=list)
     rerun_attempts: int = 0
     episode_seed: int = 0
     procedural_mode: bool = False
-    drift_detected: bool = False
 
 
 def _extract_config_path_from_text(text: str) -> str:
@@ -524,93 +515,6 @@ class RealCICDRepairEnvironment(Environment):
         )
         self._episode = episode
 
-        # --- Database selection & compose mutation (episode-scoped) ---
-        # Respect explicit scenario choices when present; otherwise fall back
-        # to curriculum-provided defaults (easy -> sqlite, hard -> postgres).
-        try:
-            scenario_db_backend = getattr(adversarial_scenario, "db_backend", None)
-            scenario_db_faults = getattr(adversarial_scenario, "db_faults", []) or []
-        except Exception:
-            scenario_db_backend = None
-            scenario_db_faults = []
-
-        db_backend = scenario_db_backend or self._curriculum.get_db_backend()
-
-        compose_path = os.path.join(repo_dir, "docker-compose.yml")
-        try:
-            # Read or create compose file in the episode workspace
-            if os.path.exists(compose_path):
-                compose_text = open(compose_path, "r", encoding="utf-8").read()
-            else:
-                compose_text = "version: '3.8'\nservices:\n  api:\n    build:\n      context: .\n      dockerfile: Dockerfile\n"
-
-            # Ensure api service has a DATABASE_URL env set appropriate for backend
-            if db_backend == "postgres":
-                db_url = "postgresql://app:secret@postgres:5432/appdb"
-                # Ensure postgres service exists and is included (no profile) when postgres desired
-                if "\n  postgres:" not in compose_text:
-                    postgres_block = (
-                        "\n  postgres:\n"
-                        "    image: postgres:15-alpine\n"
-                        "    environment:\n"
-                        "      - POSTGRES_USER=app\n"
-                        "      - POSTGRES_PASSWORD=secret\n"
-                        "      - POSTGRES_DB=appdb\n"
-                        "    volumes:\n"
-                        "      - ./data/db:/var/lib/postgresql/data\n"
-                        "    healthcheck:\n"
-                        "      test: [\"CMD-SHELL\", \"pg_isready -U app -d appdb\"]\n"
-                    )
-                    compose_text = compose_text + postgres_block
-                else:
-                    # If a postgres service exists but has 'profiles: - postgres', remove that profile so it is included
-                    compose_text = compose_text.replace("profiles:\n      - postgres\n", "")
-            else:
-                # sqlite backend -> local file
-                db_url = "sqlite:///./app.db"
-                # If compose had a postgres service, mark it under the 'postgres' profile so it stays excluded
-                if "\n  postgres:" in compose_text and "profiles:\n      - postgres\n" not in compose_text:
-                    compose_text = compose_text.replace("\n  postgres:\n", "\n  postgres:\n    profiles:\n      - postgres\n")
-
-            # Ensure DATABASE_URL appears under api.environment
-            if "environment:" in compose_text:
-                # Naively insert DATABASE_URL if missing under api service
-                api_block_start = compose_text.find("  api:")
-                if api_block_start != -1:
-                    api_env_index = compose_text.find("environment:", api_block_start)
-                    if api_env_index != -1:
-                        # Find end of environment block (next non-indented or next service)
-                        following = compose_text[api_env_index:]
-                        if "DATABASE_URL" not in following:
-                            # insert DATABASE_URL line after environment:
-                            compose_text = compose_text.replace(
-                                "environment:",
-                                "environment:\n      - DATABASE_URL=%s" % db_url,
-                                1,
-                            )
-            else:
-                # no environment block: append one under api
-                compose_text = compose_text.replace(
-                    "  api:\n    build:",
-                    f"  api:\n    build:\n      context: .\n      dockerfile: Dockerfile\n    environment:\n      - DATABASE_URL={db_url}\n",
-                )
-
-            # Persist modified compose back to episode workspace
-            with open(compose_path, "w", encoding="utf-8") as f:
-                f.write(compose_text)
-
-        except Exception as _exc:
-            logger.warning("[reset] Failed to mutate docker-compose.yml for DB backend: %s", _exc)
-
-        # Apply any DB-targeted faults requested by the scenario (these mutate files and commit)
-        if scenario_db_faults:
-            for dbf in scenario_db_faults:
-                try:
-                    inject_fault(repo_dir, dbf)
-                except Exception as _e:
-                    logger.warning("[reset] Failed to inject DB fault '%s': %s", dbf, _e)
-        
-
         # Build difficulty from fault type
         difficulty = self._get_difficulty(fault_type)
 
@@ -634,7 +538,6 @@ class RealCICDRepairEnvironment(Environment):
                 "ready_to_finalize": False,
                 "verification_required": False,
                 "verified_since_last_rerun": False,
-                "drift_detected": False,
                 "supported_operations": CANONICAL_OPERATIONS,
                 "canonical_operations": CANONICAL_OPERATIONS,
             },
@@ -958,34 +861,7 @@ class RealCICDRepairEnvironment(Environment):
         ep.all_pipeline_results.append(new_result)
         ep.pipeline_result = new_result
 
-        # Clean up Docker image after build to prevent disk space issues
         cleanup_pipeline(new_result)
-
-        # ── Mid-episode schema/state drift ─────────────────────────────
-        # Once the pipeline passes, the *world* may shift: a team rotates an
-        # endpoint, infra pins a new dep, ports change. This forces the agent
-        # to maintain a persistent world model rather than memorize the fix.
-        if drift_enabled() and new_result.status == PipelineStatus.PASSED:
-            drift_event = maybe_drift(
-                workspace=ep.workspace_dir,
-                episode_seed=ep.episode_seed,
-                attempt_idx=ep.rerun_attempts,
-            )
-            if drift_event:
-                ep.drift_events_fired.append(drift_event)
-                ep.drift_detected = True
-                ep.findings.append(
-                    f"[World Drift] {drift_event.description} "
-                    f"Files affected: {', '.join(drift_event.files_touched)}. "
-                    f"Re-investigate before finalizing."
-                )
-                # Re-run so the agent sees the fresh failure from drift
-                new_result = ep.pipeline_runner.run(workspace_dir=ep.workspace_dir)
-                ep.all_pipeline_results.append(new_result)
-                ep.pipeline_result = new_result
-                
-                # Clean up Docker image after drift rerun
-                cleanup_pipeline(new_result)
 
         # Append per-stage logs so the agent can see what happened
         for stage_name in STAGE_ORDER:
@@ -1110,24 +986,17 @@ class RealCICDRepairEnvironment(Environment):
 
     def _get_difficulty(self, fault_type: str) -> str:
         difficulty_map = {
-            "merge_conflict":           "easy",
-            "dependency_conflict":      "medium",
-            "docker_order":             "medium",
-            "flaky_test":               "easy",
-            "missing_permission":       "hard",
-            "secret_exposure":          "security",
-            "env_drift":                "network",
-            # Logging faults — treat as medium (need investigation but single-file fix)
-            "log_bad_config":           "medium",
-            "log_path_unwritable":      "medium",
-            "log_volume_missing":       "medium",
-            "log_rotation_missing":     "medium",
-            "log_pii_leak":             "security",
-            "log_disabled":             "medium",
-            # Multi-app faults — harder due to cross-service scope
-            "shared_secret_rotation":   "hard",
-            "infra_port_conflict":      "hard",
-            "dependency_version_drift": "hard",
+            "merge_conflict":      "easy",
+            "dependency_conflict": "medium",
+            "docker_order":        "medium",
+            "flaky_test":          "easy",
+            "missing_permission":  "hard",
+            "secret_exposure":     "security",
+            "env_drift":           "network",
+            "log_pii_leak":        "security",
+            "log_disabled":        "medium",
+            "bad_migration_sql":   "medium",
+            "schema_drift":        "medium",
         }
         return difficulty_map.get(fault_type, "medium")
 
@@ -1224,7 +1093,6 @@ class RealCICDRepairEnvironment(Environment):
             rubric_blend_weight=self._rubric_weight if self._rubric_judge.is_active() else 0.0,
             rubric_judge_used=rubric_judge_used,
             rubric_judge_error=rubric_judge_error,
-            drift_detected=ep.drift_detected,
             findings=ep.findings[-10:],
             metadata={
                 "task_key": fault_type,
@@ -1233,9 +1101,6 @@ class RealCICDRepairEnvironment(Environment):
                 "ready_to_finalize": ep.incident_resolved and ep.verified_for_latest_rerun,
                 "verification_required": ep.incident_resolved and not ep.verified_for_latest_rerun,
                 "verified_since_last_rerun": ep.verified_for_latest_rerun,
-                "drift_detected": ep.drift_detected,
-                "drift_event_count": len(ep.drift_events_fired),
-                "latest_drift": ep.drift_events_fired[-1].kind if ep.drift_events_fired else "",
                 "supported_operations": CANONICAL_OPERATIONS,
                 "canonical_operations": CANONICAL_OPERATIONS,
                 "rubric_enabled": self._rubric_judge.is_active(),

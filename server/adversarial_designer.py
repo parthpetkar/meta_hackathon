@@ -16,10 +16,10 @@ from typing import Dict, List, Optional
 from openai import OpenAI
 
 try:
-    from cicd.fault_injector import FAULT_TYPES, FAULT_STAGE_MAP, FAULT_KEYWORDS, FaultMetadata, inject_fault, DB_FAULT_TYPES
+    from cicd.fault_injector import FAULT_TYPES, FAULT_STAGE_MAP, FAULT_KEYWORDS, FaultMetadata, inject_fault
     from models import AdversarialCICDScenario, IncidentStep
 except ImportError:
-    from ..cicd.fault_injector import FAULT_TYPES, FAULT_STAGE_MAP, FAULT_KEYWORDS, FaultMetadata, inject_fault, DB_FAULT_TYPES
+    from ..cicd.fault_injector import FAULT_TYPES, FAULT_STAGE_MAP, FAULT_KEYWORDS, FaultMetadata, inject_fault
     from ..models import AdversarialCICDScenario, IncidentStep
 
 LOGGER = logging.getLogger(__name__)
@@ -91,8 +91,6 @@ Return ONLY a JSON object matching this exact schema (no markdown, no explanatio
   "expected_fix_sequence": [string],
   "expected_verification": ["rerun_pipeline", "verify_fix"],
     "red_herrings": [string],
-    "db_backend": string,  # one of "sqlite" or "postgres"
-    "db_faults": [string], # optional list of DB fault keys
     "root_cause_explanation": string,
     "difficulty": float
 }"""
@@ -152,7 +150,6 @@ class AdversarialDesigner:
             "pipeline_stages": ["build", "test", "deploy"],
             "difficulty": round(difficulty, 2),
             "skill_profile": skill_profile or {},
-            "db_primitives": DB_FAULT_TYPES,
         }
 
         try:
@@ -204,11 +201,9 @@ class AdversarialDesigner:
                     data = json.loads(raw)
                 else:
                     raise
-            # Ensure DB choices exist; fall back to curriculum-style defaults if missing
-            if "db_backend" not in data:
-                data["db_backend"] = "sqlite" if difficulty < 0.45 else "postgres"
-            if "db_faults" not in data:
-                data["db_faults"] = []
+            # Strip unknown DB fields the LLM may still emit
+            data.pop("db_backend", None)
+            data.pop("db_faults", None)
 
             scenario = AdversarialCICDScenario(**data)
             # Validate: ensure root_cause_fault is actually marked is_root_cause
@@ -219,15 +214,7 @@ class AdversarialDesigner:
 
         except Exception as exc:
             LOGGER.warning("AdversarialDesigner.design failed (%s); using fallback scenario", exc)
-            scenario = self._fallback_scenario(root_cause_fault, difficulty)
-            # populate DB defaults on fallback
-            scenario.db_backend = "sqlite" if difficulty < 0.45 else "postgres"
-            if difficulty >= 0.6:
-                import random as _rand
-                scenario.db_faults = _rand.sample(DB_FAULT_TYPES, k=1)
-            else:
-                scenario.db_faults = []
-            return scenario
+            return self._fallback_scenario(root_cause_fault, difficulty)
 
     def inject(self, workspace: str, scenario: AdversarialCICDScenario) -> List[FaultMetadata]:
         """Inject all faults in the scenario into the workspace, ordered by step."""

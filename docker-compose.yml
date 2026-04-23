@@ -4,14 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 #
-# Two backends are supported:
-#   SQLite (default)  — docker compose up
-#   Postgres sidecar  — docker compose --profile postgres up
-#                       (also set DB_BACKEND=postgres in your shell or .env)
-#
 # Fault-injection flags (set in .env or shell before `docker compose up`):
-#   BAD_MIGRATION_SQL=true   WRONG_DATABASE_URL=true
-#   SCHEMA_DRIFT=true        MISSING_VOLUME=true   INIT_ORDER_RACE=true
+#   BAD_MIGRATION_SQL=true   SCHEMA_DRIFT=true
 # See db/faults.py for the full registry.
 
 services:
@@ -33,17 +27,8 @@ services:
       - LOG_PATH=/app/logs/app.log
       - LOG_LEVEL=INFO
       - SERVICE_NAME=env-server
-      - DB_BACKEND=${DB_BACKEND:-sqlite}
-      - DATABASE_URL=${DATABASE_URL:-postgresql://app:secret@db:5432/appdb}
       - BAD_MIGRATION_SQL=${BAD_MIGRATION_SQL:-false}
       - SCHEMA_DRIFT=${SCHEMA_DRIFT:-false}
-      - WRONG_DATABASE_URL=${WRONG_DATABASE_URL:-false}
-    # required: false means this guard is silently skipped when the postgres
-    # profile is inactive (SQLite mode). The INIT_ORDER_RACE fault removes this block.
-    depends_on:
-      db:
-        condition: service_healthy
-        required: false
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 10s
@@ -68,22 +53,5 @@ services:
       - INFERENCE_VERBOSE=${INFERENCE_VERBOSE:-false}
     command: ["python", "-m", "agent.runner"]
 
-  db:
-    image: postgres:15-alpine
-    profiles: [postgres]
-    environment:
-      POSTGRES_USER: app
-      POSTGRES_PASSWORD: secret
-      POSTGRES_DB: appdb
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U app -d appdb"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 10s
-
 volumes:
   pipeline-workspaces:
-  pgdata:

@@ -368,24 +368,13 @@ class PipelineRunner:
         return _run_subprocess(cmd, timeout=self.timeout)
 
     def _stage_deploy(self, workspace_dir: str, result: PipelineResult) -> tuple[int, str, str]:
-        # Prefer the multi-service compose file under shared-infra/ when present,
-        # as that is where multi-app faults (log_volume_missing, infra_port_conflict,
-        # shared_secret_rotation) are injected.
-        shared_infra_compose = os.path.join(workspace_dir, "shared-infra", "docker-compose.yml")
-        root_compose = os.path.join(workspace_dir, "docker-compose.yml")
-
-        if os.path.exists(shared_infra_compose):
-            compose_file = shared_infra_compose
-            cwd = os.path.join(workspace_dir, "shared-infra")
-        elif os.path.exists(root_compose):
-            compose_file = root_compose
-            cwd = workspace_dir
-        else:
-            return 1, "", f"docker-compose.yml not found in {workspace_dir} or {workspace_dir}/shared-infra"
+        compose_file = os.path.join(workspace_dir, "docker-compose.yml")
+        if not os.path.exists(compose_file):
+            return 1, "", f"docker-compose.yml not found in {workspace_dir}"
 
         cmd = ["docker", "compose", "-f", compose_file, "up", "-d"]
         result.stages["deploy"].command = " ".join(cmd)
-        return _run_subprocess(cmd, cwd=cwd, timeout=self.timeout)
+        return _run_subprocess(cmd, cwd=workspace_dir, timeout=self.timeout)
 
 
 def cleanup_pipeline(result: PipelineResult) -> None:
@@ -401,10 +390,7 @@ def cleanup_pipeline(result: PipelineResult) -> None:
         except Exception:
             pass
 
-    # Mirror the same compose-file selection logic used in _stage_deploy
-    shared_infra_compose = os.path.join(result.workspace_dir, "shared-infra", "docker-compose.yml")
-    root_compose = os.path.join(result.workspace_dir, "docker-compose.yml")
-    compose_file = shared_infra_compose if os.path.exists(shared_infra_compose) else root_compose
+    compose_file = os.path.join(result.workspace_dir, "docker-compose.yml")
     if os.path.exists(compose_file):
         try:
             subprocess.run(

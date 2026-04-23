@@ -45,15 +45,9 @@ BASE_SYSTEM_PROMPT = textwrap.dedent(
 
           7. For every fault type, use structured JSON to describe the exact change needed.
               Examples:
-              - Volume mount missing:
-                {"file": "shared-infra/docker-compose.yml", "action": "replace",
-                 "old": "      # - ../logs:/app/logs", "new": "      - ../logs:/app/logs"}
               - PII in logs:
                 {"file": "services/api/routes.py", "action": "delete_lines",
                  "pattern": "sk-live-"}
-              - Bad log formatter:
-                {"file": "services/api/logging_config.py", "action": "replace",
-                 "old": "return str(payload)", "new": "return json.dumps(payload, ensure_ascii=False)"}
               - Hardcoded secret:
                 {"file": "services/api/app.py", "action": "delete_lines",
                  "pattern": "API_KEY ="}
