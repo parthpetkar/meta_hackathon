@@ -32,6 +32,7 @@ from cicd.pipeline_runner import (
     StageStatus,
     STAGE_ORDER,
     cleanup_pipeline,
+    cleanup_cache_image,
     setup_repo_from_template,
 )
 from cicd.fault_injector import (
@@ -56,7 +57,6 @@ from cicd.observation_builder import (
 )
 from cicd.fix_applier import apply_fix, FixResult
 from cicd.procedural_generator import generate_scenario as procedural_generate_scenario, inject_procedural
-from cicd.drift_injector import maybe_drift, drift_enabled
 try:
     from .rubric_judge import DEFAULT_OPENROUTER_MODEL, OpenEnvLLMJudgeAdapter
     from .curriculum import CurriculumController
@@ -112,13 +112,8 @@ KNOWN_CONFIG_PATHS = (
     "services/api/logging_config.py",
     "tests/test_api.py",
     ".github/ci.yml",
-    # Multi-app paths
-    "shared-infra/docker-compose.yml",
-    "shared-infra/.env",
-    "api-service/requirements.txt",
-    "api-service/Dockerfile",
-    "worker/requirements.txt",
-    "worker/Dockerfile",
+    "db/migrations/001_init.sql",
+    "db/database.py",
 )
 
 
@@ -185,12 +180,9 @@ class EpisodeState:
     # Timestamps
     created_at: float = 0.0
 
-    # Drift state
-    drift_events_fired: List[Any] = field(default_factory=list)
     rerun_attempts: int = 0
     episode_seed: int = 0
     procedural_mode: bool = False
-    drift_detected: bool = False
 
 
 def _extract_config_path_from_text(text: str) -> str:
@@ -444,7 +436,11 @@ class RealCICDRepairEnvironment(Environment):
             adversarial_scenario = procedural_scenario
             injected = inject_procedural(repo_dir, adversarial_scenario)
         else:
-            # LLM-generated scenario as-is
+            # LLM-generated scenario as-is — but only inject cascade faults when
+            # difficulty is high enough; otherwise strip them from the scenario
+            # before injection so they never land in the workspace.
+            if curriculum_difficulty < 0.65 and len(adversarial_scenario.steps) > 1:
+                adversarial_scenario.steps = adversarial_scenario.steps[:1]
             injected = self._adv_designer.inject(repo_dir, adversarial_scenario)
 
         fault_type = adversarial_scenario.steps[0].fault_type if adversarial_scenario.steps else "merge_conflict"
@@ -458,6 +454,7 @@ class RealCICDRepairEnvironment(Environment):
         )
 
         fault_metadata = injected[0] if injected else inject_fault(repo_dir, fault_type)
+        # Cascading faults only enabled for hard difficulty (curriculum >= 0.65).
         cascading_faults: list = injected[1:] if len(injected) > 1 else []
 
         # Run the pipeline — if injection silently failed and pipeline passes,
@@ -469,6 +466,9 @@ class RealCICDRepairEnvironment(Environment):
             timeout_per_stage=self._pipeline_timeout,
         )
         pipeline_result = runner.run(workspace_dir=repo_dir)
+        
+        # Clean up Docker image after initial build
+        cleanup_pipeline(pipeline_result)
 
         _retry = 0
         try:
@@ -483,6 +483,9 @@ class RealCICDRepairEnvironment(Environment):
                 if fallback_fault:
                     fault_metadata = fallback_fault
                 pipeline_result = runner.run(workspace_dir=repo_dir)
+                
+                # Clean up Docker image after retry build
+                cleanup_pipeline(pipeline_result)
         except Exception as _exc:
             logger.exception("[reset] Fault injection retry failed — continuing with current state.")
 
@@ -512,98 +515,11 @@ class RealCICDRepairEnvironment(Environment):
         )
         self._episode = episode
 
-        # --- Database selection & compose mutation (episode-scoped) ---
-        # Respect explicit scenario choices when present; otherwise fall back
-        # to curriculum-provided defaults (easy -> sqlite, hard -> postgres).
-        try:
-            scenario_db_backend = getattr(adversarial_scenario, "db_backend", None)
-            scenario_db_faults = getattr(adversarial_scenario, "db_faults", []) or []
-        except Exception:
-            scenario_db_backend = None
-            scenario_db_faults = []
-
-        db_backend = scenario_db_backend or self._curriculum.get_db_backend()
-
-        compose_path = os.path.join(repo_dir, "docker-compose.yml")
-        try:
-            # Read or create compose file in the episode workspace
-            if os.path.exists(compose_path):
-                compose_text = open(compose_path, "r", encoding="utf-8").read()
-            else:
-                compose_text = "version: '3.8'\nservices:\n  api:\n    build:\n      context: .\n      dockerfile: Dockerfile\n"
-
-            # Ensure api service has a DATABASE_URL env set appropriate for backend
-            if db_backend == "postgres":
-                db_url = "postgresql://app:secret@postgres:5432/appdb"
-                # Ensure postgres service exists and is included (no profile) when postgres desired
-                if "\n  postgres:" not in compose_text:
-                    postgres_block = (
-                        "\n  postgres:\n"
-                        "    image: postgres:15-alpine\n"
-                        "    environment:\n"
-                        "      - POSTGRES_USER=app\n"
-                        "      - POSTGRES_PASSWORD=secret\n"
-                        "      - POSTGRES_DB=appdb\n"
-                        "    volumes:\n"
-                        "      - ./data/db:/var/lib/postgresql/data\n"
-                        "    healthcheck:\n"
-                        "      test: [\"CMD-SHELL\", \"pg_isready -U app -d appdb\"]\n"
-                    )
-                    compose_text = compose_text + postgres_block
-                else:
-                    # If a postgres service exists but has 'profiles: - postgres', remove that profile so it is included
-                    compose_text = compose_text.replace("profiles:\n      - postgres\n", "")
-            else:
-                # sqlite backend -> local file
-                db_url = "sqlite:///./app.db"
-                # If compose had a postgres service, mark it under the 'postgres' profile so it stays excluded
-                if "\n  postgres:" in compose_text and "profiles:\n      - postgres\n" not in compose_text:
-                    compose_text = compose_text.replace("\n  postgres:\n", "\n  postgres:\n    profiles:\n      - postgres\n")
-
-            # Ensure DATABASE_URL appears under api.environment
-            if "environment:" in compose_text:
-                # Naively insert DATABASE_URL if missing under api service
-                api_block_start = compose_text.find("  api:")
-                if api_block_start != -1:
-                    api_env_index = compose_text.find("environment:", api_block_start)
-                    if api_env_index != -1:
-                        # Find end of environment block (next non-indented or next service)
-                        following = compose_text[api_env_index:]
-                        if "DATABASE_URL" not in following:
-                            # insert DATABASE_URL line after environment:
-                            compose_text = compose_text.replace(
-                                "environment:",
-                                "environment:\n      - DATABASE_URL=%s" % db_url,
-                                1,
-                            )
-            else:
-                # no environment block: append one under api
-                compose_text = compose_text.replace(
-                    "  api:\n    build:",
-                    f"  api:\n    build:\n      context: .\n      dockerfile: Dockerfile\n    environment:\n      - DATABASE_URL={db_url}\n",
-                )
-
-            # Persist modified compose back to episode workspace
-            with open(compose_path, "w", encoding="utf-8") as f:
-                f.write(compose_text)
-
-        except Exception as _exc:
-            logger.warning("[reset] Failed to mutate docker-compose.yml for DB backend: %s", _exc)
-
-        # Apply any DB-targeted faults requested by the scenario (these mutate files and commit)
-        if scenario_db_faults:
-            for dbf in scenario_db_faults:
-                try:
-                    inject_fault(repo_dir, dbf)
-                except Exception as _e:
-                    logger.warning("[reset] Failed to inject DB fault '%s': %s", dbf, _e)
-        
-
         # Build difficulty from fault type
         difficulty = self._get_difficulty(fault_type)
 
         # Build max_steps — single source of truth via _get_max_steps
-        max_steps = self._get_max_steps(fault_type)
+        max_steps = self._get_max_steps(fault_type, cascade_count=len(cascading_faults))
 
         obs_dict = build_observation(
             pipeline_result=pipeline_result,
@@ -622,7 +538,6 @@ class RealCICDRepairEnvironment(Environment):
                 "ready_to_finalize": False,
                 "verification_required": False,
                 "verified_since_last_rerun": False,
-                "drift_detected": False,
                 "supported_operations": CANONICAL_OPERATIONS,
                 "canonical_operations": CANONICAL_OPERATIONS,
             },
@@ -711,7 +626,8 @@ class RealCICDRepairEnvironment(Environment):
         # Determine if episode is done
         done = False
         fault_type_for_steps = episode.fault_metadata.fault_type if episode.fault_metadata else "unknown"
-        max_steps = self._get_max_steps(fault_type_for_steps)
+        cascade_count_for_steps = len(episode.cascading_faults) if episode.cascading_faults else 0
+        max_steps = self._get_max_steps(fault_type_for_steps, cascade_count=cascade_count_for_steps)
 
         if operation == "finalize":
             done = True
@@ -877,12 +793,20 @@ class RealCICDRepairEnvironment(Environment):
             ep.hypothesis_correct = True
             ep.findings.append(f"Hypothesis partially aligns (matched {match_count}/{len(keywords)} keywords). Apply the fix.")
             if ep.hypothesis_attempts == 1:
-                return 0.18 if match_ratio >= 0.4 else 0.12
-            return 0.08 if match_ratio >= 0.4 else 0.05
+                # Scale base reward by difficulty: more keywords = harder problem = higher ceiling.
+                # A 7-keyword fault deserves more reward for a good match than a 3-keyword fault.
+                difficulty_scale = min(1.5, max(1.0, len(keywords) / 4.0))
+                base_high = round(min(0.25, 0.18 * difficulty_scale), 3)
+                base_low  = round(min(0.18, 0.12 * difficulty_scale), 3)
+                return base_high if match_ratio >= 0.4 else base_low
+            # Subsequent attempts: reward scales down but still difficulty-aware
+            difficulty_scale = min(1.4, max(1.0, len(keywords) / 4.0))
+            return round(min(0.12, 0.08 * difficulty_scale), 3) if match_ratio >= 0.4 else round(min(0.08, 0.05 * difficulty_scale), 3)
         else:
-            # Give a hint using the ROOT CAUSE fault's keywords (not cascading fault's)
+            # Give a hint using ALL root-cause keywords (not just first 3) so the agent
+            # isn't playing a truncated guessing game on high-keyword faults.
             root_fault = ep.fault_metadata.fault_type
-            hint_keywords = FAULT_KEYWORDS.get(root_fault, keywords)[:3]
+            hint_keywords = FAULT_KEYWORDS.get(root_fault, keywords)
             ep.findings.append("Hypothesis does not match current evidence. Try mentioning: " + ", ".join(hint_keywords))
             return -0.10
 
@@ -937,28 +861,7 @@ class RealCICDRepairEnvironment(Environment):
         ep.all_pipeline_results.append(new_result)
         ep.pipeline_result = new_result
 
-        # ── Mid-episode schema/state drift ─────────────────────────────
-        # Once the pipeline passes, the *world* may shift: a team rotates an
-        # endpoint, infra pins a new dep, ports change. This forces the agent
-        # to maintain a persistent world model rather than memorize the fix.
-        if drift_enabled() and new_result.status == PipelineStatus.PASSED:
-            drift_event = maybe_drift(
-                workspace=ep.workspace_dir,
-                episode_seed=ep.episode_seed,
-                attempt_idx=ep.rerun_attempts,
-            )
-            if drift_event:
-                ep.drift_events_fired.append(drift_event)
-                ep.drift_detected = True
-                ep.findings.append(
-                    f"[World Drift] {drift_event.description} "
-                    f"Files affected: {', '.join(drift_event.files_touched)}. "
-                    f"Re-investigate before finalizing."
-                )
-                # Re-run so the agent sees the fresh failure from drift
-                new_result = ep.pipeline_runner.run(workspace_dir=ep.workspace_dir)
-                ep.all_pipeline_results.append(new_result)
-                ep.pipeline_result = new_result
+        cleanup_pipeline(new_result)
 
         # Append per-stage logs so the agent can see what happened
         for stage_name in STAGE_ORDER:
@@ -987,9 +890,23 @@ class RealCICDRepairEnvironment(Environment):
                     f"Pipeline advanced from '{old_failed_stage}' to '{new_result.failed_stage}'."
                 )
             else:
-                ep.findings.append("Pipeline still failing at the same stage.")
+                msg = "Pipeline still failing at the same stage."
+                # If cascading faults are present, the same-stage failure may be
+                # caused by the next fault in the chain — not the one just fixed.
+                if ep.cascading_faults:
+                    msg += (
+                        " This incident has cascading faults — the previous fix may have "
+                        "resolved the first fault but exposed a second independent fault. "
+                        "Re-read surfaced_errors now and treat the new error as a fresh root cause."
+                    )
+                ep.findings.append(msg)
         elif old_status == PipelineStatus.FAILED and new_result.status == PipelineStatus.FAILED:
-            ep.findings.append("Rerun shows failure unchanged; refine diagnosis.")
+            msg = "Rerun shows failure unchanged; refine diagnosis."
+            if ep.cascading_faults:
+                msg += (
+                    " Note: cascading faults are active — if errors changed, this is a new fault."
+                )
+            ep.findings.append(msg)
 
         ep.last_rerun_progressed = progressed
 
@@ -1069,32 +986,27 @@ class RealCICDRepairEnvironment(Environment):
 
     def _get_difficulty(self, fault_type: str) -> str:
         difficulty_map = {
-            "merge_conflict":           "easy",
-            "dependency_conflict":      "medium",
-            "docker_order":             "medium",
-            "flaky_test":               "easy",
-            "missing_permission":       "hard",
-            "secret_exposure":          "security",
-            "env_drift":                "network",
-            # Logging faults — treat as medium (need investigation but single-file fix)
-            "log_bad_config":           "medium",
-            "log_path_unwritable":      "medium",
-            "log_volume_missing":       "medium",
-            "log_rotation_missing":     "medium",
-            "log_pii_leak":             "security",
-            "log_disabled":             "medium",
-            # Multi-app faults — harder due to cross-service scope
-            "shared_secret_rotation":   "hard",
-            "infra_port_conflict":      "hard",
-            "dependency_version_drift": "hard",
+            "merge_conflict":      "easy",
+            "dependency_conflict": "medium",
+            "docker_order":        "medium",
+            "flaky_test":          "easy",
+            "missing_permission":  "hard",
+            "secret_exposure":     "security",
+            "env_drift":           "network",
+            "log_pii_leak":        "security",
+            "log_disabled":        "medium",
+            "bad_migration_sql":   "medium",
+            "schema_drift":        "medium",
         }
         return difficulty_map.get(fault_type, "medium")
 
-    def _get_max_steps(self, fault_type: str) -> int:
+    def _get_max_steps(self, fault_type: str, cascade_count: int = 0) -> int:
         """Single source of truth for max_steps — used by both reset() and step()."""
         difficulty = self._get_difficulty(fault_type)
         max_steps_map = {"easy": 16, "medium": 20, "network": 20, "security": 20, "hard": 25}
-        return max_steps_map.get(difficulty, 20)
+        base = max_steps_map.get(difficulty, 20)
+        # Each cascading fault adds 4 steps — the agent must debug multiple independent faults.
+        return base + cascade_count * 4
 
     def _is_destructive_fix(self, value: str) -> bool:
         normalized = (value or "").strip().lower()
@@ -1181,7 +1093,6 @@ class RealCICDRepairEnvironment(Environment):
             rubric_blend_weight=self._rubric_weight if self._rubric_judge.is_active() else 0.0,
             rubric_judge_used=rubric_judge_used,
             rubric_judge_error=rubric_judge_error,
-            drift_detected=ep.drift_detected,
             findings=ep.findings[-10:],
             metadata={
                 "task_key": fault_type,
@@ -1190,9 +1101,6 @@ class RealCICDRepairEnvironment(Environment):
                 "ready_to_finalize": ep.incident_resolved and ep.verified_for_latest_rerun,
                 "verification_required": ep.incident_resolved and not ep.verified_for_latest_rerun,
                 "verified_since_last_rerun": ep.verified_for_latest_rerun,
-                "drift_detected": ep.drift_detected,
-                "drift_event_count": len(ep.drift_events_fired),
-                "latest_drift": ep.drift_events_fired[-1].kind if ep.drift_events_fired else "",
                 "supported_operations": CANONICAL_OPERATIONS,
                 "canonical_operations": CANONICAL_OPERATIONS,
                 "rubric_enabled": self._rubric_judge.is_active(),
@@ -1249,9 +1157,9 @@ class RealCICDRepairEnvironment(Environment):
 
         # Efficiency bonus
         step_count = self._state.step_count
-        max_steps_map = {"easy": 16, "medium": 20, "network": 20, "security": 20, "hard": 25}
-        difficulty = self._get_difficulty(ep.fault_metadata.fault_type if ep.fault_metadata else "medium")
-        max_steps = max_steps_map.get(difficulty, 15)
+        fault_type_eff = ep.fault_metadata.fault_type if ep.fault_metadata else "medium"
+        cascade_count_eff = len(ep.cascading_faults) if ep.cascading_faults else 0
+        max_steps = self._get_max_steps(fault_type_eff, cascade_count=cascade_count_eff)
         efficiency = max(0.0, 1.0 - (step_count / max_steps))
         score += efficiency * 0.10
 
@@ -1309,6 +1217,13 @@ class RealCICDRepairEnvironment(Environment):
         if ep.pipeline_result and ep.pipeline_result not in ep.all_pipeline_results:
             try:
                 cleanup_pipeline(ep.pipeline_result)
+            except Exception:
+                pass
+
+        # Remove the shared cache image now that the episode is fully done.
+        if ep.pipeline_runner:
+            try:
+                cleanup_cache_image(ep.pipeline_runner._cache_tag)
             except Exception:
                 pass
 

@@ -41,16 +41,17 @@ All architecture changes are implemented behind this contract.
 - Fix execution layer: `cicd/fix_applier.py`
   - Applies structured JSON edits or heuristic fixes, then commits.
 - Learning and adaptation layer:
-  - Curriculum scheduler: `server/curriculum.py`
-  - Adversarial incident designer: `server/adversarial_designer.py`
+  - Curriculum scheduler: `server/curriculum.py` — UCB1 fault selection + EMA difficulty (alpha=0.35, step cap=0.15).
+  - Adversarial incident designer: `server/adversarial_designer.py` — 15 s timeout with auto-retry at higher `max_tokens` on JSON truncation.
   - Phase-aware judge shaping: `server/adversarial_judge.py`
-  - Cross-episode memory: `server/agent_memory.py`
+  - Cross-episode memory: `server/agent_memory.py` — fix recall + optimal-path storage keyed by fault type.
   - Rubric semantic judge: `server/rubric_judge.py`
 
 ### 3.2 Inference stack
 
 - Entry point: `inference.py`
-- Agent runtime: `agent/runner.py`
+- Agent runtime: `agent/runner.py` — tool-calling loop, multi-pass guardrails, optimal-path hint injection, step-trace recording.
+- Prompt construction: `agent/prompts.py` — BASE_SYSTEM_PROMPT + general skill cards + task-specific skill cards.
 - Model tool-calling: `agent/model_client.py`
 - Action normalization and guards: `agent/actions.py`
 - HTTP adapter: `agent/http_environment.py`
@@ -83,7 +84,15 @@ All architecture changes are implemented behind this contract.
 
 ### 5.1 Fault classes
 
-Faults include merge conflict, dependency conflict, docker order, flaky tests, permission/network faults, secret exposure, and env-var drift style deploy faults.
+There are 20 fault types across four categories:
+
+**Core faults** (single-app): `merge_conflict`, `dependency_conflict`, `docker_order`, `flaky_test`, `missing_permission`, `secret_exposure`, `env_drift`.
+
+**Logging/observability faults** (build or deploy stage): `log_bad_config`, `log_path_unwritable`, `log_volume_missing`, `log_rotation_missing`, `log_pii_leak`, `log_disabled`.
+
+**Multi-app cross-service faults**: `shared_secret_rotation`, `infra_port_conflict`, `dependency_version_drift`.
+
+**Database faults**: `bad_migration_sql`, `schema_drift`, `wrong_db_url`, `init_order_race`, `missing_volume_mount`.
 
 Each fault declares:
 
@@ -91,6 +100,12 @@ Each fault declares:
 - affected files,
 - keyword set for hypothesis alignment,
 - injection mutation behavior.
+
+Fault injection reliability constraints:
+
+- `flaky_test` uses a deterministic impossibly tight threshold so every episode has a real failure. The agent still sees a timing-sensitive assertion and must diagnose it as a flaky/policy issue.
+- `missing_permission` injects an `external: true` network reference without a `name:` alias, which is reliably rejected by Docker Compose across versions.
+- `infra_port_conflict` targets port `8001:8001` (the current template) with a fallback scan for the legacy `8000:8000` mapping. Both the injector and fix applier maintain this dual-port logic for backward compatibility.
 
 ### 5.2 Mid-episode drift
 
@@ -152,9 +167,18 @@ Key safeguards in runtime:
 
 These prevent score gaming and align behavior with production SRE workflow.
 
-## 8. Observability and reproducibility
+## 8. Agent memory and optimal-path learning
 
-### 8.1 Runtime observability
+`server/agent_memory.py` provides two cross-episode memory mechanisms:
+
+1. **Fix recall**: error fingerprint → suggested fix, with confidence and recency weighting. Injected as a hint in the initial observation of each episode.
+2. **Optimal-path recall**: at the end of a resolved episode, the positive-reward step sequence is distilled (negative-reward steps stripped) and stored keyed by `fault_type`. On subsequent episodes of the same fault type, the path is injected into the first user message so the agent can follow a proven resolution sequence.
+
+Optimal paths are built in `agent/runner.py` (`_build_optimal_path`) — only steps with `reward >= 0` are kept, truncated at the first `finalize`. This produces a clean, efficient template free of wasted moves.
+
+## 9. Observability and reproducibility
+
+### 9.1 Runtime observability
 
 Observation payload surfaces:
 
@@ -165,25 +189,27 @@ Observation payload surfaces:
 - scoring diagnostics (`deterministic_score`, `rubric_score`, `delayed_reward`),
 - drift and verification readiness metadata.
 
-### 8.2 Audit trail and reproducibility
+### 9.2 Audit trail and reproducibility
 
 With audit trail enabled, metadata includes deterministic lineage fields (`episode_seed`, variant metadata, sampled pattern events), enabling reviewer-side traceability for surfaced evidence.
 
 Generated artifacts in `results/` capture deterministic evaluation and inference trajectories.
 
-## 9. Extensibility guide
+## 10. Extensibility guide
 
 Preferred extension points:
 
-- Add new fault types in `cicd/fault_injector.py` and clue extraction in `cicd/observation_builder.py`.
+- Add new fault types in `cicd/fault_injector.py` (and register in `FAULT_TYPES`, `FAULT_STAGE_MAP`, `FAULT_KEYWORDS`) and clue extraction in `cicd/observation_builder.py`.
 - Add new drift strategies in `cicd/drift_injector.py`.
 - Tune rewards/terminal components in `server/environment.py`.
 - Extend semantic judging policy in `server/rubric_judge.py`.
 - Add agent guards/strategies in `agent/actions.py` and `agent/runner.py`.
+- Extend optimal-path storage schema in `server/agent_memory.py`.
 
-## 10. Design constraints
+## 11. Design constraints
 
 - Keep OpenEnv API surface unchanged.
 - Maintain backward-compatible env vars and defaults where possible.
 - Avoid silent, implicit shortcuts that bypass inspect/rerun/verify loops.
 - Preserve reproducibility for benchmark runs.
+- Fault injection must produce a real pipeline failure; unreliable injectors cause silent zero-score episodes and corrupt curriculum statistics.

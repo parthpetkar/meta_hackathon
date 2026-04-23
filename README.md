@@ -41,12 +41,12 @@ Runtime architecture (current):
 
 - `server/environment.py` hosts `RealCICDRepairEnvironment` and action dispatch.
 - `server/rubric_judge.py` provides delayed reward rubric scoring with provider-aware fallback.
-- `server/agent_memory.py` stores persistent cross-episode fix memory in SQLite.
-- `server/curriculum.py` adapts difficulty from episode outcomes.
-- `server/adversarial_designer.py` composes LLM-designed multi-fault incidents.
+- `server/agent_memory.py` stores persistent cross-episode fix memory and optimal-path recall in SQLite.
+- `server/curriculum.py` adapts difficulty from episode outcomes using UCB1 + EMA scheduling.
+- `server/adversarial_designer.py` composes LLM-designed multi-fault incidents (cascading + red-herring).
 - `server/adversarial_judge.py` applies phase-aware adversarial reward shaping.
-- `cicd/fault_injector.py` injects task faults into the episode workspace.
-- `cicd/pipeline_runner.py` executes `clone -> build -> test -> deploy` via subprocess.
+- `cicd/fault_injector.py` injects task faults into the episode workspace (20 fault types across single-app, logging, multi-app, and DB categories).
+- `cicd/pipeline_runner.py` executes `clone -> build -> test -> deploy` via subprocess with BuildKit layer caching.
 - `cicd/observation_builder.py` builds surfaced errors/logs/config snapshots.
 - `cicd/drift_injector.py` performs opt-in mid-episode drift mutations.
 - `cicd/fix_applier.py` applies structured JSON or heuristic fixes and commits successful changes.
@@ -82,17 +82,19 @@ The runtime follows a layered architecture to keep OpenEnv APIs stable while evo
 ### 5) Inference Layer
 
 - `inference.py`: compatibility entrypoint plus run logging.
-- `agent/runner.py`: tool-calling loop, action guards, memory-aware hints.
+- `agent/runner.py`: tool-calling loop, action guards, memory-aware hints, optimal-path injection.
+- `agent/prompts.py`: system prompt construction with skill cards and task-specific guidance.
 - `agent/http_environment.py`: OpenEnv HTTP observation/action adapter.
 - `agent/trajectory_logging.py`: strict START/STEP/END structured logs.
 
 ### End-to-end flow
 
-1. `reset()` creates a workspace from `sample-app`, injects scenario faults, runs pipeline, returns evidence-rich observation.
+1. `reset()` creates a workspace from `sample-app`, curriculum selects fault type via UCB1, LLM adversarial designer composes the scenario, faults are injected, pipeline runs, observation returned.
 2. Agent issues inspect/hypothesis/fix/rerun/verify actions via `step()`.
-3. Environment updates state, applies shaping + safeguards, and emits next observation.
+3. Environment updates state, applies phase shaping + safeguards, and emits next observation.
 4. Optional drift mutates state after a successful rerun, requiring re-triage.
 5. `finalize` is accepted only after a valid `verify_fix`; terminal score blends deterministic + optional rubric.
+6. Episode outcome is recorded in curriculum; optimal fix path is stored in agent memory for future hint injection.
 
 ## Action space
 
@@ -134,6 +136,12 @@ Fix payload format for `modify_config`:
 - The fix engine applies fixes in priority order: (A) structured JSON patch, (B) fault-type direct dispatch (server knows the active fault and routes to the correct fix function automatically), (C) keyword heuristic fallback, (D) generic auto-repair scan.
 - Because the server always knows the active fault type, the agent does not need to use magic phrases — any structured JSON patch describing the correct file change will succeed.
 
+Fault injection reliability:
+
+- `flaky_test` now uses a deterministically failing threshold (0.001 s after a 0.1 s sleep) so the episode always has a detectable failure. The test still presents as a timing/flaky issue to the agent.
+- `missing_permission` uses `external: true` without a `name:` alias for maximum Docker version compatibility.
+- `infra_port_conflict` targets the correct `8001:8001` port mapping in `shared-infra/docker-compose.yml` (updated from the stale `8000:8000` reference). Both injector and fix applier handle both port variants for backward compatibility.
+
 When `META_HACKATHON_AUDIT_TRAIL=true`, observation metadata also includes deterministic provenance fields:
 
 - `audit_enabled`, `episode_seed`, `variant_id`
@@ -172,19 +180,22 @@ Additional runtime scoring rules:
 
 ## Curriculum and LLM adversarial training
 
-The runtime now includes adaptive curriculum plus adversarial incident generation.
+The runtime includes adaptive curriculum, adversarial incident generation, and cross-episode memory.
 
-- `server/curriculum.py` persists episode outcomes and updates global difficulty via EMA.
+- `server/curriculum.py` persists episode outcomes, updates global difficulty via EMA (alpha=0.35), and selects fault types via UCB1 (step cap=0.15 for faster progression).
 - Curriculum difficulty and skill-profile stats are injected into scenario design on every `reset()`.
-- `server/adversarial_designer.py` uses an LLM to generate multi-fault incidents (root cause + cascades + optional red herring).
+- `server/adversarial_designer.py` uses an LLM to generate multi-fault incidents (root cause + cascades + optional red herring). Timeout is 15 s with automatic retry at higher `max_tokens` if JSON is truncated.
 - `server/adversarial_judge.py` adds phase-aware shaping bonuses/penalties for triage, investigation, hypothesis, fix, and verification.
 - `cicd/drift_injector.py` can mutate the workspace after a successful rerun to simulate live infra/schema drift.
+- `server/agent_memory.py` stores the optimal fix path from each resolved episode and injects it as a hint on the next episode of the same fault type, accelerating convergence.
 
 How this affects episodes:
 
 - Episodes are no longer static one-shot puzzles; they can include cascading failure structure.
 - Agent behavior is rewarded for correct SRE phase progression, not only final pass/fail.
 - Optional drift forces re-triage and adaptation after an apparent recovery.
+- Difficulty increases more aggressively (step cap 0.15 vs previous 0.08) so the curriculum escapes early-difficulty stagnation.
+- Cascading faults are only injected when curriculum difficulty ≥ 0.65, keeping early episodes simple.
 
 Key controls:
 
@@ -197,43 +208,75 @@ Key controls:
 
 ## Task descriptions
 
-`easy` - Single-file merge conflict (6-step resolution target)
+`easy` / `merge_conflict` — Single-file merge conflict
 
 - One root cause: unresolved merge markers in `services/api/routes.py`.
-- One inspect pass reveals the issue.
-- One config fix resolves it, then rerun, verify, and finalize.
+- One inspect pass reveals the issue; one config fix resolves it, then rerun, verify, finalize.
 
-`flaky` - Flaky test tolerance (timing-sensitive CI instability)
+`flaky_test` — Flaky test tolerance (timing-sensitive CI instability)
 
-- Test stage intermittently fails, then passes on immediate retry.
-- Agent must diagnose this as a flaky/timing issue rather than a true product-code regression.
-- Correct remediation is retry/isolation-safe test policy updates (not broad code rewrites or disabling tests).
+- A timing-sensitive test with an impossibly tight threshold is injected into `tests/test_api.py`.
+- Fault always fails in CI but presents as a flaky/timing regression to the agent.
+- Correct remediation: remove or relax the timing assertion (retry policy or threshold fix), not broad code rewrites.
 
-`medium` - Dependency + Docker ordering chain
+`dependency_conflict` / `medium` — Dependency version conflict
 
-- Build fails due to `requests`/`urllib3` incompatibility.
-- After dependency remediation, Docker install-order instability may remain.
-- Agent must perform dependency fix and Docker order correction.
+- Build fails due to `requests`/`urllib3` incompatibility in `services/api/requirements.txt`.
+- Agent must pin compatible versions with `add_dependency`, then rerun/verify/finalize.
 
-`network` - Deploy/network configuration failure
+`docker_order` / `hard` — Dockerfile layer ordering
 
-- Deploy path fails due to runtime network/permission style misconfiguration in compose/runtime setup.
-- Agent should inspect deploy/build evidence and apply targeted configuration repair.
+- Build fails because `pip install` runs before `COPY` in the Dockerfile.
+- Agent should inspect the Dockerfile and apply order/layer correction.
 
-`security` - Secret exposure misconfiguration
+`missing_permission` / `network` — Deploy network misconfiguration
 
-- Build security gate fails because a hardcoded secret is detected.
-- Agent must remove the exposed secret safely and rerun/verify before finalize.
+- Deploy fails because `docker-compose.yml` references a non-existent external network (`corp-internal-network-v2`).
+- Agent should inspect compose config, remove/replace the external network reference, rerun, verify, finalize.
 
-`hard` - Docker layer/order failure
+`secret_exposure` / `security` — Hardcoded secrets
 
-- Build fails due to broken Dockerfile copy/install ordering.
-- Agent should inspect Dockerfile and apply order/layer correction, then rerun/verify/finalize.
+- Build security gate fails because hardcoded API keys are detected in `services/api/app.py`.
+- Agent must remove the exposed secrets safely and rerun/verify before finalize.
 
-`env_drift` - Runtime env-var deploy drift
+`env_drift` — Runtime env-var deploy drift
 
-- Deploy fails because a runtime env var in `docker-compose.yml` is invalid (for example `PORT=not-a-number` with `${PORT}:5000`).
-- Agent should inspect compose/runtime config, repair the broken env mapping, rerun, verify, and finalize.
+- Deploy fails because `PORT=not-a-number` is set with `${PORT}:5000` in `docker-compose.yml`.
+- Agent should inspect compose config, repair the broken env mapping, rerun, verify, finalize.
+
+### Logging fault group (`build` stage)
+
+`log_bad_config` — Non-JSON log formatter: `str(payload)` replaces `json.dumps()` in `logging_config.py`.
+
+`log_path_unwritable` — LOG_PATH hardcoded to `/var/log/restricted/app.log` (root-owned, write fails).
+
+`log_rotation_missing` — `RotatingFileHandler` replaced with plain `FileHandler`; log rotation disabled.
+
+`log_pii_leak` — PII credential token logged directly in `routes.py`; static scan detects it at build time.
+
+`log_disabled` — `LOG_LEVEL` hardcoded to `CRITICAL`, silencing all application log output.
+
+`log_volume_missing` — Log volume mount commented out in `shared-infra/docker-compose.yml` (`deploy` stage).
+
+### Multi-app cross-service fault group
+
+`shared_secret_rotation` — `AUTH_SECRET` rotated in `shared-infra/.env`; services reject auth (`deploy` stage).
+
+`infra_port_conflict` — `api-service` port changed from `8001:8001` to `5000:8001` in `shared-infra/docker-compose.yml`, clashing with the frontend port (`deploy` stage).
+
+`dependency_version_drift` — `fastapi==0.89.0` pinned alongside `pydantic>=2.0.0` in `api-service/requirements.txt`; pip resolution fails (`build` stage).
+
+### Database fault group
+
+`bad_migration_sql` — SQL syntax error (`CREAT TABLE`) in `db/migrations/001_init.sql`.
+
+`schema_drift` — Phantom column `artifact_url` added to `CANONICAL_COLUMNS` in `db/database.py` without a migration.
+
+`wrong_db_url` — `DATABASE_URL` uses double-slash host in `docker-compose.yml`; connection fails at deploy.
+
+`init_order_race` — `depends_on: db` healthcheck removed; app starts before Postgres is ready.
+
+`missing_volume_mount` — `pgdata` volume mount removed; Postgres data does not persist.
 
 ## Setup instructions
 
@@ -294,6 +337,10 @@ Current runtime defaults from `agent/config.py`:
 - `MESSAGE_WINDOW=12`
 - `MAX_MODEL_CALLS_PER_TASK=MAX_STEPS * 3` unless overridden
 - `META_HACKATHON_NUM_EPISODES=6` (creates `episode_1 ... episode_n` run order)
+
+The runner also injects an **optimal-path hint** at the start of each episode when `server/agent_memory.py` has a stored resolved path for the current fault type, giving the agent a step-by-step template from a prior successful episode.
+
+Guard retry attempts are capped at 3 (reduced from 4) to keep per-step latency low.
 
 `eval_runner.py` is separate: it is a deterministic regression baseline for score calibration and reproducibility, not a claim that the environment itself is solved by hardcoded control flow.
 

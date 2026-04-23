@@ -32,24 +32,19 @@ except ImportError:  # pragma: no cover
 # clobber each other, so we refuse those combinations.
 _FAULT_FILES = {
     # Core faults
-    "merge_conflict":           {"services/api/routes.py"},
-    "dependency_conflict":      {"services/api/requirements.txt"},
-    "docker_order":             {"Dockerfile"},
-    "flaky_test":               {"tests/test_api.py"},
-    "missing_permission":       {"docker-compose.yml"},
-    "secret_exposure":          {"services/api/app.py"},
-    "env_drift":                {"docker-compose.yml"},
+    "merge_conflict":      {"services/api/routes.py"},
+    "dependency_conflict": {"services/api/requirements.txt"},
+    "docker_order":        {"Dockerfile"},
+    "flaky_test":          {"tests/test_api.py"},
+    "missing_permission":  {"docker-compose.yml"},
+    "secret_exposure":     {"services/api/app.py"},
+    "env_drift":           {"docker-compose.yml"},
     # Logging faults
-    "log_bad_config":           {"services/api/logging_config.py"},
-    "log_path_unwritable":      {"services/api/logging_config.py"},
-    "log_volume_missing":       {"shared-infra/docker-compose.yml"},
-    "log_rotation_missing":     {"services/api/logging_config.py"},
-    "log_pii_leak":             {"services/api/routes.py"},
-    "log_disabled":             {"services/api/logging_config.py"},
-    # Multi-app faults
-    "shared_secret_rotation":   {"shared-infra/.env"},
-    "infra_port_conflict":      {"shared-infra/docker-compose.yml"},
-    "dependency_version_drift": {"services/api/requirements.txt", "worker/requirements.txt"},
+    "log_pii_leak":        {"services/api/routes.py"},
+    "log_disabled":        {"services/api/logging_config.py"},
+    # DB faults
+    "bad_migration_sql":   {"db/migrations/001_init.sql"},
+    "schema_drift":        {"db/database.py"},
 }
 
 
@@ -141,8 +136,6 @@ def generate_scenario(
         ),
         difficulty=difficulty,
         # DB selection: easy tiers prefer sqlite, harder tiers prefer postgres
-        db_backend=("sqlite" if difficulty < 0.4 else "postgres"),
-        db_faults=[],
     )
 
 

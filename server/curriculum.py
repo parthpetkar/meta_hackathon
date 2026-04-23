@@ -99,7 +99,7 @@ class CurriculumController:
             ).fetchone()
         finally:
             db.close()
-        return float(row[0]) if row else 0.40
+        return float(row[0]) if row else 0.20
 
     def select_fault_type(self) -> str:
         """
@@ -162,15 +162,6 @@ class CurriculumController:
                 }
         return profile
 
-    def get_db_backend(self) -> str:
-        """Return default DB backend for the current curriculum difficulty.
-
-        Easy tiers prefer `sqlite` (low setup cost). Harder tiers prefer `postgres`.
-        """
-        diff = self.get_difficulty()
-        # difficulty near lower bound -> sqlite, high difficulty -> postgres
-        return "sqlite" if diff < 0.45 else "postgres"
-
     def get_stats_summary(self) -> dict:
         """Human-readable stats — useful for logging at episode start."""
         db = _conn()
@@ -220,7 +211,7 @@ class CurriculumController:
         keeps scoring above the neutral threshold, regardless of absolute score value.
         """
         _NEUTRAL_THRESHOLD = 0.60   # score at which difficulty holds steady
-        _STEP_CAP = 0.08            # max difficulty change per episode
+        _STEP_CAP = 0.15            # max difficulty change per episode (increased from 0.08)
 
         row = db.execute(
             "SELECT value FROM curriculum_state WHERE key = 'ema_difficulty'"
@@ -231,5 +222,7 @@ class CurriculumController:
         delta = (new_score - _NEUTRAL_THRESHOLD) * _STEP_CAP / (1.0 - _NEUTRAL_THRESHOLD)
         delta = max(-_STEP_CAP, min(_STEP_CAP, delta))
 
-        new_ema = (1.0 - _EMA_ALPHA) * current + _EMA_ALPHA * (current + delta)
+        # Increased alpha for faster adaptation
+        alpha = 0.35  # increased from 0.20 for faster difficulty progression
+        new_ema = (1.0 - alpha) * current + alpha * (current + delta)
         return round(max(_DIFFICULTY_MIN, min(_DIFFICULTY_MAX, new_ema)), 4)
