@@ -34,6 +34,7 @@ from cicd.pipeline_runner import (
     cleanup_pipeline,
     cleanup_cache_image,
     setup_repo_from_template,
+    create_pipeline_runner,
 )
 from cicd.fault_injector import (
     FaultMetadata,
@@ -159,6 +160,7 @@ class EpisodeState:
     verified_for_latest_rerun: bool = False
     inspected_since_last_rerun: bool = True
     fix_hits: int = 0
+    errors_stale_after_fix: bool = False  # True after a successful fix until next rerun
 
     # Adversarial mode
     adversarial_scenario: Optional[Any] = None
@@ -438,8 +440,11 @@ class RealCICDRepairEnvironment(Environment):
         # Run the pipeline — if injection silently failed and pipeline passes,
         # retry with a fresh deterministic fault (up to 2 retries) so every
         # episode has a real failure for the agent to debug.
-        runner = PipelineRunner(
-            repo_path=repo_dir,
+        runner = create_pipeline_runner(
+            workspace_path=repo_dir,
+            fault_type=fault_type,
+            scenario=adversarial_scenario,
+            episode_id=episode_id,
             workspace_base=workspace_base,
             timeout_per_stage=self._pipeline_timeout,
         )
@@ -811,6 +816,7 @@ class RealCICDRepairEnvironment(Environment):
         if fix_result.success:
             ep.findings.append(f"Fix applied: {fix_result.description}")
             ep.pending_fix_outcome = "applied"
+            ep.errors_stale_after_fix = True
             return 0.10
         else:
             ep.findings.append(f"Fix could not be applied: {fix_result.error}")
@@ -838,6 +844,7 @@ class RealCICDRepairEnvironment(Environment):
         new_result = ep.pipeline_runner.run(workspace_dir=ep.workspace_dir)
         ep.all_pipeline_results.append(new_result)
         ep.pipeline_result = new_result
+        ep.errors_stale_after_fix = False
 
         cleanup_pipeline(new_result)
 
@@ -1047,7 +1054,7 @@ class RealCICDRepairEnvironment(Environment):
 
         pipeline_result = ep.pipeline_result or PipelineResult()
 
-        return build_observation(
+        obs = build_observation(
             pipeline_result=pipeline_result,
             workspace_dir=ep.workspace_dir,
             task_id=f"real_{fault_type}",
@@ -1081,14 +1088,28 @@ class RealCICDRepairEnvironment(Environment):
                 "verified_since_last_rerun": ep.verified_for_latest_rerun,
                 "supported_operations": CANONICAL_OPERATIONS,
                 "canonical_operations": CANONICAL_OPERATIONS,
-                "rubric_enabled": False,
-                "log_tokens_remaining": ep.log_tokens_remaining,
-                "log_budget_total": ep.log_budget_total,
-                "log_access_mode": "tail_only" if ep.log_tokens_remaining <= 0 else "full",
-                "last_log_access": ep.last_log_access,
-                "reward_model": "process_reward_model",
-                "reward_trace": ep.step_reward_trace[-12:],
-                "simulated": True,
+                "rubric_enabled": self._rubric_judge.is_active(),
+            },
+        )
+
+        if ep.errors_stale_after_fix:
+            obs["surfaced_errors"] = [
+                "[Errors from previous run — rerun pipeline to see current state]"
+            ]
+
+        return obs
+
+    def _build_rubric_payload(self, ep: EpisodeState, fault_type: str, difficulty: str) -> Dict[str, Any]:
+        keywords = ep.fault_metadata.keywords if ep.fault_metadata else []
+        return {
+            "task_id": f"real_{fault_type}",
+            "difficulty": difficulty,
+            "evidence": {
+                "hypothesis_history": ep.hypothesis_history[-8:],
+                "current_hypothesis": ep.current_hypothesis,
+                "findings": ep.findings[-10:],
+                "surfaced_errors": build_surfaced_errors(ep.pipeline_result or PipelineResult(), ep.workspace_dir),
+                "incident_resolved": ep.incident_resolved,
             },
         )
 

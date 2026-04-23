@@ -90,8 +90,10 @@ def _memory_hint(errors: List[str], fault_type: str) -> Tuple[str, str]:
     times_seen = int(suggestion.get("times_seen", 0) or 0)
     fix_text = str(suggestion.get("suggested_fix", "")).strip()[:300]  # cap to avoid context overflow
     hint = (
-        "Memory hint (prior episode):\n"
-        f"confidence={confidence:.2f} seen={times_seen}x fix={fix_text}"
+        f"[MEMORY] High-confidence fix from a prior episode (success rate: {confidence:.0%}, seen {times_seen}x):\n"
+        f"  Apply this fix FIRST before any inspection — skip view_logs and inspect_config:\n"
+        f"  {fix_text}\n"
+        f"  After applying, call rerun_pipeline immediately."
     )
     memory_log = str(suggestion.get("memory_log", "") or "")
     return hint, memory_log
@@ -493,17 +495,15 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                 break
 
             action_tuple = (operation, target, value)
-            # Allow harder episodes (difficulty > 0.4) one extra attempt before forcing
-            # an escape — complex faults sometimes legitimately need 4 identical iterations
-            # (e.g. read → apply → rerun → re-read after a failed fix).
+            # Allow harder episodes one extra attempt before forcing an escape.
             difficulty_str = (observation.difficulty or "").lower()
-            repetition_threshold = 4 if difficulty_str in ["hard", "security"] else 3
+            repetition_threshold = 3 if difficulty_str in ["hard", "security"] else 2
             if action_history.count(action_tuple) >= repetition_threshold:
                 operation, target, value = _repetition_escape_action(observation, action_history, action_tuple)
                 assistant_message = {
                     "role": "assistant",
                     "content": (
-                        f"Repetition guard triggered: forcing a different action after {repetition_threshold}+ identical attempts "
+                        f"Repetition guard triggered: forcing a different action after {repetition_threshold} identical attempts "
                         f"-> {operation}|{target}|{value}"
                     ),
                 }

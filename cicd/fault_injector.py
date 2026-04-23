@@ -72,7 +72,7 @@ FAULT_KEYWORDS: Dict[str, List[str]] = {
     "schema_drift": ["schema", "mismatch", "column"],
     "merge_conflict": ["merge", "conflict", "markers", "routes"],
     "dependency_conflict": ["dependency", "incompatible", "requests", "urllib3", "pip", "version"],
-    "docker_order": ["docker", "order", "copy", "install", "layer", "dockerfile"],
+    "docker_order": ["docker", "order", "copy", "install", "layer", "dockerfile", "before", "missing", "file", "not found"],
     "flaky_test": ["flaky", "test", "intermittent", "timing", "random", "fail"],
     "missing_permission": ["permission", "network", "deploy", "compose", "missing"],
     "secret_exposure": ["secret", "credential", "api_key", "hardcoded", "exposed", "scan"],

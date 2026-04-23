@@ -429,3 +429,39 @@ def setup_repo_from_template(template_dir: str, target_dir: str) -> str:
     _run_subprocess(["git", "commit", "-m", "Initial commit: sample API service"], cwd=target_dir, env=ci_env)
 
     return target_dir
+
+
+
+# ── Factory for Simulated vs Real Pipeline Runner ──────────────────────────
+
+def create_pipeline_runner(
+    workspace_path: str,
+    fault_type: Optional[str] = None,
+    scenario: Optional[dict] = None,
+    episode_id: Optional[str] = None,
+    **kwargs
+) -> PipelineRunner:
+    """Factory: returns simulated runner on HF Spaces, real runner locally.
+    
+    Set CICD_SIMULATE=true in environment to use simulation mode.
+    This allows the same codebase to run on Hugging Face Spaces (no Docker)
+    and locally (with Docker) without code changes.
+    """
+    if os.getenv("CICD_SIMULATE", "false").lower() == "true":
+        from cicd.simulated_runner import SimulatedPipelineRunner
+        return SimulatedPipelineRunner(
+            workspace_path=workspace_path,
+            fault_type=fault_type,
+            scenario=scenario,
+            episode_id=episode_id,
+        )
+    
+    # Real pipeline runner (existing behavior)
+    return PipelineRunner(
+        repo_path=workspace_path,
+        workspace_base=kwargs.get("workspace_base", ""),
+        image_tag=kwargs.get("image_tag", ""),
+        timeout_per_stage=kwargs.get("timeout_per_stage", 300),
+        secret_scan_enabled=kwargs.get("secret_scan_enabled", True),
+        log_config_check_enabled=kwargs.get("log_config_check_enabled", True),
+    )
