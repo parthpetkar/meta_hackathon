@@ -295,17 +295,18 @@ def _inject_flaky_test(workspace: str) -> FaultMetadata:
     flaky = textwrap.dedent('''
 
     def test_response_time_health(client):
-        """Timing-sensitive test that fails ~60% of CI runs."""
-        import time, random
-        random.seed(time.time_ns())
+        """Timing-sensitive test that fails intermittently due to tight threshold."""
+        import time
         start = time.time()
         time.sleep(0.1)
         response = client.get("/health")
         elapsed = time.time() - start
         assert response.status_code == 200
-        threshold = 0.05 if random.random() < 0.6 else 0.5
+        # Threshold is unrealistically tight — always fails after the sleep
+        threshold = 0.001
         assert elapsed < threshold, (
-            f"Health endpoint took {elapsed:.3f}s, expected < {threshold}s."
+            f"Health endpoint took {elapsed:.3f}s, expected < {threshold}s "
+            f"(flaky: timing constraint too strict for this environment)."
         )
     ''')
     with open(path, "w", encoding="utf-8") as f:
@@ -316,7 +317,7 @@ def _inject_flaky_test(workspace: str) -> FaultMetadata:
         fault_type="flaky_test",
         affected_files=["tests/test_api.py"],
         injected_at_commit_sha=sha,
-        description="Timing-sensitive test with random threshold fails ~60% of runs",
+        description="Timing-sensitive test with impossibly tight threshold always fails — needs retry policy or relaxed threshold",
     )
 
 
@@ -325,8 +326,10 @@ def _inject_missing_permission(workspace: str) -> FaultMetadata:
     # Read existing content to preserve environment variables and volumes
     with open(path, "r", encoding="utf-8") as f:
         original = f.read()
-    
-    # Inject external network reference that will cause docker compose to fail
+
+    # Inject a deploy section that requires a named Docker network that does not exist.
+    # Using 'cap_add: NET_ADMIN' with a missing network makes compose fail reliably at
+    # container-start time with a permission/network error, regardless of Docker version.
     with open(path, "w", encoding="utf-8") as f:
         f.write(textwrap.dedent("""\
             version: "3.8"
@@ -343,10 +346,10 @@ def _inject_missing_permission(workspace: str) -> FaultMetadata:
                   - LOG_PATH=/app/logs/app.log
                   - LOG_LEVEL=INFO
                   - SERVICE_NAME=api
-                networks:
-                  - restricted_internal_net
                 volumes:
                   - ./logs:/app/logs
+                networks:
+                  - corp-internal-network-v2
                 healthcheck:
                   test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
                   interval: 30s
@@ -354,9 +357,8 @@ def _inject_missing_permission(workspace: str) -> FaultMetadata:
                   retries: 3
 
             networks:
-              restricted_internal_net:
+              corp-internal-network-v2:
                 external: true
-                name: corp-internal-network-v2
         """))
     sha = _commit(workspace, "infra: connect api service to internal corporate network", [path])
     return FaultMetadata(
@@ -626,12 +628,18 @@ def _inject_infra_port_conflict(workspace: str) -> FaultMetadata:
         content = f.read()
 
     new_content = content.replace(
-        '      - "8000:8000"',
-        '      - "5000:8000"  # FAULT(infra_port_conflict): clashes with frontend port',
+        '      - "8001:8001"',
+        '      - "5000:8001"  # FAULT(infra_port_conflict): clashes with frontend port',
     )
     if new_content == content:
+        # Fallback: try the old port mapping in case template changed
+        new_content = content.replace(
+            '      - "8000:8000"',
+            '      - "5000:8000"  # FAULT(infra_port_conflict): clashes with frontend port',
+        )
+    if new_content == content:
         raise RuntimeError(
-            "_inject_infra_port_conflict: expected port mapping '8000:8000' not found in "
+            "_inject_infra_port_conflict: expected port mapping '8001:8001' (or '8000:8000') not found in "
             "shared-infra/docker-compose.yml — template may have drifted"
         )
     with open(path, "w", encoding="utf-8") as f:
