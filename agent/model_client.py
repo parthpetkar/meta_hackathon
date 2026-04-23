@@ -4,7 +4,7 @@ import json
 import re
 from typing import Any, Dict, Optional, Tuple
 
-from .config import MAX_TOKENS, MODEL_NAME, TEMPERATURE
+from .config import MAX_TOKENS, MODEL_NAME, TEMPERATURE, HTTP_TIMEOUT_SECONDS
 from .tool_schemas import TOOL_SCHEMAS
 
 
@@ -86,6 +86,7 @@ def get_model_action(
             temperature=TEMPERATURE,
             max_tokens=MAX_TOKENS,
             stream=False,
+            timeout=HTTP_TIMEOUT_SECONDS,  # Add explicit timeout
         )
     except Exception as exc:
         # Groq (and some other providers) return a 400 BadRequestError when the
