@@ -620,6 +620,60 @@ class SimulatedPipelineRunner:
 
     # ── Public run ─────────────────────────────────────────────────────────
 
+    def run_stage(self, stage_name: str, workspace_dir: Optional[str] = None) -> SimulatedStageResult:
+        """Execute a single pipeline stage and return its result.
+
+        Useful for streaming stage-by-stage execution over WebSocket.
+        Caller is responsible for tracking fault_status across calls.
+        """
+        ws_dir = workspace_dir or self.workspace_path
+
+        fault_status: Dict[str, Tuple[bool, float, List[str]]] = {}
+        for fault in self._active_faults:
+            score, failing = _score_fix(ws_dir, fault)
+            fault_status[fault] = (score == 1.0, score, failing)
+
+        faults_by_stage: Dict[str, List[str]] = {s: [] for s in STAGE_ORDER}
+        for fault in self._active_faults:
+            fully_fixed, _, _ = fault_status[fault]
+            if not fully_fixed:
+                stage = FAULT_STAGE_MAP.get(fault, "build")
+                faults_by_stage[stage].append(fault)
+
+        syntax_errors_build: List[str] = []
+        if stage_name == "build":
+            for py_file in _find_python_files(ws_dir, "services") + _find_python_files(ws_dir, "tests"):
+                ok, msg = _validate_python_syntax(ws_dir, py_file)
+                if not ok:
+                    syntax_errors_build.append(msg)
+            sql_ok, sql_msg = _validate_sql_tokens(ws_dir, "db/migrations/001_init.sql")
+            if not sql_ok:
+                syntax_errors_build.append(sql_msg)
+
+        active_stage_faults = faults_by_stage.get(stage_name, [])
+        stage = SimulatedStageResult(name=stage_name, status=_sw(StageStatus.RUNNING))
+
+        if stage_name == "clone":
+            exit_code, stdout, stderr = self._run_clone_stage(ws_dir)
+        elif stage_name == "build":
+            exit_code, stdout, stderr = self._run_build_stage(
+                ws_dir, active_stage_faults, fault_status, syntax_errors_build
+            )
+        elif stage_name == "test":
+            exit_code, stdout, stderr = self._run_test_stage(ws_dir, active_stage_faults, fault_status)
+        elif stage_name == "deploy":
+            exit_code, stdout, stderr = self._run_deploy_stage(ws_dir, active_stage_faults, fault_status)
+        else:
+            exit_code, stdout, stderr = 1, "", f"Unknown stage: {stage_name}"
+
+        stage.duration_seconds = self._stage_duration(stage_name, exit_code, active_stage_faults)
+        stage.exit_code = exit_code
+        stage.stdout = stdout
+        stage.stderr = stderr
+        stage.command = self._stage_command(stage_name)
+        stage.status = _sw(StageStatus.PASSED if exit_code == 0 else StageStatus.FAILED)
+        return stage
+
     def run(self, workspace_dir: Optional[str] = None) -> SimulatedPipelineResult:
         ws_dir = workspace_dir or self.workspace_path
 

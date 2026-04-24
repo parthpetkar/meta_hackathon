@@ -1,4 +1,3 @@
-LICENSE
 README.md
 __init__.py
 client.py
@@ -6,6 +5,7 @@ eval_runner.py
 inference.py
 models.py
 pyproject.toml
+reset_sqlite_db.py
 ./__init__.py
 ./client.py
 ./eval_runner.py
@@ -14,6 +14,8 @@ pyproject.toml
 ./reset_sqlite_db.py
 agent/__init__.py
 agent/actions.py
+agent/api_client.py
+agent/api_tool_schemas.py
 agent/config.py
 agent/http_environment.py
 agent/model_client.py
@@ -21,13 +23,14 @@ agent/prompts.py
 agent/runner.py
 agent/tool_schemas.py
 agent/trajectory_logging.py
+agent/ws_client.py
 cicd/__init__.py
-cicd/drift_injector.py
 cicd/fault_injector.py
 cicd/fix_applier.py
 cicd/observation_builder.py
 cicd/pipeline_runner.py
 cicd/procedural_generator.py
+cicd/simulated_runner.py
 openenv_meta_hackathon.egg-info/PKG-INFO
 openenv_meta_hackathon.egg-info/SOURCES.txt
 openenv_meta_hackathon.egg-info/dependency_links.txt
@@ -39,6 +42,7 @@ server/adversarial_designer.py
 server/adversarial_judge.py
 server/agent_memory.py
 server/app.py
+server/cicd_api.py
 server/curriculum.py
 server/environment.py
 server/rubric_judge.py
