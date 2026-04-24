@@ -51,15 +51,24 @@ except Exception as e:  # pragma: no cover
 
 try:
     from ..models import MetaHackathonAction, MetaHackathonObservation
-    from .environment import RealCICDRepairEnvironment
+    from .environment import RealCICDRepairEnvironment, SimulatedCICDRepairEnvironment
 except (ImportError, ModuleNotFoundError):
     from models import MetaHackathonAction, MetaHackathonObservation
-    from server.environment import RealCICDRepairEnvironment
+    from server.environment import RealCICDRepairEnvironment, SimulatedCICDRepairEnvironment
 
 logger = logging.getLogger(__name__)
 
+# Select environment class based on CICD_SIMULATE env var.
+# CICD_SIMULATE=true  → SimulatedCICDRepairEnvironment (no Docker, no Git)
+# CICD_SIMULATE=false → RealCICDRepairEnvironment      (real subprocesses)
+_simulate = os.getenv("CICD_SIMULATE", "false").strip().lower() == "true"
+_EnvClass = SimulatedCICDRepairEnvironment if _simulate else RealCICDRepairEnvironment
+if _simulate:
+    logger.info("CICD_SIMULATE=true — using SimulatedCICDRepairEnvironment (no Docker/Git required)")
+else:
+    logger.info("CICD_SIMULATE=false — using RealCICDRepairEnvironment (Docker + Git required)")
 
-_SHARED_REST_ENV = RealCICDRepairEnvironment()
+_SHARED_REST_ENV = _EnvClass()
 _SHARED_REST_ENV.close = lambda: None  # prevent REST handlers from nuking _episode between requests
 
 # Global reference to CI/CD API server process
@@ -141,7 +150,7 @@ def _stop_cicd_api_server():
         logger.info("CI/CD API server stopped")
 
 
-def _shared_env_factory() -> RealCICDRepairEnvironment:
+def _shared_env_factory():
     # OpenEnv HTTP handlers call close() after every request; the no-op close above
     # preserves episode state across /reset and /step calls on the shared instance.
     return _SHARED_REST_ENV
