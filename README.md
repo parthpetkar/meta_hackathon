@@ -17,9 +17,9 @@ tags:
 
 ## Environment description
 
-This environment runs a real CI/CD debugging and repair workflow for reinforcement learning agents.
-Each episode creates a workspace from `sample-app`, injects a fault into real files, runs a real
-subprocess-backed pipeline, and returns structured evidence.
+This environment runs a CI/CD debugging and repair workflow for reinforcement learning agents.
+Each episode creates a workspace from `sample-app`, injects a fault into real files, runs a
+pipeline (real subprocess-backed or pure-Python simulated), and returns structured evidence.
 
 At every episode, an agent must investigate pipeline evidence, infer the root cause, apply safe fixes,
 rerun the pipeline, verify the fix signal, and finalize only when the incident is truly resolved.
@@ -29,7 +29,7 @@ Why this matters for RL:
 - The task requires sequential reasoning under uncertainty (logs are noisy and partially ambiguous).
 - The action space mixes diagnosis and intervention, creating realistic credit-assignment challenges.
 - Rewards encourage operationally safe behavior, not just short-term score gaming.
-- Failure logs and file evidence come from real pipeline execution against the faulted workspace.
+- Failure logs and file evidence come from real or simulated pipeline execution against the faulted workspace.
 
 OpenEnv API compliance:
 
@@ -39,16 +39,19 @@ OpenEnv API compliance:
 
 Runtime architecture (current):
 
-- `server/environment.py` hosts `RealCICDRepairEnvironment` and action dispatch.
+- `server/environment.py` hosts both `RealCICDRepairEnvironment` and `SimulatedCICDRepairEnvironment`; selection is controlled by `CICD_SIMULATE`.
 - `server/rubric_judge.py` provides delayed reward rubric scoring with provider-aware fallback.
 - `server/agent_memory.py` stores persistent cross-episode fix memory and optimal-path recall in SQLite.
 - `server/curriculum.py` adapts difficulty from episode outcomes using UCB1 + EMA scheduling.
 - `server/adversarial_designer.py` composes LLM-designed multi-fault incidents (cascading + red-herring).
 - `server/adversarial_judge.py` applies phase-aware adversarial reward shaping.
-- `cicd/fault_injector.py` injects task faults into the episode workspace (20 fault types across single-app, logging, multi-app, and DB categories).
+- `cicd/fault_injector.py` injects task faults into the episode workspace via real file mutations + git commits (20 fault types).
+- `cicd/simulated_fault_injector.py` injects the same 20 fault types via file mutations only — no git required.
 - `cicd/pipeline_runner.py` executes `clone -> build -> test -> deploy` via subprocess with BuildKit layer caching.
-- `cicd/observation_builder.py` builds surfaced errors/logs/config snapshots.
-- `cicd/fix_applier.py` applies structured JSON or heuristic fixes and commits successful changes.
+- `cicd/simulated_runner.py` executes the same four stages in pure Python — no Docker required.
+- `cicd/observation_builder.py` builds surfaced errors/logs/config snapshots (works with both runners).
+- `cicd/fix_applier.py` applies structured JSON or heuristic fixes and commits successful changes via git.
+- `cicd/simulated_fix_applier.py` applies the same fix strategies without git commits.
 
 ## Architecture
 
@@ -56,20 +59,29 @@ The runtime follows a layered architecture to keep OpenEnv APIs stable while evo
 
 ### 1) API + Session Layer
 
-- `server/app.py`: OpenEnv HTTP server wiring (`/reset`, `/step`, `/state`).
-- `server/environment.py`: `RealCICDRepairEnvironment` episode state machine and action dispatcher.
+- `server/app.py`: OpenEnv HTTP server wiring (`/reset`, `/step`, `/state`). Reads `CICD_SIMULATE` at startup and selects the appropriate environment class.
+- `server/environment.py`: `RealCICDRepairEnvironment` and `SimulatedCICDRepairEnvironment` — both implement the same episode state machine and action dispatcher. Curriculum, adversarial designer, judge, and memory components are shared identically between the two.
 
 ### 2) Execution Layer
 
-- `cicd/pipeline_runner.py`: real subprocess pipeline (`clone -> build -> test -> deploy`).
-- `cicd/fault_injector.py`: file-level fault mutations with git commits.
-- `cicd/fix_applier.py`: structured JSON edits + fault-type direct dispatch + heuristic/auto fixes.
+Two parallel implementations — swap via `CICD_SIMULATE` env var:
+
+| Component | Real (`CICD_SIMULATE=false`) | Simulated (`CICD_SIMULATE=true`) |
+|---|---|---|
+| Pipeline runner | `cicd/pipeline_runner.py` — Docker + Git subprocess | `cicd/simulated_runner.py` — pure Python, no Docker |
+| Fault injector | `cicd/fault_injector.py` — file mutations + git commit | `cicd/simulated_fault_injector.py` — file mutations only |
+| Fix applier | `cicd/fix_applier.py` — file edits + git commit | `cicd/simulated_fix_applier.py` — file edits only |
+| Workspace setup | `git init` + initial commit | `shutil.copytree` (no git) |
+
+Both implementations support all 20 fault types and use identical fix strategies (structured JSON → fault-type dispatch → heuristic → auto-repair).
 
 ### 3) Evidence Layer
 
-- `cicd/observation_builder.py`: builds surfaced logs/errors/metrics/config snapshots.
+- `cicd/observation_builder.py`: builds surfaced logs/errors/metrics/config snapshots. Works with both real and simulated pipeline results because both expose the same stage result interface.
 
 ### 4) Adaptation + Scoring Layer
+
+Fully shared between real and simulated environments:
 
 - `server/curriculum.py`: difficulty scheduling from prior outcomes.
 - `server/adversarial_designer.py`: LLM-designed cascading incidents.
@@ -87,7 +99,7 @@ The runtime follows a layered architecture to keep OpenEnv APIs stable while evo
 
 ### End-to-end flow
 
-1. `reset()` creates a workspace from `sample-app`, curriculum selects fault type via UCB1, LLM adversarial designer composes the scenario, faults are injected, pipeline runs, observation returned.
+1. `reset()` creates a workspace from `sample-app` (via git or shutil depending on mode), curriculum selects fault type via UCB1, LLM adversarial designer composes the scenario, faults are injected into real files, pipeline runs, observation returned.
 2. Agent issues inspect/hypothesis/fix/rerun/verify actions via `step()`.
 3. Environment updates state, applies phase shaping + safeguards, and emits next observation.
 4. `finalize` is accepted only after a valid `verify_fix`; terminal score blends deterministic + optional rubric.
@@ -273,6 +285,36 @@ Key controls:
 
 ## Setup instructions
 
+### Run in simulated mode (no Docker, no Git required)
+
+Set `CICD_SIMULATE=true` to use the fully pure-Python environment. No Docker daemon, no Git CLI, and no BuildKit are needed — the environment runs entirely in process.
+
+```bash
+uv sync
+CICD_SIMULATE=true uv run uvicorn server.app:app --host 0.0.0.0 --port 8000
+```
+
+The server logs confirm which mode is active at startup:
+
+```
+INFO: CICD_SIMULATE=true — using SimulatedCICDRepairEnvironment (no Docker/Git required)
+```
+
+Use this mode for:
+- Development and local testing without Docker Desktop
+- Hugging Face Spaces CPU deployments (no Docker-in-Docker support)
+- Rapid agent iteration where pipeline latency is not a concern
+- CI environments without container runtimes
+
+### Run in real mode (Docker + Git required)
+
+```bash
+uv sync
+uv run uvicorn server.app:app --host 0.0.0.0 --port 8000
+# or explicitly:
+CICD_SIMULATE=false uv run uvicorn server.app:app --host 0.0.0.0 --port 8000
+```
+
 ### Run locally with Docker
 
 1. Build image:
@@ -281,28 +323,30 @@ Key controls:
 docker build -t meta-hackathon-env .
 ```
 
-1. Start API server:
+2. Start API server:
 
 ```bash
 docker run --rm -p 8000:8000 meta-hackathon-env
 ```
 
-1. Validate OpenEnv endpoints:
+3. Validate OpenEnv endpoints:
 
 - `POST /reset`
 - `POST /step`
 - `GET /state`
 
-### Run locally without Docker
+### Run with Docker in simulated mode
 
 ```bash
-uv sync
-uv run uvicorn server.app:app --host 0.0.0.0 --port 8000
+docker run --rm -p 8000:8000 -e CICD_SIMULATE=true meta-hackathon-env
 ```
+
+This lets you run the container without a Docker-in-Docker setup (e.g. in resource-constrained cloud environments).
 
 ## Design rationale and contribution angle
 
-- Real-world abstraction: each episode uses a real workspace, real file mutations, and real subprocess pipeline stages.
+- Dual-mode execution: the same agent, curriculum, reward structure, and observation schema work against both real Docker pipelines and a pure-Python simulator — swapped via a single env var.
+- Real-world abstraction: fault injection always writes real file mutations (conflict markers, bad SQL, broken YAML) so agents see authentic evidence regardless of execution mode.
 - Why RL over rules: agents must sequence evidence gathering, hypothesis quality, safe edits, and verification under noisy logs.
 - Open-source contribution value: reproducible fault injection, transparent step/reward dynamics, and OpenEnv-compatible serving.
 - Extensibility entry points: environment/action logic in `server/environment.py`, pipeline/fault/fix subsystems in `cicd/`, deterministic regression eval in `eval_runner.py`, and agentic baseline modules in `agent/`.
@@ -312,8 +356,12 @@ For a deeper narrative of intended upstream value and extension strategy, see `D
 ## Project layout
 
 - `models.py` and `client.py`: OpenEnv action/observation models and client adapter.
-- `server/`: API app and real environment runtime (`app.py`, `environment.py`).
-- `cicd/`: real pipeline runner, fault injector, fix applier, and observation builder.
+- `server/`: API app and environment runtime (`app.py`, `environment.py` — hosts both `RealCICDRepairEnvironment` and `SimulatedCICDRepairEnvironment`).
+- `cicd/`: pipeline runners, fault injectors, fix appliers, and observation builder — each with real and simulated variants:
+  - `pipeline_runner.py` / `simulated_runner.py`
+  - `fault_injector.py` / `simulated_fault_injector.py`
+  - `fix_applier.py` / `simulated_fix_applier.py`
+  - `observation_builder.py` (shared)
 - `agent/`: modular inference baseline (`config`, `prompts`, `tool_schemas`, action guards, fallback plans, HTTP environment helpers, model tool-call translation, and runner).
 - `inference.py`: thin compatibility entry point for the agentic baseline.
 - `eval_runner.py`: deterministic regression evaluator for calibration and smoke tests.
@@ -396,6 +444,11 @@ SUCCESS_SCORE_THRESHOLD=0.20
 
 # Server/runtime controls
 META_HACKATHON_PIPELINE_TIMEOUT_SECONDS=300
+
+# Execution mode toggle
+# true  -> SimulatedCICDRepairEnvironment (pure Python, no Docker, no Git)
+# false -> RealCICDRepairEnvironment (Docker + Git subprocesses, default)
+CICD_SIMULATE=false
 
 # Optional provenance audit trail in reset/step metadata
 META_HACKATHON_AUDIT_TRAIL=true

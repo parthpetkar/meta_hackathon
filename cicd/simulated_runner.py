@@ -388,10 +388,10 @@ PARTIAL_FIX_CHECKS: Dict[str, List[Tuple[str, Callable[[str], bool]]]] = {
          lambda ws: _validate_python_syntax(ws, "services/api/routes.py")[0]),
     ],
     "dependency_conflict": [
-        ("urllib3==2.0 pin removed from requirements.txt",
+        ("urllib3==2.0 exact pin removed from requirements.txt",
          lambda ws: "urllib3==2.0" not in _read_file_safe(ws, "services/api/requirements.txt")),
-        ("urllib3 pin is compatible with requests==2.28.0 (must be <2.0)",
-         lambda ws: bool(re.search(r"urllib3[><=!,\s]*(>=\s*1\.|<\s*[12]\.|>=1,)", _read_file_safe(ws, "services/api/requirements.txt")))),
+        ("requests and urllib3 versions are mutually compatible",
+         lambda ws: _no_version_drift(ws)),
     ],
     "docker_order": [
         ("COPY requirements.txt precedes RUN uv pip install",

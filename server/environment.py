@@ -1317,3 +1317,829 @@ class RealCICDRepairEnvironment(Environment):
         if self._episode:
             self._cleanup_episode(self._episode)
             self._episode = None
+
+
+# ── Simulated Environment ───────────────────────────────────────────────────
+
+class SimulatedCICDRepairEnvironment(Environment):
+    """Fully simulated CI/CD repair environment — no Docker, no Git required.
+
+    Mirrors RealCICDRepairEnvironment's complete API (reset/step/state) but
+    replaces every real-subprocess component with pure-Python equivalents:
+
+      - Workspace setup: shutil.copytree (no git init/commit)
+      - Fault injection: SimulatedFaultInjector (file mutations, no git)
+      - Pipeline execution: SimulatedPipelineRunner (synthetic logs)
+      - Fix application: SimulatedFixApplier (file mutations, no git)
+      - Observation building: ObservationBuilder (reads real mutated files)
+      - Curriculum / AdversarialDesigner / Judge / Memory: identical to real env
+
+    Toggle via environment variable:  CICD_SIMULATE=true
+    """
+
+    SUPPORTS_CONCURRENT_SESSIONS = True
+
+    def __init__(self, task_key: str = ""):
+        self._task_key = task_key or os.getenv("META_HACKATHON_TASK_MODE", "cycle")
+        self._state = State()
+        self._episode: Optional[EpisodeState] = None
+
+        self._task_order = FAULT_TYPES
+        self._task_cursor = 0
+
+        self._rubric_enabled = os.getenv("META_HACKATHON_RUBRIC_ENABLED", "false").strip().lower() == "true"
+        self._rubric_weight = max(
+            0.0,
+            min(1.0, float(os.getenv("META_HACKATHON_RUBRIC_WEIGHT", "0.30"))),
+        )
+        self._rubric_timeout = int(os.getenv("META_HACKATHON_RUBRIC_TIMEOUT_SECONDS", "10"))
+        self._rubric_model = (
+            os.getenv("META_HACKATHON_RUBRIC_MODEL")
+            or os.getenv("MODEL_NAME")
+            or DEFAULT_OPENROUTER_MODEL
+        )
+        self._rubric_judge = OpenEnvLLMJudgeAdapter(
+            enabled=self._rubric_enabled,
+            model_name=self._rubric_model,
+            timeout_seconds=self._rubric_timeout,
+        )
+
+        self._curriculum = CurriculumController()
+
+        _llm_provider = os.getenv("LLM_PROVIDER", "hf").strip().lower()
+
+        def _resolve_api_key() -> str:
+            explicit = (os.getenv("API_KEY") or "").strip()
+            if explicit:
+                return explicit
+            if _llm_provider == "openrouter":
+                return (os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
+                        or os.getenv("HF_TOKEN") or os.getenv("GROQ_API_KEY") or "")
+            if _llm_provider == "groq":
+                return (os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY")
+                        or os.getenv("HF_TOKEN") or os.getenv("OPENROUTER_API_KEY") or "")
+            return (os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY")
+                    or os.getenv("OPENROUTER_API_KEY") or os.getenv("GROQ_API_KEY") or "")
+
+        def _resolve_base_url() -> str:
+            explicit = (os.getenv("CICD_ADV_BASE_URL") or os.getenv("API_BASE_URL") or "").strip()
+            if explicit:
+                return explicit
+            if _llm_provider == "openrouter":
+                return "https://openrouter.ai/api/v1"
+            if _llm_provider == "groq":
+                return "https://api.groq.com/openai/v1"
+            return "https://router.huggingface.co/v1"
+
+        self._adv_designer = AdversarialDesigner(
+            api_key=_resolve_api_key(),
+            base_url=_resolve_base_url(),
+        )
+        self._adv_judge = AdversarialJudge()
+
+        self._cleanup_lock = threading.Lock()
+        self._stale_workspaces: List[tuple[str, float]] = []
+
+        self._template_dir = SAMPLE_APP_TEMPLATE
+        if not os.path.isdir(self._template_dir):
+            self._template_dir = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "..", "sample-app"
+            )
+
+        # Import simulated components (deferred to avoid circular imports)
+        from cicd.simulated_runner import SimulatedPipelineRunner
+        from cicd.simulated_fault_injector import inject_fault_simulated
+        from cicd.simulated_fix_applier import apply_fix_simulated
+        from cicd.procedural_generator import generate_scenario as procedural_generate_scenario, inject_procedural
+
+        self._SimulatedPipelineRunner = SimulatedPipelineRunner
+        self._inject_fault = inject_fault_simulated
+        self._apply_fix = apply_fix_simulated
+        self._procedural_generate_scenario = procedural_generate_scenario
+        self._inject_procedural = inject_procedural
+
+    # ── Workspace setup (no git) ────────────────────────────────────────────
+
+    def _setup_workspace(self, target_dir: str) -> None:
+        """Copy template into target_dir without initialising a git repository."""
+        if os.path.exists(target_dir):
+            shutil.rmtree(target_dir)
+        shutil.copytree(self._template_dir, target_dir, dirs_exist_ok=False)
+
+    # ── OpenEnv API ─────────────────────────────────────────────────────────
+
+    async def reset_async(
+        self, seed: Optional[int] = None, episode_id: Optional[str] = None, **kwargs: Any
+    ) -> MetaHackathonObservation:
+        options = kwargs.get("reset_options", {})
+        task_key = options.get("task_key") or kwargs.get("task_key", "")
+        return self.reset(task_key=task_key)
+
+    def reset(self, task_key: str = "") -> MetaHackathonObservation:
+        """Start a new simulated episode: inject fault, run simulated pipeline, return observation."""
+        if self._episode:
+            self._cleanup_episode(self._episode)
+
+        episode_id = str(uuid.uuid4())
+        self._state = State(episode_id=episode_id, step_count=0)
+
+        eff_task_key = task_key or self._task_key
+        use_procedural_style = eff_task_key in ("procedural", "combo")
+
+        curriculum_difficulty = self._curriculum.get_difficulty()
+        skill_profile = self._curriculum.get_skill_profile()
+
+        # Set up workspace (plain copy, no git)
+        workspace_base = tempfile.mkdtemp(prefix="cicd-sim-episode-")
+        repo_dir = os.path.join(workspace_base, "repo")
+        self._setup_workspace(repo_dir)
+
+        episode_seed = int(uuid.UUID(episode_id).int & 0xFFFFFFFF)
+
+        # Curriculum selects seed fault; adversarial designer composes scenario
+        seed_fault = self._curriculum.select_fault_type()
+        adversarial_scenario = self._adv_designer.design(
+            root_cause_fault=seed_fault,
+            difficulty=curriculum_difficulty,
+            skill_profile=skill_profile,
+        )
+
+        if use_procedural_style and adversarial_scenario.steps:
+            root_cause_ft = adversarial_scenario.steps[0].fault_type
+            adversarial_scenario = self._procedural_generate_scenario(
+                difficulty=curriculum_difficulty,
+                seed=episode_seed,
+                root_cause=root_cause_ft,
+            )
+            injected = self._inject_procedural_simulated(repo_dir, adversarial_scenario)
+        else:
+            if curriculum_difficulty < 0.65 and len(adversarial_scenario.steps) > 1:
+                adversarial_scenario.steps = adversarial_scenario.steps[:1]
+            injected = self._inject_scenario_simulated(repo_dir, adversarial_scenario)
+
+        fault_type = adversarial_scenario.steps[0].fault_type if adversarial_scenario.steps else "merge_conflict"
+        cascade_types = [s.fault_type for s in adversarial_scenario.steps[1:]] if adversarial_scenario.steps else []
+        fail_stage = FAULT_STAGE_MAP.get(fault_type, "unknown")
+        print(
+            f"[SIM-EPISODE] fault={fault_type}  cascades={cascade_types}  "
+            f"fail_stage={fail_stage}  difficulty={curriculum_difficulty:.2f}  "
+            f"mode={'procedural' if use_procedural_style else 'llm-adversarial'}",
+            flush=True,
+        )
+
+        fault_metadata = injected[0] if injected else self._inject_fault(repo_dir, fault_type)
+        cascading_faults: list = injected[1:] if len(injected) > 1 else []
+
+        # Run the simulated pipeline
+        runner = self._SimulatedPipelineRunner(
+            workspace_path=repo_dir,
+            fault_type=fault_type,
+            scenario=adversarial_scenario,
+            episode_id=episode_id,
+        )
+        pipeline_result = runner.run(workspace_dir=repo_dir)
+
+        # Retry if pipeline unexpectedly passed (fault injection may have missed)
+        _retry = 0
+        try:
+            from cicd.simulated_runner import PipelineStatus as SimPipelineStatus
+            while str(pipeline_result.status) == SimPipelineStatus.PASSED and _retry < 2:
+                _retry += 1
+                logger.warning(
+                    "[sim-reset] Simulated pipeline passed after injection — retrying "
+                    "(fault_type=%s, attempt %d/2).", fault_type, _retry,
+                )
+                fallback = self._inject_fault(repo_dir, fault_type)
+                if fallback:
+                    fault_metadata = fallback
+                pipeline_result = runner.run(workspace_dir=repo_dir)
+        except Exception:
+            logger.exception("[sim-reset] Fault injection retry failed.")
+
+        episode = EpisodeState(
+            episode_id=episode_id,
+            workspace_dir=repo_dir,
+            repo_dir=repo_dir,
+            fault_metadata=fault_metadata,
+            pipeline_result=pipeline_result,
+            pipeline_runner=runner,
+            all_pipeline_results=[pipeline_result],
+            findings=["Incident acknowledged. Investigate before changing configuration."],
+            created_at=time.time(),
+            adversarial_scenario=adversarial_scenario,
+            cascading_faults=cascading_faults,
+            curriculum_difficulty=curriculum_difficulty,
+            episode_seed=episode_seed,
+            procedural_mode=use_procedural_style,
+        )
+        self._episode = episode
+
+        difficulty = self._get_difficulty(fault_type)
+        max_steps = self._get_max_steps(fault_type, cascade_count=len(cascading_faults))
+
+        obs_dict = build_observation(
+            pipeline_result=pipeline_result,
+            workspace_dir=repo_dir,
+            task_id=f"sim_{fault_type}",
+            task_title=f"Fix {fault_type.replace('_', ' ')} in CI/CD pipeline (simulated)",
+            difficulty=difficulty,
+            reward=0.0,
+            done=False,
+            findings=episode.findings,
+            metadata={
+                "task_key": fault_type,
+                "max_steps": max_steps,
+                "fault_type": fault_type,
+                "expected_fail_stage": fault_metadata.expected_fail_stage,
+                "ready_to_finalize": False,
+                "verification_required": False,
+                "verified_since_last_rerun": False,
+                "supported_operations": CANONICAL_OPERATIONS,
+                "canonical_operations": CANONICAL_OPERATIONS,
+                "simulated": True,
+            },
+        )
+        return self._dict_to_observation(obs_dict)
+
+    def step(self, action: MetaHackathonAction) -> MetaHackathonObservation:
+        """Execute one action step (identical logic to RealCICDRepairEnvironment.step)."""
+        self._state.step_count += 1
+        episode = self._episode
+        if not episode:
+            return self._error_observation("No active episode. Call /reset first.")
+
+        raw_operation = (action.operation or "").strip()
+        operation = _canonical_operation(raw_operation)
+        target = (action.target or "").strip()
+        value = (action.value or "").strip()
+
+        if operation not in CANONICAL_OPERATIONS:
+            return self._error_observation(
+                f"Unsupported operation '{raw_operation}'",
+                reward=-0.20,
+            )
+
+        history_entry = {"operation": operation, "target": target, "value": value}
+        episode.history.append(history_entry)
+
+        action_key = f"{operation}:{target}:{value}"
+        was_redundant = action_key in episode.action_keys
+        if was_redundant:
+            episode.redundant_actions += 1
+        episode.action_keys.add(action_key)
+
+        reward = 0.0
+        finalize_blocked = operation == "finalize" and not episode.verified_for_latest_rerun
+
+        if operation == "view_logs":
+            reward = self._handle_view_logs(episode, target)
+        elif operation == "inspect_config":
+            reward = self._handle_inspect_config(episode, target)
+        elif operation == "inspect_dockerfile":
+            reward = self._handle_inspect_dockerfile(episode)
+        elif operation == "inspect_permissions":
+            reward = self._handle_inspect_permissions(episode, target)
+        elif operation == "set_hypothesis":
+            reward = self._handle_set_hypothesis(episode, value)
+        elif operation in ("modify_config", "add_dependency"):
+            reward = self._handle_modify(episode, operation, target, value)
+        elif operation == "rerun_pipeline":
+            reward = self._handle_rerun_pipeline(episode)
+        elif operation == "verify_fix":
+            reward = self._handle_verify_fix(episode)
+        elif operation == "finalize":
+            reward = self._handle_finalize(episode)
+
+        if episode.adversarial_scenario is not None and not finalize_blocked:
+            phase_bonus, phase_note = self._adv_judge.score_step(
+                operation=operation,
+                value=value,
+                scenario=episode.adversarial_scenario,
+                history=episode.history,
+            )
+            reward += phase_bonus
+            if phase_note:
+                episode.findings.append(f"[Judge] {phase_note}")
+
+        if was_redundant and not finalize_blocked:
+            reward = min(reward, -0.08)
+        if finalize_blocked:
+            reward = -0.05
+
+        done = False
+        fault_type_for_steps = episode.fault_metadata.fault_type if episode.fault_metadata else "unknown"
+        cascade_count_for_steps = len(episode.cascading_faults) if episode.cascading_faults else 0
+        max_steps = self._get_max_steps(fault_type_for_steps, cascade_count=cascade_count_for_steps)
+
+        if operation == "finalize":
+            done = True
+        elif self._state.step_count >= max_steps:
+            done = True
+
+        obs_dict = self._build_step_observation(episode, reward, done)
+        return self._dict_to_observation(obs_dict)
+
+    def state(self) -> dict:
+        return {
+            "episode_id": self._state.episode_id,
+            "step_count": self._state.step_count,
+        }
+
+    # ── Action handlers (override only _handle_modify and _handle_rerun_pipeline) ──
+
+    def _handle_view_logs(self, ep: EpisodeState, target: str) -> float:
+        """Return simulated pipeline logs for the requested stage."""
+        from cicd.observation_builder import build_stage_log_response
+        stage = target.lower() if target else ""
+        ep.used_inspections.add("view_logs")
+        ep.inspected_since_last_rerun = True
+
+        if ep.pipeline_result:
+            if stage and stage in STAGE_ORDER:
+                log_text = build_stage_log_response(ep.pipeline_result, stage)
+                ep.findings.append(f"Logs for stage '{stage}':\n{log_text[:300]}")
+            else:
+                failed_stage = ep.pipeline_result.failed_stage
+                if failed_stage:
+                    log_text = build_stage_log_response(ep.pipeline_result, failed_stage)
+                    ep.findings.append(f"Logs for failed stage '{failed_stage}':\n{log_text[:300]}")
+
+        if ep.fault_metadata and stage == ep.fault_metadata.expected_fail_stage:
+            return 0.12
+        elif stage and ep.pipeline_result and stage == ep.pipeline_result.failed_stage:
+            return 0.12
+        return -0.05
+
+    def _handle_inspect_config(self, ep: EpisodeState, target: str) -> float:
+        """Read actual (mutated) file content from simulated workspace."""
+        ep.used_inspections.add("inspect_config")
+        ep.inspected_since_last_rerun = True
+
+        if target:
+            filepath = _resolve_episode_config_target(ep, target)
+            content = read_workspace_file(ep.workspace_dir, filepath)
+            configs = {filepath: content}
+        else:
+            configs = read_config_files(ep.workspace_dir)
+
+        for filename, content in configs.items():
+            lines = content.splitlines()
+            conflict_indices = [i for i, l in enumerate(lines) if l.startswith(("<<<<<<<", "=======", ">>>>>>>"))]
+            if conflict_indices:
+                start_ctx = max(0, conflict_indices[0] - 2)
+                end_ctx = min(len(lines), conflict_indices[-1] + 3)
+                conflict_section = "\n".join(
+                    f"  {i:3d}: {line}" for i, line in enumerate(lines[start_ctx:end_ctx], start_ctx + 1)
+                )
+                ep.findings.append(f"⚠ MERGE CONFLICT in '{filename}':\n{conflict_section}")
+            else:
+                ep.findings.append(f"Config file '{filename}':\n{content[:400]}")
+
+        if ep.fault_metadata:
+            relevant_files = set(ep.fault_metadata.affected_files)
+            if relevant_files & set(configs.keys()):
+                return 0.12
+        return -0.05
+
+    def _handle_inspect_dockerfile(self, ep: EpisodeState) -> float:
+        ep.used_inspections.add("inspect_dockerfile")
+        ep.inspected_since_last_rerun = True
+        content = read_workspace_file(ep.workspace_dir, "Dockerfile")
+        ep.findings.append(f"Dockerfile content:\n{content[:300]}")
+        if ep.fault_metadata and "Dockerfile" in ep.fault_metadata.affected_files:
+            return 0.12
+        elif ep.fault_metadata and ep.fault_metadata.fault_type == "docker_order":
+            return 0.12
+        return -0.05
+
+    def _handle_inspect_permissions(self, ep: EpisodeState, target: str) -> float:
+        ep.used_inspections.add("inspect_permissions")
+        ep.inspected_since_last_rerun = True
+        files_to_check = ["Dockerfile", "docker-compose.yml", "services/api/app.py"]
+        if target:
+            files_to_check.insert(0, target)
+        for filepath in files_to_check:
+            full_path = os.path.join(ep.workspace_dir, filepath)
+            if os.path.exists(full_path):
+                try:
+                    stat = os.stat(full_path)
+                    ep.findings.append(f"File '{filepath}': mode={oct(stat.st_mode)} size={stat.st_size}B")
+                except OSError as e:
+                    ep.findings.append(f"Cannot stat '{filepath}': {e}")
+        if ep.fault_metadata and ep.fault_metadata.fault_type == "missing_permission":
+            return 0.12
+        return -0.05
+
+    def _handle_set_hypothesis(self, ep: EpisodeState, value: str) -> float:
+        """Score hypothesis against fault keywords — identical to real env."""
+        ep.current_hypothesis = value
+        ep.hypothesis_history.append(value)
+        ep.hypothesis_attempts += 1
+
+        if not ep.fault_metadata:
+            return -0.10
+
+        hypothesis_lower = value.lower()
+
+        if ep.adversarial_scenario is not None:
+            keywords = list(ep.adversarial_scenario.expected_hypothesis_terms)
+            root_fault_type = ep.fault_metadata.fault_type
+            for kw in FAULT_KEYWORDS.get(root_fault_type, []):
+                if kw not in keywords:
+                    keywords.append(kw)
+        else:
+            keywords = ep.fault_metadata.keywords or FAULT_KEYWORDS.get(ep.fault_metadata.fault_type, [])
+
+        match_count = sum(1 for kw in keywords if kw.lower() in hypothesis_lower)
+        match_ratio = match_count / max(len(keywords), 1)
+        file_mentioned = any(
+            os.path.basename(f).lower() in hypothesis_lower
+            for f in ep.fault_metadata.affected_files
+        )
+
+        if match_count >= 1 or file_mentioned:
+            ep.hypothesis_correct = True
+            ep.findings.append(f"Hypothesis partially aligns (matched {match_count}/{len(keywords)} keywords). Apply the fix.")
+            if ep.hypothesis_attempts == 1:
+                difficulty_scale = min(1.5, max(1.0, len(keywords) / 4.0))
+                base_high = round(min(0.25, 0.18 * difficulty_scale), 3)
+                base_low  = round(min(0.18, 0.12 * difficulty_scale), 3)
+                return base_high if match_ratio >= 0.4 else base_low
+            difficulty_scale = min(1.4, max(1.0, len(keywords) / 4.0))
+            return round(min(0.12, 0.08 * difficulty_scale), 3) if match_ratio >= 0.4 else round(min(0.08, 0.05 * difficulty_scale), 3)
+        else:
+            root_fault = ep.fault_metadata.fault_type
+            hint_keywords = FAULT_KEYWORDS.get(root_fault, keywords)
+            ep.findings.append("Hypothesis does not match current evidence. Try mentioning: " + ", ".join(hint_keywords))
+            return -0.10
+
+    def _handle_modify(self, ep: EpisodeState, operation: str, target: str, value: str) -> float:
+        """Apply fix using SimulatedFixApplier (file mutations, no git)."""
+        ep.attempted_fix = value
+        ep.verified_for_latest_rerun = False
+
+        if self._is_destructive_fix(value):
+            ep.destructive_actions += 1
+            ep.pipeline_health = max(0.0, ep.pipeline_health - 0.20)
+            ep.recovery_cost += 4
+            ep.pending_fix_outcome = "destructive"
+            ep.findings.append("Unsafe fix worsened system stability and increased recovery cost.")
+            return -0.30
+
+        fault_type = ep.fault_metadata.fault_type if ep.fault_metadata else ""
+        fix_result = self._apply_fix(ep.workspace_dir, value, target, fault_type=fault_type)
+        ep.last_fix_result = fix_result
+
+        if fix_result.success:
+            ep.findings.append(f"Fix applied: {fix_result.description}")
+            ep.pending_fix_outcome = "applied"
+            ep.errors_stale_after_fix = True
+            return 0.10
+        else:
+            ep.findings.append(f"Fix could not be applied: {fix_result.error}")
+            ep.pending_fix_outcome = "failed"
+            ep.wrong_fixes += 1
+            ep.pipeline_health = max(0.0, ep.pipeline_health - 0.10)
+            ep.recovery_cost += 2
+            return -0.15
+
+    def _handle_rerun_pipeline(self, ep: EpisodeState) -> float:
+        """Re-run the simulated pipeline against current (possibly mutated) workspace."""
+        from cicd.simulated_runner import PipelineStatus as SimPipelineStatus
+        ep.recovery_cost += 1
+        ep.verified_for_latest_rerun = False
+        ep.inspected_since_last_rerun = False
+        ep.rerun_attempts += 1
+
+        if not ep.pipeline_runner:
+            ep.findings.append("No pipeline runner available for rerun.")
+            return -0.10
+
+        old_status = str(ep.pipeline_result.status) if ep.pipeline_result else SimPipelineStatus.FAILED
+        old_failed_stage = ep.pipeline_result.failed_stage if ep.pipeline_result else ""
+
+        new_result = ep.pipeline_runner.run(workspace_dir=ep.workspace_dir)
+        ep.all_pipeline_results.append(new_result)
+        ep.pipeline_result = new_result
+        ep.errors_stale_after_fix = False
+
+        for stage_name in STAGE_ORDER:
+            stage = new_result.stages.get(stage_name)
+            if not stage or str(stage.status) in ("pending", "skipped"):
+                continue
+            combined = ((stage.stdout or "") + "\n" + (stage.stderr or "")).strip()
+            tail = "\n".join(combined.splitlines()[-20:]) if combined else "(no output)"
+            ep.findings.append(
+                f"[Rerun] Stage '{stage_name}' → {stage.status.value} "
+                f"(exit {stage.exit_code}, {stage.duration_seconds:.1f}s)\n{tail[:600]}"
+            )
+
+        progressed = False
+        if str(new_result.status) == SimPipelineStatus.PASSED:
+            progressed = True
+            ep.incident_resolved = True
+            ep.findings.append("Pipeline PASSED — all stages completed successfully!")
+        elif old_failed_stage and new_result.failed_stage:
+            old_idx = STAGE_ORDER.index(old_failed_stage) if old_failed_stage in STAGE_ORDER else 0
+            new_idx = STAGE_ORDER.index(new_result.failed_stage) if new_result.failed_stage in STAGE_ORDER else 0
+            if new_idx > old_idx:
+                progressed = True
+                ep.findings.append(f"Pipeline advanced from '{old_failed_stage}' to '{new_result.failed_stage}'.")
+            else:
+                msg = "Pipeline still failing at the same stage."
+                if ep.cascading_faults:
+                    msg += (
+                        " This incident has cascading faults — the previous fix may have "
+                        "resolved the first fault but exposed a second independent fault."
+                    )
+                ep.findings.append(msg)
+        elif old_status == SimPipelineStatus.FAILED and str(new_result.status) == SimPipelineStatus.FAILED:
+            ep.findings.append("Rerun shows failure unchanged; refine diagnosis.")
+
+        ep.last_rerun_progressed = progressed
+
+        if progressed:
+            ep.fix_hits += 1
+            if str(new_result.status) == SimPipelineStatus.PASSED:
+                ep.findings.append(
+                    "Pipeline PASSED. Call verify_fix next (required before finalize) — "
+                    "then immediately call finalize."
+                )
+            else:
+                ep.findings.append(
+                    "Pipeline progressed but is not yet passing. Call verify_fix next."
+                )
+            return 0.18
+        return 0.05
+
+    def _handle_verify_fix(self, ep: EpisodeState) -> float:
+        from cicd.simulated_runner import PipelineStatus as SimPipelineStatus
+        if not ep.pipeline_result:
+            ep.findings.append("No pipeline run to verify.")
+            return -0.06
+        if ep.verified_for_latest_rerun:
+            ep.findings.append("Latest rerun is already verified.")
+            return -0.06
+        if ep.rerun_attempts == 0:
+            ep.findings.append("Cannot verify: run rerun_pipeline after applying a fix before calling verify_fix.")
+            return -0.06
+        if str(ep.pipeline_result.status) == SimPipelineStatus.PASSED:
+            ep.incident_resolved = True
+            ep.verified_for_latest_rerun = True
+            ep.findings.append("VERIFIED: fix resolved the incident. Call finalize now.")
+            return 0.16
+        elif ep.last_rerun_progressed:
+            ep.verified_for_latest_rerun = True
+            ep.findings.append("Verification confirms partial progress.")
+            return 0.08
+        else:
+            ep.findings.append("Verification failed: pipeline still shows unresolved failures.")
+            return -0.06
+
+    def _handle_finalize(self, ep: EpisodeState) -> float:
+        if not ep.verified_for_latest_rerun:
+            ep.findings.append("Run verify_fix before finalize")
+            return -0.05
+        if ep.rerun_attempts == 0:
+            ep.findings.append("Finalize without running rerun_pipeline — no terminal bonus awarded.")
+            return 0.05
+        from cicd.simulated_runner import PipelineStatus as SimPipelineStatus
+        pipeline_passed = (
+            ep.pipeline_result is not None
+            and str(ep.pipeline_result.status) == SimPipelineStatus.PASSED
+        )
+        bonus, note = self._adv_judge.score_terminal(
+            incident_resolved=ep.incident_resolved,
+            verified=ep.verified_for_latest_rerun,
+            pipeline_passed=pipeline_passed,
+            cascading_fault_count=len(ep.cascading_faults),
+        )
+        ep.findings.append(f"[Judge] terminal: {note}")
+        return bonus
+
+    # ── Scenario injection helpers ──────────────────────────────────────────
+
+    def _inject_scenario_simulated(self, repo_dir: str, scenario) -> list:
+        """Inject all faults from an adversarial scenario without git."""
+        results = []
+        for step in scenario.steps:
+            try:
+                meta = self._inject_fault(repo_dir, step.fault_type)
+                results.append(meta)
+            except Exception as exc:
+                logger.warning("[sim] Could not inject fault %s: %s", step.fault_type, exc)
+        return results
+
+    def _inject_procedural_simulated(self, repo_dir: str, scenario) -> list:
+        """Inject a procedurally-generated scenario without git."""
+        return self._inject_scenario_simulated(repo_dir, scenario)
+
+    # ── Helpers (identical to RealCICDRepairEnvironment) ───────────────────
+
+    def _get_difficulty(self, fault_type: str) -> str:
+        difficulty_map = {
+            "merge_conflict":      "easy",
+            "dependency_conflict": "medium",
+            "docker_order":        "medium",
+            "flaky_test":          "easy",
+            "missing_permission":  "hard",
+            "secret_exposure":     "security",
+            "env_drift":           "network",
+            "log_pii_leak":        "security",
+            "log_disabled":        "medium",
+            "bad_migration_sql":   "medium",
+            "schema_drift":        "medium",
+        }
+        return difficulty_map.get(fault_type, "medium")
+
+    def _get_max_steps(self, fault_type: str, cascade_count: int = 0) -> int:
+        difficulty = self._get_difficulty(fault_type)
+        max_steps_map = {"easy": 16, "medium": 20, "network": 20, "security": 20, "hard": 25}
+        base = max_steps_map.get(difficulty, 20)
+        return base + cascade_count * 4
+
+    def _is_destructive_fix(self, value: str) -> bool:
+        normalized = (value or "").strip().lower()
+        return any(phrase in normalized for phrase in DESTRUCTIVE_FIXES)
+
+    def _build_step_observation(self, ep: EpisodeState, reward: float, done: bool) -> dict:
+        fault_type = ep.fault_metadata.fault_type if ep.fault_metadata else "unknown"
+        difficulty = self._get_difficulty(fault_type)
+
+        action_history = [
+            f"{e['operation']}:{e.get('target', '')}:{e.get('value', '')}".strip(":")
+            for e in ep.history[-16:]
+        ]
+
+        final_score = 0.0
+        deterministic_score = 0.0
+        rubric_score = 0.0
+        delayed_reward = 0.0
+        rubric_judge_used = False
+        rubric_judge_error = ""
+
+        if done:
+            deterministic_score = self._compute_final_score(ep)
+            final_score = deterministic_score
+            if self._rubric_judge.is_active():
+                try:
+                    judge_result = self._rubric_judge.evaluate_hypothesis_quality(
+                        self._build_rubric_payload(ep, fault_type, difficulty)
+                    )
+                    rubric_score = float(judge_result.score)
+                    final_score = round(
+                        ((1.0 - self._rubric_weight) * deterministic_score)
+                        + (self._rubric_weight * rubric_score),
+                        3,
+                    )
+                    delayed_reward = round(final_score - deterministic_score, 3)
+                    reward = round(reward + delayed_reward, 3)
+                    rubric_judge_used = not judge_result.used_fallback
+                    rubric_judge_error = str(judge_result.error or "")
+                except Exception as exc:
+                    rubric_judge_error = f"Rubric judge failed: {exc}"
+
+            ep.deterministic_score = deterministic_score
+            ep.rubric_score = rubric_score
+            ep.delayed_reward = delayed_reward
+            ep.rubric_judge_used = rubric_judge_used
+            ep.rubric_judge_error = rubric_judge_error
+
+            self._curriculum.record_episode(
+                fault_type=fault_type,
+                difficulty=ep.curriculum_difficulty,
+                final_score=final_score,
+                resolved=ep.incident_resolved,
+                steps_used=self._state.step_count,
+            )
+
+        pipeline_result = ep.pipeline_result
+
+        obs = build_observation(
+            pipeline_result=pipeline_result,
+            workspace_dir=ep.workspace_dir,
+            task_id=f"sim_{fault_type}",
+            task_title=f"Fix {fault_type.replace('_', ' ')} in CI/CD pipeline (simulated)",
+            difficulty=difficulty,
+            reward=reward,
+            done=done,
+            action_history=action_history,
+            current_hypothesis=ep.current_hypothesis,
+            attempted_fix=ep.attempted_fix,
+            hypothesis_history=ep.hypothesis_history[-8:],
+            incident_resolved=ep.incident_resolved,
+            pipeline_health=ep.pipeline_health,
+            recovery_cost=ep.recovery_cost,
+            redundant_actions=ep.redundant_actions,
+            destructive_actions=ep.destructive_actions,
+            final_score=final_score,
+            deterministic_score=deterministic_score,
+            rubric_score=rubric_score,
+            delayed_reward=delayed_reward,
+            rubric_blend_weight=self._rubric_weight if self._rubric_judge.is_active() else 0.0,
+            rubric_judge_used=rubric_judge_used,
+            rubric_judge_error=rubric_judge_error,
+            findings=ep.findings[-10:],
+            metadata={
+                "task_key": fault_type,
+                "fault_type": fault_type,
+                "expected_fail_stage": ep.fault_metadata.expected_fail_stage if ep.fault_metadata else "",
+                "ready_to_finalize": ep.incident_resolved and ep.verified_for_latest_rerun,
+                "verification_required": ep.incident_resolved and not ep.verified_for_latest_rerun,
+                "verified_since_last_rerun": ep.verified_for_latest_rerun,
+                "supported_operations": CANONICAL_OPERATIONS,
+                "canonical_operations": CANONICAL_OPERATIONS,
+                "rubric_enabled": self._rubric_judge.is_active(),
+                "simulated": True,
+            },
+        )
+
+        if ep.errors_stale_after_fix:
+            obs["surfaced_errors"] = [
+                "[Errors from previous run — rerun pipeline to see current state]"
+            ]
+
+        return obs
+
+    def _build_rubric_payload(self, ep: EpisodeState, fault_type: str, difficulty: str) -> dict:
+        keywords = ep.fault_metadata.keywords if ep.fault_metadata else []
+        return {
+            "task_id": f"sim_{fault_type}",
+            "difficulty": difficulty,
+            "evidence": {
+                "hypothesis_history": ep.hypothesis_history[-8:],
+                "current_hypothesis": ep.current_hypothesis,
+                "findings": ep.findings[-10:],
+                "surfaced_errors": build_surfaced_errors(ep.pipeline_result, ep.workspace_dir) if ep.pipeline_result else [],
+                "incident_resolved": ep.incident_resolved,
+            },
+            "incident_chain": [
+                {
+                    "true_cause": fault_type.replace("_", " "),
+                    "hypothesis_terms": keywords,
+                    "family_term_sets": [keywords[:2], keywords[2:4]] if len(keywords) >= 4 else [keywords],
+                }
+            ],
+            "rubric": {
+                "semantic_correctness": "Hypothesis should match the real fault category",
+                "evidence_alignment": "Hypothesis should align with surfaced errors and logs",
+                "completeness": "Hypothesis should reference core affected component/file",
+            },
+        }
+
+    def _compute_final_score(self, ep: EpisodeState) -> float:
+        score = 0.0
+        genuine_work = ep.fix_hits > 0 and ep.rerun_attempts > 0
+
+        if genuine_work and ep.incident_resolved and ep.verified_for_latest_rerun:
+            score += 0.50
+        elif genuine_work and ep.incident_resolved:
+            score += 0.30
+        elif genuine_work and ep.last_rerun_progressed:
+            score += 0.20
+
+        if ep.hypothesis_correct:
+            score += 0.15
+        if ep.fix_hits > 0:
+            score += 0.10
+
+        step_count = self._state.step_count
+        fault_type_eff = ep.fault_metadata.fault_type if ep.fault_metadata else "medium"
+        cascade_count_eff = len(ep.cascading_faults) if ep.cascading_faults else 0
+        max_steps = self._get_max_steps(fault_type_eff, cascade_count=cascade_count_eff)
+        efficiency = max(0.0, 1.0 - (step_count / max_steps))
+        score += efficiency * 0.10
+
+        score -= ep.redundant_actions * 0.02
+        score -= ep.destructive_actions * 0.10
+        score -= ep.wrong_fixes * 0.05
+        score *= ep.pipeline_health
+
+        if not genuine_work:
+            score = min(score, 0.15)
+
+        return round(max(0.0, min(1.0, score)), 3)
+
+    def _dict_to_observation(self, obs_dict: dict) -> MetaHackathonObservation:
+        return MetaHackathonObservation(**obs_dict)
+
+    def _error_observation(self, message: str, reward: float = -0.20) -> MetaHackathonObservation:
+        return MetaHackathonObservation(
+            pipeline_status="error",
+            reward=reward,
+            done=False,
+            metadata={"error": message},
+        )
+
+    def _cleanup_episode(self, ep: EpisodeState) -> None:
+        workspace_base = os.path.dirname(ep.workspace_dir)
+        if workspace_base and os.path.exists(workspace_base) and "cicd-sim-episode" in workspace_base:
+            try:
+                shutil.rmtree(workspace_base, ignore_errors=True)
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        if self._episode:
+            self._cleanup_episode(self._episode)
+            self._episode = None
