@@ -106,3 +106,8 @@ MIN_MODEL_CALLS_BEFORE_STRICT_FAIL = max(
 INFERENCE_VERBOSE = os.getenv("INFERENCE_VERBOSE", "false").strip().lower() == "true"
 INFERENCE_DETAIL_MAX_ITEMS = max(1, int(os.getenv("INFERENCE_DETAIL_MAX_ITEMS", "3")))
 
+# WebSocket API mode — when True the agent talks directly to cicd_api.py (:8001)
+# via a persistent WebSocket instead of routing all actions through /step (:8000).
+USE_WS_API = os.getenv("USE_WS_API", "false").strip().lower() == "true"
+CICD_API_WS_URL = os.getenv("CICD_API_WS_URL", "ws://localhost:8001")
+

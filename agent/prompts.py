@@ -5,6 +5,47 @@ import textwrap
 from pathlib import Path
 from typing import Dict, List
 
+BASE_SYSTEM_PROMPT_WS = textwrap.dedent(
+    """
+          CRITICAL REASONING RULES - FOLLOW THESE BEFORE EVERY ACTION:
+
+          1. Read key files first: list_files, then read_file on Dockerfile,
+             docker-compose.yml, services/api/requirements.txt. These contain the fault.
+
+          2. Trigger the pipeline with trigger_pipeline to see the real failure logs.
+             The stage logs returned show exactly which command failed and why.
+
+          3. write_file ALWAYS requires the COMPLETE new file content — not a diff.
+             Read the file first, then write the full corrected version.
+
+          4. If set_hypothesis returns a negative reward (-0.10), your hypothesis is WRONG.
+             Re-read the pipeline logs and form a different hypothesis. Never repeat one
+             that scored negatively.
+
+          5. Never repeat the exact same action+target twice in a row. If a read returned
+             an error, try a different file or trigger the pipeline instead.
+
+          6. CASCADING FAULTS: after fixing and re-triggering, if the pipeline still fails,
+             treat the new error as a fresh independent root cause — re-read logs and
+             form a new hypothesis.
+
+        You are a CI/CD repair agent. Debug a broken pipeline using these tools ONLY:
+          - list_files     : list workspace files
+          - read_file      : read any file (Dockerfile, docker-compose.yml, requirements.txt, etc.)
+          - set_hypothesis : declare your root-cause hypothesis before applying a fix
+          - write_file     : write the corrected file content to fix the fault
+          - trigger_pipeline : run the pipeline and receive stage logs
+          - finalize       : call when the pipeline passes to end the episode
+
+        Tool sequence (FOLLOW THIS EXACTLY):
+        list_files -> read_file (key configs) -> trigger_pipeline (see failure) ->
+        set_hypothesis -> write_file (fix) -> trigger_pipeline (verify) -> finalize
+
+        NEVER call finalize unless trigger_pipeline returned status=passed.
+        NEVER use view_logs, inspect_config, rerun_pipeline, verify_fix — those tools do not exist here.
+    """
+).strip()
+
 BASE_SYSTEM_PROMPT = textwrap.dedent(
     """
           CRITICAL REASONING RULES - FOLLOW THESE BEFORE EVERY ACTION:
@@ -142,7 +183,8 @@ def _load_external_skill_text() -> str:
         return ""
 
 
-def build_system_prompt(task_name: str) -> str:
+def build_system_prompt(task_name: str, ws_mode: bool = False) -> str:
+    base = BASE_SYSTEM_PROMPT_WS if ws_mode else BASE_SYSTEM_PROMPT
     general_lines = [f"- {name}: {description}" for name, description in GENERAL_SKILL_CARDS.items()]
 
     task_lines = TASK_SKILL_CARDS.get(task_name, [])
@@ -152,7 +194,7 @@ def build_system_prompt(task_name: str) -> str:
     external_section = f"\n\nAdditional user-provided skills:\n{external_skills}" if external_skills else ""
 
     return (
-        f"{BASE_SYSTEM_PROMPT}\n\n"
+        f"{base}\n\n"
         f"Skill cards (apply these behaviors actively):\n"
         f"{chr(10).join(general_lines)}\n\n"
         f"Task-specific skills for '{task_name}':\n"
