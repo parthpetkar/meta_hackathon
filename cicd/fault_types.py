@@ -37,6 +37,9 @@ FAULT_TYPES: List[str] = [
     "log_disabled",
     "bad_migration_sql",
     "schema_drift",
+    "terraform_invalid_provider",
+    "terraform_missing_variable",
+    "terraform_permission_denied",
 ]
 
 FAULT_STAGE_MAP: Dict[str, str] = {
@@ -57,6 +60,9 @@ FAULT_STAGE_MAP: Dict[str, str] = {
     "log_disabled":        "build",
     "bad_migration_sql":   "build",
     "schema_drift":        "deploy",
+    "terraform_invalid_provider": "deploy",
+    "terraform_missing_variable": "deploy",
+    "terraform_permission_denied": "deploy",
 }
 
 FAULT_KEYWORDS: Dict[str, List[str]] = {
@@ -77,6 +83,9 @@ FAULT_KEYWORDS: Dict[str, List[str]] = {
     "none_config_runtime":  ["none", "config", "runtime", "attribute", "request"],
     "log_pii_leak":        ["logging", "pii", "credential", "token", "secret", "leak", "routes"],
     "log_disabled":        ["logging", "level", "critical", "disabled", "silent", "log_level"],
+    "terraform_invalid_provider": ["terraform", "provider", "registry", "invalid"],
+    "terraform_missing_variable": ["terraform", "variable", "tfvars", "plan"],
+    "terraform_permission_denied": ["terraform", "permission", "iam", "accessdenied", "apply"],
 }
 
 FAULT_AFFECTED_APPS: Dict[str, List[str]] = {}

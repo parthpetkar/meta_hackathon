@@ -187,6 +187,27 @@ FAULT_FIX_HINTS = {
         "title": "Align schema drift",
         "reason": "Schema drift is usually fixed in the schema definition layer.",
     },
+    "terraform_invalid_provider": {
+        "operation": "modify_config",
+        "target": "infra/main.tf",
+        "value": "fix-terraform-provider",
+        "title": "Fix Terraform provider",
+        "reason": "Provider registry failures are fixed in the Terraform provider block.",
+    },
+    "terraform_missing_variable": {
+        "operation": "modify_config",
+        "target": "infra/terraform.tfvars",
+        "value": "add-terraform-variables",
+        "title": "Supply Terraform variables",
+        "reason": "Missing input variables are resolved by adding tfvars values.",
+    },
+    "terraform_permission_denied": {
+        "operation": "modify_config",
+        "target": "infra/main.tf",
+        "value": "remove-terraform-permission-blocker",
+        "title": "Resolve Terraform permission blocker",
+        "reason": "Apply permission errors typically come from infrastructure permission configuration.",
+    },
 }
 
 
@@ -809,14 +830,13 @@ def _shared_env_factory():
     return _SHARED_REST_ENV
 
 
-# Create the app with web interface and README integration
+# Create the app with the default OpenEnv playground UI
 app = create_app(
     _shared_env_factory,
     MetaHackathonAction,
     MetaHackathonObservation,
     env_name="meta_hackathon",
     max_concurrent_envs=1,  # increase this number to allow more concurrent WebSocket sessions
-    gradio_builder=my_custom_ui,
 )
 
 

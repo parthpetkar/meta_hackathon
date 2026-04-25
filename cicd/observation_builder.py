@@ -67,6 +67,10 @@ _CONFIG_PATHS = [
     "services/runtime_support/request_context.py",
     "tests/test_api.py",
     ".github/ci.yml",
+    ".github/workflows/ci.yml",
+    "infra/main.tf",
+    "infra/variables.tf",
+    "infra/terraform.tfvars",
 ]
 
 

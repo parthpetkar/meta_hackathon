@@ -32,6 +32,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
+from cicd.terraform_simulator import has_terraform_config, simulate_terraform_pipeline
 
 if TYPE_CHECKING:
     from models import AdversarialCICDScenario
@@ -87,6 +88,9 @@ FAULT_STAGE_MAP: Dict[str, str] = {
     "log_disabled":        "build",
     "bad_migration_sql":   "build",
     "schema_drift":        "deploy",
+    "terraform_invalid_provider": "deploy",
+    "terraform_missing_variable": "deploy",
+    "terraform_permission_denied": "deploy",
 }
 
 
@@ -462,6 +466,18 @@ PARTIAL_FIX_CHECKS: Dict[str, List[Tuple[str, Callable[[str], bool]]]] = {
     "schema_drift": [
         ("artifact_url removed from database.py CANONICAL_COLUMNS",
          lambda ws: "artifact_url" not in _read_file_safe(ws, "db/database.py")),
+    ],
+    "terraform_invalid_provider": [
+        ("provider block no longer references invalidcorp",
+         lambda ws: 'provider "invalidcorp"' not in _read_file_safe(ws, "infra/main.tf")),
+    ],
+    "terraform_missing_variable": [
+        ("required tf variable values supplied in infra/terraform.tfvars",
+         lambda ws: bool(_read_file_safe(ws, "infra/terraform.tfvars").strip())),
+    ],
+    "terraform_permission_denied": [
+        ("permission denial simulation flag removed",
+         lambda ws: "simulate_permission_denied" not in _read_file_safe(ws, "infra/main.tf").lower()),
     ],
 }
 
@@ -947,6 +963,14 @@ class SimulatedPipelineRunner:
         fault_status: Dict[str, Tuple[bool, float, List[str]]],
     ) -> Tuple[int, str, str]:
         extra_warnings = self._partial_fix_warnings("deploy", fault_status)
+        if has_terraform_config(workspace):
+            tf_code, tf_stdout, tf_stderr = simulate_terraform_pipeline(workspace)
+            if tf_code != 0:
+                if extra_warnings:
+                    tf_stderr = (extra_warnings + "\n" + tf_stderr).strip()
+                return 1, tf_stdout, tf_stderr
+        else:
+            tf_stdout = ""
 
         if active_faults:
             _, stdout, stderr = self._fault_log(active_faults[0])
@@ -956,6 +980,8 @@ class SimulatedPipelineRunner:
 
         _, health_msg = _simulate_health_check()
         stdout = (
+            (tf_stdout + "\n" if tf_stdout else "")
+            +
             'Creating network "sample-app_default" with the default driver\n'
             "Pulling db (postgres:15-alpine)...\n"
             "Pulling api (sample-app:latest)...\n"
@@ -1277,6 +1303,26 @@ class SimulatedPipelineRunner:
                 'HINT:  Perhaps you meant to reference the column "builds.exit_code".\n'
                 "ERROR: Schema mismatch detected in database.py CANONICAL_COLUMNS\n"
                 "Hint: Either add a migration to CREATE the column, or remove it from CANONICAL_COLUMNS."
+            )
+
+        if fault == "terraform_invalid_provider":
+            return 1, "", (
+                "Error: Failed to query available provider packages\n"
+                "provider registry registry.terraform.io does not have a provider named invalidcorp/mock\n"
+                "Terraform init failed."
+            )
+
+        if fault == "terraform_missing_variable":
+            return 1, "", (
+                "Error: No value for required variable\n"
+                '  on infra/variables.tf line 1: variable "region" is required\n'
+                "Terraform plan failed because required input variables are missing."
+            )
+
+        if fault == "terraform_permission_denied":
+            return 1, "", (
+                "Error: AccessDenied: User is not authorized to perform this action\n"
+                "Apply failed due to insufficient IAM permissions."
             )
 
         # Generic fallback

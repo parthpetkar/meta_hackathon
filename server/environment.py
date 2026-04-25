@@ -21,10 +21,11 @@ except (ImportError, ModuleNotFoundError):
     from models import MetaHackathonAction, MetaHackathonObservation
 
 from cicd.simulated_runner import SimulatedPipelineRunner, PipelineStatus as SimPipelineStatus
-if os.getenv("CICD_SUBPROCESS_RUNNER", "0") == "1":
-    from cicd.subprocess_runner import SubprocessPipelineRunner as _RunnerClass
-else:
+_runner_mode = os.getenv("CICD_RUNNER_MODE", "subprocess").strip().lower()
+if _runner_mode == "simulated":
     _RunnerClass = SimulatedPipelineRunner  # type: ignore[assignment]
+else:
+    from cicd.subprocess_runner import SubprocessPipelineRunner as _RunnerClass
 from cicd.simulated_fault_injector import inject_fault_simulated
 from cicd.simulated_fix_applier import apply_fix_simulated
 from cicd.observation_builder import (
@@ -107,6 +108,10 @@ KNOWN_CONFIG_PATHS = (
     "services/runtime_support/request_context.py",
     "tests/test_api.py",
     ".github/ci.yml",
+    ".github/workflows/ci.yml",
+    "infra/main.tf",
+    "infra/variables.tf",
+    "infra/terraform.tfvars",
     "db/migrations/001_init.sql",
     "db/database.py",
 )
