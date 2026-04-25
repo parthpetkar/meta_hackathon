@@ -15,6 +15,12 @@ from pathlib import Path
 _DB_PATH = Path(__file__).parent / "agent_memory.db"
 
 
+def _init_db() -> None:
+    """Create tables on first import so the DB file always exists."""
+    conn = _connect()
+    conn.close()
+
+
 def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(str(_DB_PATH), check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -38,11 +44,45 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _normalize_error(error: str) -> str:
+    """Strip volatile tokens so semantically identical errors produce the same hash.
+
+    Removed:
+    - UUIDs / hex run-IDs  (e.g. job-3f2a1b...)
+    - Line/column numbers  (line 42, col 7)
+    - Memory addresses     (0x7f3a...)
+    - Absolute timestamps  (2024-01-01T12:00:00)
+    - Temp paths           (/tmp/cicd-ws-abc123-/)
+    - Docker layer hashes  (---> 4b8a3f2e1c9d)
+    """
+    s = error.strip().lower()
+    # UUIDs
+    s = re.sub(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", "<uuid>", s)
+    # Hex run-IDs / docker layer digests (8+ hex chars)
+    s = re.sub(r"\b[0-9a-f]{8,}\b", "<hex>", s)
+    # line N / col N / column N
+    s = re.sub(r"\b(line|col|column)\s+\d+\b", r"\1 <n>", s)
+    # :<digits>: (e.g. file.py:42:7:)
+    s = re.sub(r":\d+", ":<n>", s)
+    # memory addresses
+    s = re.sub(r"0x[0-9a-f]+", "<addr>", s)
+    # ISO timestamps
+    s = re.sub(r"\d{4}-\d{2}-\d{2}[t ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:\d{2})?", "<ts>", s)
+    # temp workspace paths like /tmp/cicd-ws-3f2a1b45-/
+    s = re.sub(r"/tmp/cicd-ws-[^/\s]+", "/tmp/cicd-ws-<id>", s)
+    # collapse whitespace
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
 def fingerprint(errors: list[str]) -> str:
-    """Deterministic 16-hex-char hash of a normalised error list."""
-    normalised = sorted(
-        re.sub(r"\s+", " ", e.strip().lower()) for e in errors if e.strip()
-    )
+    """Deterministic 16-hex-char hash of a normalised error list.
+
+    Normalisation strips UUIDs, line numbers, hex digests, memory addresses,
+    and timestamps so semantically identical errors from different episodes
+    hash to the same value, improving cross-episode recall hit rates.
+    """
+    normalised = sorted(_normalize_error(e) for e in errors if e.strip())
     payload = json.dumps(normalised, separators=(",", ":")).encode()
     return hashlib.sha256(payload).hexdigest()[:16]
 
@@ -104,6 +144,12 @@ def recall(errors: list[str], fault_type: str = "unknown") -> dict:
 
 
 import time as _time
+
+# Ensure DB and tables exist as soon as the module is imported.
+try:
+    _init_db()
+except Exception:
+    pass
 
 
 def remember_optimal_path(fault_type: str, path: list[dict]) -> None:

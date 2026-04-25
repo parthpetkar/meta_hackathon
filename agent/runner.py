@@ -15,6 +15,7 @@ from .config import (
     API_BASE_URL,
     API_KEY,
     BENCHMARK,
+    CICD_API_WS_URL,
     INFERENCE_VERBOSE,
     MAX_CONSECUTIVE_TOOL_CALL_MISSES,
     MAX_MODEL_CALLS_PER_TASK,
@@ -24,6 +25,7 @@ from .config import (
     NUM_EPISODES,
     SUCCESS_SCORE_THRESHOLD,
     TASK_ORDER,
+    USE_WS_API,
     get_openai_client_kwargs,
 )
 from .http_environment import format_obs_for_llm, reset_env, step_env, trim_messages
@@ -56,12 +58,21 @@ def _normalize_hypothesis(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").strip().lower())
 
 
-# Structured JSON fix template injected as a hint after hypothesis is accepted.
+# Structured fix hint injected after hypothesis is accepted — one variant per tool schema.
 _STRUCTURED_FIX_HINT = (
     "Hypothesis accepted. Now apply the fix using modify_config with a structured JSON value:\n"
     '{"file": "<path/to/file>", "action": "replace", "old": "<exact broken lines>", "new": "<fixed lines>"}\n'
     "Use the file content you already inspected to fill in the exact old/new strings. "
     "Do not inspect or view_logs again — go straight to the fix."
+)
+
+_STRUCTURED_FIX_HINT_WS = (
+    "Hypothesis accepted. Now apply the fix using write_file.\n"
+    "You MUST supply BOTH arguments — path AND content:\n"
+    '  path    = "<the exact relative file path you read, e.g. tests/test_api.py>"\n'
+    '  content = "<complete new file content — the entire file, not just the changed lines>"\n'
+    "Do NOT call write_file without a path. "
+    "Do NOT trigger_pipeline until write_file succeeds."
 )
 
 
@@ -90,8 +101,10 @@ def _memory_hint(errors: List[str], fault_type: str) -> Tuple[str, str]:
     times_seen = int(suggestion.get("times_seen", 0) or 0)
     fix_text = str(suggestion.get("suggested_fix", "")).strip()[:300]  # cap to avoid context overflow
     hint = (
-        "Memory hint (prior episode):\n"
-        f"confidence={confidence:.2f} seen={times_seen}x fix={fix_text}"
+        f"[MEMORY] High-confidence fix from a prior episode (success rate: {confidence:.0%}, seen {times_seen}x):\n"
+        f"  Apply this fix FIRST before any inspection — skip view_logs and inspect_config:\n"
+        f"  {fix_text}\n"
+        f"  After applying, call rerun_pipeline immediately."
     )
     memory_log = str(suggestion.get("memory_log", "") or "")
     return hint, memory_log
@@ -154,6 +167,35 @@ def _repetition_escape_action(
             return candidate
     # Last resort: view logs for current stage even if seen before
     return ("view_logs", stage, "")
+
+
+def _repetition_escape_action_ws(
+    action_history: List[Tuple[str, str, str]],
+    repeated_action: Tuple[str, str, str],
+) -> Tuple[str, str, str]:
+    """WS-mode equivalent of _repetition_escape_action — uses WS tool names."""
+    repeated_op = repeated_action[0]
+    candidates: List[Tuple[str, str, str]] = []
+
+    if repeated_op == "write_file":
+        candidates.extend([
+            ("trigger_pipeline", "", ""),
+            ("read_file", "Dockerfile", ""),
+            ("read_file", "docker-compose.yml", ""),
+        ])
+
+    candidates.extend([
+        ("trigger_pipeline", "", ""),
+        ("read_file", "Dockerfile", ""),
+        ("read_file", "docker-compose.yml", ""),
+        ("read_file", "services/api/requirements.txt", ""),
+        ("list_files", "", ""),
+    ])
+
+    for candidate in candidates:
+        if candidate != repeated_action and candidate not in action_history:
+            return candidate
+    return ("trigger_pipeline", "", "")
 
 
 def _step_rationale(operation: str, target: str, value: str, reward: float) -> str:
@@ -276,17 +318,27 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
         if recall_optimal_path is not None:
             prior_path = recall_optimal_path(fault_type)
             if prior_path:
+                mem = recall(initial_surfaced_errors, fault_type) if recall is not None else {}
+                _path_confidence_high = float(mem.get("historical_success_rate", 0.0)) >= 1.0
                 path_lines = "\n".join(
                     f"  {i+1}. [{s['operation']}] target={s.get('target','') or '—'}  "
                     f"{'value=' + repr(s['value'][:60]) + '  ' if s.get('value') else ''}"
                     f"→ {s.get('rationale', '')}"
                     for i, s in enumerate(prior_path)
                 )
-                optimal_path_hint = (
-                    f"Optimal path learned from a prior successful episode for fault_type={fault_type}:\n"
-                    f"{path_lines}\n"
-                    "Follow this sequence closely — it resolved the incident efficiently."
-                )
+                if _path_confidence_high:
+                    optimal_path_hint = (
+                        f"HIGH-CONFIDENCE memory hit for fault_type={fault_type} (100% success rate).\n"
+                        "Skip view_logs, inspect_config, and inspect_dockerfile — go directly to:\n"
+                        f"{path_lines}\n"
+                        "Do NOT inspect files first. Apply the fix, rerun_pipeline, verify_fix, finalize."
+                    )
+                else:
+                    optimal_path_hint = (
+                        f"Optimal path learned from a prior successful episode for fault_type={fault_type}:\n"
+                        f"{path_lines}\n"
+                        "Follow this sequence closely — it resolved the incident efficiently."
+                    )
 
         task_intro = f"Task: {task_title}\n\n{format_obs_for_llm(observation, 0)}"
         if memory_hint:
@@ -493,17 +545,15 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                 break
 
             action_tuple = (operation, target, value)
-            # Allow harder episodes (difficulty > 0.4) one extra attempt before forcing
-            # an escape — complex faults sometimes legitimately need 4 identical iterations
-            # (e.g. read → apply → rerun → re-read after a failed fix).
+            # Allow harder episodes one extra attempt before forcing an escape.
             difficulty_str = (observation.difficulty or "").lower()
-            repetition_threshold = 4 if difficulty_str in ["hard", "security"] else 3
+            repetition_threshold = 3 if difficulty_str in ["hard", "security"] else 2
             if action_history.count(action_tuple) >= repetition_threshold:
                 operation, target, value = _repetition_escape_action(observation, action_history, action_tuple)
                 assistant_message = {
                     "role": "assistant",
                     "content": (
-                        f"Repetition guard triggered: forcing a different action after {repetition_threshold}+ identical attempts "
+                        f"Repetition guard triggered: forcing a different action after {repetition_threshold} identical attempts "
                         f"-> {operation}|{target}|{value}"
                     ),
                 }
@@ -711,6 +761,473 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
     return task_name, success, steps_taken, score
 
 
+def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, float]:
+    """WS-mode episode runner — full feature parity with run_task.
+
+    Creates a workspace on the CI/CD API, opens a persistent WebSocket
+    connection, and dispatches each LLM tool call directly to the API
+    via execute_tool(). Does NOT call /reset or /step on port 8000.
+
+    Returns (task_name, success, steps_taken, score).
+    """
+    import textwrap as _tw
+    from .api_client import create_ws_client, execute_tool, format_tool_result
+
+    # ── Select fault type via curriculum UCB1 ────────────────────────────────
+    try:
+        from server.curriculum import CurriculumController
+        _curriculum = CurriculumController()
+        selected_fault = _curriculum.select_fault_type()
+        curriculum_difficulty = _curriculum.get_difficulty()
+    except Exception as exc:
+        print(f"[WS-MODE] Curriculum unavailable ({exc}), using random fault", flush=True)
+        import random
+        from cicd.fault_types import FAULT_TYPES
+        selected_fault = random.choice(FAULT_TYPES)
+        curriculum_difficulty = 0.5
+
+    # ── Bootstrap workspace via REST (one-time per episode) ─────────────────
+    import requests as _req
+    cicd_rest = CICD_API_WS_URL.replace("ws://", "http://").replace("wss://", "https://")
+    try:
+        resp = _req.post(
+            f"{cicd_rest}/api/workspace/create",
+            json={"fault_type": selected_fault},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        ws_resp = resp.json()
+        workspace_id = ws_resp["workspace_id"]
+        fault_injected = ws_resp.get("fault_injected") or selected_fault
+        initial_failure_logs = ws_resp.get("initial_failure_logs") or ""
+    except Exception as exc:
+        print(f"[WS-MODE] Failed to create workspace: {exc}", flush=True)
+        return episode_label, False, 0, 0.0
+
+    task_name = fault_injected if fault_injected != "unknown" else episode_label
+    success = False
+    steps_taken = 0
+    score = 0.0
+    rewards: List[float] = []
+    history: List[str] = []
+    action_history: List[Tuple[str, str, str]] = []
+    attempted_hypotheses: set[str] = set()
+    forced_messages: List[str] = []
+    injected_guardrails: set[str] = set()
+    fix_applied_since_rerun: bool = False
+    hypothesis_accepted: bool = False
+    pipeline_passed = False
+    pipeline_triggered_once: bool = False  # tracks whether agent has seen failure output
+    model_calls_used = 0
+    tool_call_misses = 0
+    last_fix_value: str = ""
+    step_trace: List[Dict[str, Any]] = []
+    task_max_steps = MAX_STEPS
+    read_files: set[str] = set()  # tracks paths that have been read_file'd this episode
+
+    log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
+    print(
+        f"[EPISODE START] workspace={workspace_id}  fault={fault_injected}  "
+        f"difficulty={curriculum_difficulty:.2f}  max_steps={task_max_steps}",
+        flush=True,
+    )
+
+    # ── Memory: recall fix hint and optimal path ──────────────────────────────
+    memory_hint, memory_log = _memory_hint([fault_injected], fault_injected) if fault_injected != "unknown" else ("", "")
+    if memory_log:
+        log_memory(memory_log)
+
+    optimal_path_hint = ""
+    memory_confidence_high = False
+    if recall_optimal_path is not None and fault_injected != "unknown":
+        prior_path = recall_optimal_path(fault_injected)
+        if prior_path:
+            # Check if the stored fix has a 1.0 success rate in the recall memory.
+            mem = recall([fault_injected], fault_injected) if recall is not None else {}
+            memory_confidence_high = float(mem.get("historical_success_rate", 0.0)) >= 1.0
+
+            path_lines = "\n".join(
+                f"  {i+1}. [{s['operation']}] target={s.get('target','') or '—'}  "
+                f"{'value=' + repr(s['value'][:60]) + '  ' if s.get('value') else ''}"
+                f"→ {s.get('rationale', '')}"
+                for i, s in enumerate(prior_path)
+            )
+            if memory_confidence_high:
+                optimal_path_hint = (
+                    f"HIGH-CONFIDENCE memory hit for fault_type={fault_injected} (100% success rate).\n"
+                    "Skip list_files and all read_file steps — go directly to the fix using this exact sequence:\n"
+                    f"{path_lines}\n"
+                    "Do NOT read Dockerfile, docker-compose.yml, or requirements.txt first. "
+                    "Apply the write_file fix, trigger_pipeline, then finalize."
+                )
+            else:
+                optimal_path_hint = (
+                    f"Optimal path learned from a prior successful episode for fault_type={fault_injected}:\n"
+                    f"{path_lines}\n"
+                    "Follow this sequence closely — it resolved the incident efficiently."
+                )
+            print(f"[MEMORY] Recalled optimal path for fault_type={fault_injected} ({len(prior_path)} steps)", flush=True)
+
+    if initial_failure_logs:
+        # Incident alert already available — agent does not need a discovery pipeline run.
+        pipeline_triggered_once = True
+        task_intro = (
+            f"You are debugging a CI/CD pipeline in workspace {workspace_id}.\n"
+            "An incident was detected. The pipeline has already been run and the failure "
+            "logs are included below as your incident alert.\n\n"
+            "Read ONLY the file the failure output names, set your hypothesis, apply the fix, "
+            "then call trigger_pipeline once to verify. Call finalize when the pipeline passes.\n\n"
+            f"=== INCIDENT ALERT — PIPELINE FAILURE LOGS ===\n{initial_failure_logs}\n"
+            "=== END OF INCIDENT ALERT ==="
+        )
+    else:
+        task_intro = (
+            f"You are debugging a CI/CD pipeline in workspace {workspace_id}.\n"
+            "Start by calling trigger_pipeline to see the current failure logs. "
+            "Read ONLY the file the failure output names, diagnose the fault, apply a fix, "
+            "and re-run the pipeline until it passes. Call finalize when the pipeline passes."
+        )
+    if memory_hint:
+        task_intro += f"\n\n{memory_hint}"
+    if optimal_path_hint:
+        task_intro += f"\n\n{optimal_path_hint}"
+
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": build_system_prompt(task_name, ws_mode=True)}]
+    messages.append({"role": "user", "content": task_intro + "\n\nBegin debugging."})
+
+    with create_ws_client(workspace_id, base_url=CICD_API_WS_URL) as ws:
+        for step in range(1, task_max_steps + 1):
+            # Inject forced guardrail messages before the model call
+            if forced_messages:
+                for reminder in forced_messages:
+                    messages.append({"role": "user", "content": f"Guardrail: {reminder}"})
+                forced_messages.clear()
+                messages = trim_messages(messages)
+
+            _model_failed = False
+            operation = target = value = ""
+            assistant_message: Dict[str, Any] = {"role": "assistant", "content": ""}
+            tool_call_id: Optional[str] = None
+
+            try:
+                guard_attempts = 0
+                while True:
+                    guard_attempts += 1
+                    operation, target, value, assistant_message, tool_call_id = get_model_action(
+                        client=client, step=step, messages=messages
+                    )
+                    model_calls_used += 1
+                    if model_calls_used > MAX_MODEL_CALLS_PER_TASK:
+                        raise RuntimeError("Model call budget exceeded")
+
+                    if tool_call_id is None:
+                        tool_call_misses += 1
+                        messages.append({
+                            "role": "user",
+                            "content": "Your previous response did not include a tool call. Return exactly one valid tool call.",
+                        })
+                        if tool_call_misses >= MAX_CONSECUTIVE_TOOL_CALL_MISSES and model_calls_used >= MIN_MODEL_CALLS_BEFORE_STRICT_FAIL:
+                            raise RuntimeError("Model failed to emit tool calls repeatedly.")
+                        messages = trim_messages(messages)
+                        continue
+                    tool_call_misses = 0
+
+                    should_resample = False
+
+                    # Deduplication guard
+                    action_tuple = (operation, target, value)
+                    rerun_blocked = (
+                        action_tuple in action_history
+                        and not (operation == "trigger_pipeline" and fix_applied_since_rerun)
+                    )
+                    if rerun_blocked:
+                        _dup_key = f"dup:{operation}:{target}"
+                        if _dup_key not in injected_guardrails:
+                            injected_guardrails.add(_dup_key)
+                            messages.append({
+                                "role": "user",
+                                "content": "You already tried this exact action. Choose a different operation or target.",
+                            })
+                        should_resample = True
+
+                    # Hypothesis dedup
+                    if operation == "set_hypothesis":
+                        norm = _normalize_hypothesis(value)
+                        if norm and norm in attempted_hypotheses:
+                            _dup_hyp_key = f"dup_hyp:{norm}"
+                            if _dup_hyp_key not in injected_guardrails:
+                                injected_guardrails.add(_dup_hyp_key)
+                                messages.append({
+                                    "role": "user",
+                                    "content": "That hypothesis already scored negatively. Choose a different root cause.",
+                                })
+                            should_resample = True
+
+                    # Hard block: write_file with no path is always wrong — fire every attempt
+                    if operation == "write_file" and not target:
+                        _last_read = next(
+                            (t for op, t, v in reversed(action_history) if op == "read_file" and t),
+                            "",
+                        )
+                        _path_hint = f"'{_last_read}'" if _last_read else "<relative file path>"
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "ERROR: write_file was called without a 'path' argument — the tool call is invalid.\n"
+                                f"You must provide BOTH arguments: path={_path_hint} and content='<complete file content>'.\n"
+                                "Re-issue write_file with the correct path and the full corrected file content."
+                            ),
+                        })
+                        should_resample = True
+
+                    # Read-before-write guardrail: block write_file if the file was never read
+                    if operation == "write_file" and target and target not in read_files:
+                        _rbw_key = f"rbw:{target}"
+                        if _rbw_key not in injected_guardrails:
+                            injected_guardrails.add(_rbw_key)
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    f"You must read_file('{target}') before writing it. "
+                                    "Call read_file on that path now so you have the current content."
+                                ),
+                            })
+                        should_resample = True
+
+                    if should_resample and guard_attempts < 3:
+                        messages = trim_messages(messages)
+                        continue
+
+                    break
+
+            except RuntimeError as exc:
+                _model_failed = True
+                log_step(step=step, action="[model_failure]||", reward=0.0, done=True,
+                         error=str(exc), llm_thought="")
+
+            if _model_failed:
+                break
+
+            # Hard redirect: write_file with empty path must never reach the API
+            if operation == "write_file" and not target:
+                _last_read = next(
+                    (t for op, t, v in reversed(action_history) if op == "read_file" and t),
+                    "",
+                )
+                operation = "read_file" if _last_read else "trigger_pipeline"
+                target = _last_read
+                value = ""
+                assistant_message = {
+                    "role": "assistant",
+                    "content": f"Hard redirect: write_file had no path → {operation}|{target}",
+                }
+                tool_call_id = None
+                forced_messages.append(
+                    f"write_file was blocked because 'path' was missing. "
+                    f"Now call write_file(path='{_last_read or '<file_path>'}', "
+                    "content='<the complete corrected file>') — both arguments are required."
+                )
+
+            # Repetition escape — force a different action after too many identical attempts
+            action_tuple = (operation, target, value)
+            repetition_threshold = 2
+            if action_history.count(action_tuple) >= repetition_threshold:
+                # Map WS ops to HTTP-equivalent for the escape helper
+                _escaped = _repetition_escape_action_ws(action_history, action_tuple)
+                operation, target, value = _escaped
+                assistant_message = {
+                    "role": "assistant",
+                    "content": f"Repetition guard: forcing {operation}|{target}|{value}",
+                }
+                tool_call_id = None
+
+            action_history.append((operation, target, value))
+            history.append(f"{operation}|{target}|{value}")
+            steps_taken = step
+            if operation == "write_file" and value:
+                last_fix_value = value
+
+            # ── Dispatch tool call to WS API ──────────────────────────────
+            tool_args: Dict[str, Any] = {}
+            if operation == "read_file":
+                tool_args = {"path": target}
+            elif operation == "write_file":
+                tool_args = {"path": target, "content": value}
+            elif operation == "list_files":
+                tool_args = {"directory": target}
+            elif operation == "set_hypothesis":
+                tool_args = {"hypothesis": value}
+
+            result = execute_tool(operation, tool_args, ws)
+            tool_result_str = format_tool_result(operation, result)
+
+            # ── Reward ────────────────────────────────────────────────────
+            op_success = result.get("success", False)
+            # Per-step cost encourages efficiency; finalize is exempt.
+            STEP_PENALTY = -0.01
+            if operation == "trigger_pipeline":
+                pipeline_passed = result.get("passed", False)
+                pipeline_triggered_once = True
+                if pipeline_passed:
+                    reward = 0.30
+                elif op_success:
+                    reward = 0.05
+                else:
+                    reward = -0.10
+            elif operation == "set_hypothesis":
+                reward = 0.10 if op_success else -0.10
+            elif operation == "write_file":
+                reward = 0.10 if op_success else -0.15
+            elif operation == "read_file":
+                # Only reward reads that follow a pipeline run (agent has seen the error).
+                # Blind pre-trigger reads score negatively to discourage the preamble pattern.
+                if op_success and result.get("exists"):
+                    reward = 0.05 if pipeline_triggered_once else -0.02
+                else:
+                    reward = -0.05
+            elif operation == "list_files":
+                # list_files is rarely necessary; give no positive reward to avoid padding.
+                reward = 0.0
+            elif operation == "finalize":
+                reward = 1.0 if pipeline_passed else 0.0
+                score = reward
+                success = pipeline_passed
+            else:
+                reward = 0.0
+            # Apply step penalty to all non-finalize actions.
+            if operation != "finalize":
+                reward += STEP_PENALTY
+
+            rewards.append(reward)
+            step_trace.append({
+                "operation": operation,
+                "target": target,
+                "value": value[:120] if value else "",
+                "reward": round(reward, 3),
+                "rationale": _step_rationale(operation, target, value, reward),
+            })
+
+            tool_error = result.get("error") if not op_success else None
+            llm_thought = assistant_message.get("content") or ""
+            log_step(
+                step=step,
+                action=f"{operation}|{target}|{value[:60]}",
+                reward=reward,
+                done=(operation == "finalize"),
+                error=tool_error,
+                llm_thought=llm_thought,
+            )
+
+            if tool_result_str:
+                truncated = tool_result_str[:1500] + ("..." if len(tool_result_str) > 1500 else "")
+                print(_tw.indent(truncated, "    "), flush=True)
+
+            # Track successfully read files so the read-before-write guardrail can allow them.
+            # Also clear the guardrail key so re-attempting write_file on the same path is allowed.
+            if operation == "read_file" and op_success and result.get("exists"):
+                read_files.add(target)
+                injected_guardrails.discard(f"rbw:{target}")
+
+            # ── Post-step forced messages ─────────────────────────────────
+            if operation == "write_file":
+                fix_applied_since_rerun = True
+                if op_success and not pipeline_passed:
+                    forced_messages.append(
+                        "Fix applied. Call trigger_pipeline NOW to see whether the issue is resolved. "
+                        "Do not read files again until you have seen the new pipeline state."
+                    )
+            if operation == "trigger_pipeline":
+                fix_applied_since_rerun = False
+                if pipeline_passed:
+                    forced_messages.append(
+                        "The pipeline PASSED. Call finalize NOW to complete the episode."
+                    )
+            if operation == "set_hypothesis":
+                norm = _normalize_hypothesis(value)
+                if norm:
+                    attempted_hypotheses.add(norm)
+                if reward > 0:
+                    hypothesis_accepted = True
+                    if "fix_hint_sent" not in injected_guardrails:
+                        injected_guardrails.add("fix_hint_sent")
+                        forced_messages.append(_STRUCTURED_FIX_HINT_WS)
+                elif reward < 0:
+                    forced_messages.append(
+                        "Your last hypothesis was incorrect (negative reward). "
+                        "Re-read the pipeline logs and form a new hypothesis targeting a different root cause."
+                    )
+
+            # Recovery: write_file failed because path was missing — remind the model of correct usage
+            if operation == "write_file" and not op_success and "requires 'path'" in (tool_error or ""):
+                _rbw_recovery_key = "write_file_path_missing"
+                if _rbw_recovery_key not in injected_guardrails:
+                    injected_guardrails.add(_rbw_recovery_key)
+                    forced_messages.append(
+                        "write_file failed because 'path' was missing. "
+                        "You must call write_file with BOTH path='<file path>' AND content='<complete file content>'. "
+                        "Example: write_file(path='tests/test_api.py', content='<the entire corrected file>')"
+                    )
+
+            messages.append(assistant_message)
+            if tool_call_id:
+                obs_msg: Dict[str, Any] = {"role": "tool", "tool_call_id": tool_call_id, "content": tool_result_str}
+            else:
+                obs_msg = {"role": "user", "content": f"Result:\n{tool_result_str}\n\nNext action?"}
+            messages.append(obs_msg)
+            messages = trim_messages(messages)
+
+            if operation == "finalize":
+                break
+
+        # Forced finalize if the loop exhausted steps without one
+        if not success and steps_taken > 0:
+            result = execute_tool("finalize", {}, ws)
+            steps_taken += 1
+            reward = 1.0 if pipeline_passed else 0.0
+            score = reward
+            success = pipeline_passed
+            rewards.append(reward)
+            log_step(step=steps_taken, action="finalize||", reward=reward, done=True,
+                     error=None, llm_thought="[forced finalize: step budget exhausted]")
+
+    # ── Record episode outcome in curriculum ──────────────────────────────────
+    try:
+        from server.curriculum import CurriculumController
+        CurriculumController().record_episode(
+            fault_type=fault_injected,
+            difficulty=curriculum_difficulty,
+            final_score=score,
+            resolved=success,
+            steps_used=steps_taken,
+        )
+    except Exception:
+        pass
+
+    # ── Persist memory ────────────────────────────────────────────────────────
+    memory_key = fault_injected if fault_injected != "unknown" else task_name
+    if remember is not None and last_fix_value:
+        try:
+            remember([memory_key], last_fix_value, success)
+        except Exception:
+            pass
+
+    if remember_optimal_path is not None and success:
+        try:
+            optimal = _build_optimal_path(step_trace, resolved=success)
+            if optimal:
+                remember_optimal_path(memory_key, optimal)
+                print(f"[MEMORY] Stored optimal path for fault_type={memory_key} ({len(optimal)} steps)", flush=True)
+        except Exception:
+            pass
+
+    log_end(
+        success=success, steps=steps_taken, score=score,
+        resolved=success, rewards=rewards,
+        deterministic_score=score, rubric_score=0.0, rubric_judge_used=False,
+    )
+    return task_name, success, steps_taken, score
+
+
 def main() -> None:
     if not API_KEY:
         raise RuntimeError(
@@ -729,5 +1246,8 @@ def main() -> None:
         for episode_label in TASK_ORDER:
             # episode_label is just a slot name ("episode_1", etc.).
             # The actual fault/scenario is generated fresh by LLM for each reset.
-            task_name, success, _steps, score = run_task(client, session, episode_label)
+            if USE_WS_API:
+                task_name, success, _steps, score = run_task_ws(client, episode_label)
+            else:
+                task_name, success, _steps, score = run_task(client, session, episode_label)
             task_scores.append((task_name, score, success))

@@ -5,6 +5,58 @@ import textwrap
 from pathlib import Path
 from typing import Dict, List
 
+BASE_SYSTEM_PROMPT_WS = textwrap.dedent(
+    """
+          CRITICAL REASONING RULES - FOLLOW THESE BEFORE EVERY ACTION:
+
+          1. The incident alert in your first message contains the pipeline failure logs.
+             Read them carefully — they name the exact file and error that caused the fault.
+             DO NOT call trigger_pipeline for discovery; it has already been run for you.
+
+          2. Read ONLY the file named in the failure output. Do not read Dockerfile,
+             docker-compose.yml, or requirements.txt unless the failure log specifically
+             mentions that file.
+
+          3. write_file ALWAYS requires the COMPLETE new file content — not a diff.
+             Read the file first, then write the full corrected version.
+
+          4. MERGE CONFLICTS: if the error contains "<<<<<<< HEAD" or "SyntaxError" near
+             conflict markers, the file has unresolved git merge conflict markers.
+             Read the file with read_file, remove ALL three marker lines (<<<<<<< HEAD,
+             =======, >>>>>>> branch), keep the correct code, then write_file with the
+             clean resolved content.
+
+          5. If set_hypothesis returns a negative reward (-0.10), your hypothesis is WRONG.
+             Re-read the incident alert logs and form a different hypothesis. Never repeat
+             one that scored negatively.
+
+          6. Never repeat the exact same action+target twice in a row.
+
+          7. CASCADING FAULTS: after fixing and re-triggering, if the pipeline still fails,
+             treat the new error as a fresh independent root cause — re-read the new logs
+             and form a new hypothesis.
+
+        You are a CI/CD repair agent. The pipeline has already failed and you have been
+        paged with the failure logs. Debug and fix the fault using these tools ONLY:
+          - read_file      : read the specific file the failure log names
+          - set_hypothesis : declare your root-cause hypothesis before applying a fix
+          - write_file     : write the corrected file content to fix the fault
+          - trigger_pipeline : run the pipeline ONLY to verify a fix — not for discovery
+          - list_files     : list workspace files — only if the error references an unknown path
+          - finalize       : call when the pipeline passes to end the episode
+
+        Tool sequence (FOLLOW THIS EXACTLY):
+        read_file (file named in incident alert) -> set_hypothesis ->
+        write_file (fix) -> trigger_pipeline (verify) -> finalize
+
+        NEVER call trigger_pipeline before applying a fix — the failure logs are already provided.
+        NEVER call finalize unless trigger_pipeline returned status=passed.
+        NEVER write_file on a path you have not yet read_file.
+        NEVER use view_logs, inspect_config, rerun_pipeline, verify_fix — those tools do not exist here.
+        NEVER read files that the incident alert did not mention.
+    """
+).strip()
+
 BASE_SYSTEM_PROMPT = textwrap.dedent(
     """
           CRITICAL REASONING RULES - FOLLOW THESE BEFORE EVERY ACTION:
@@ -94,9 +146,16 @@ GENERAL_SKILL_CARDS: Dict[str, str] = {
 }
 
 TASK_SKILL_CARDS: Dict[str, List[str]] = {
+    "merge_conflict": [
+        "Trigger pipeline FIRST — the build error will name the exact file with conflict markers.",
+        "Read the named file with read_file to see the full <<<<<<< HEAD / ======= / >>>>>>> block.",
+        "Choose one side of the conflict (usually the feature branch side after >>>>>>>), remove all three marker lines, write the clean file back with write_file.",
+        "Trigger pipeline again to verify, then finalize.",
+    ],
     "easy": [
-        "Focus on merge evidence: unresolved markers and strict merge policy clues.",
-        "Use build-targeted modify_config to resolve conflict, then rerun, verify, finalize.",
+        "Trigger pipeline first to identify which file contains the fault.",
+        "Read the specific file named in the error before writing any fix.",
+        "Use write_file with the complete corrected file content to resolve the fault.",
     ],
     "flaky": [
         "Treat intermittent test failures as flaky/timing candidates when logs show pass-on-retry behavior.",
@@ -142,7 +201,8 @@ def _load_external_skill_text() -> str:
         return ""
 
 
-def build_system_prompt(task_name: str) -> str:
+def build_system_prompt(task_name: str, ws_mode: bool = False) -> str:
+    base = BASE_SYSTEM_PROMPT_WS if ws_mode else BASE_SYSTEM_PROMPT
     general_lines = [f"- {name}: {description}" for name, description in GENERAL_SKILL_CARDS.items()]
 
     task_lines = TASK_SKILL_CARDS.get(task_name, [])
@@ -152,7 +212,7 @@ def build_system_prompt(task_name: str) -> str:
     external_section = f"\n\nAdditional user-provided skills:\n{external_skills}" if external_skills else ""
 
     return (
-        f"{BASE_SYSTEM_PROMPT}\n\n"
+        f"{base}\n\n"
         f"Skill cards (apply these behaviors actively):\n"
         f"{chr(10).join(general_lines)}\n\n"
         f"Task-specific skills for '{task_name}':\n"
