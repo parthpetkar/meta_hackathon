@@ -868,7 +868,6 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
                 )
             print(f"[MEMORY] Recalled optimal path for fault_type={fault_injected} ({len(prior_path)} steps)", flush=True)
 
-<<<<<<< Updated upstream
     if initial_failure_logs:
         # Incident alert already available — agent does not need a discovery pipeline run.
         pipeline_triggered_once = True
@@ -888,15 +887,6 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
             "Read ONLY the file the failure output names, diagnose the fault, apply a fix, "
             "and re-run the pipeline until it passes. Call finalize when the pipeline passes."
         )
-=======
-    task_intro = (
-        f"You are debugging a CI/CD pipeline in workspace {workspace_id}.\n"
-        "Call trigger_pipeline FIRST to see the current failure output. "
-        "The error logs will name the exact file that is broken. "
-        "Read that specific file with read_file, apply the fix with write_file, "
-        "then trigger_pipeline again to verify. Call finalize when the pipeline passes."
-    )
->>>>>>> Stashed changes
     if memory_hint:
         task_intro += f"\n\n{memory_hint}"
     if optimal_path_hint:
