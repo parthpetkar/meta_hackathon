@@ -1130,7 +1130,8 @@ class SimulatedPipelineRunner:
                 "        ^\n"
                 "DETAIL:  Expected CREATE, found CREAT\n"
                 "CONTEXT:  SQL statement in migration file: db/migrations/001_init.sql:1\n"
-                "ERROR: Database migration failed during build"
+                "ERROR: Database migration failed during build\n"
+                "HINT: Read db/migrations/001_init.sql and fix 'CREAT TABLE' -> 'CREATE TABLE'."
             )
 
         # ── test-stage faults ──────────────────────────────────────────────
@@ -1153,7 +1154,9 @@ class SimulatedPipelineRunner:
                 "    <<<<<<< HEAD\n"
                 "    ^\n"
                 "SyntaxError: invalid syntax\n\n"
-                "ERROR: InvocationError for command pytest tests/ -v (exited with code 1)"
+                "ERROR: InvocationError for command pytest tests/ -v (exited with code 1)\n"
+                "HINT: Read services/api/routes.py and remove ALL three git conflict marker lines"
+                " (<<<<<<< HEAD, =======, >>>>>>> branch), keeping the correct code."
             )
 
         if fault == "flaky_test":
@@ -1187,7 +1190,8 @@ class SimulatedPipelineRunner:
                 "tests/test_api.py:89: AssertionError\n"
                 "=========================== short test summary info ============================\n"
                 f"FAILED tests/test_api.py::test_response_time_health - AssertionError: response time {elapsed:.3f}s exceeds threshold {live_threshold}s\n"
-                "========================= 1 failed, 11 passed in 3.21s ========================="
+                "========================= 1 failed, 11 passed in 3.21s =========================\n"
+                "HINT: Read tests/test_api.py and change 'threshold = 0.001' to 'threshold = 0.5'."
             )
 
         # ── deploy-stage faults ────────────────────────────────────────────
@@ -1195,14 +1199,16 @@ class SimulatedPipelineRunner:
             return 1, "", (
                 "ERROR: for api  Cannot create container for service api: "
                 "network corp-internal-network-v2 declared as external, but could not be found\n"
-                "ERROR: Encountered errors while bringing up the project."
+                "ERROR: Encountered errors while bringing up the project.\n"
+                "HINT: Read docker-compose.yml and remove 'external: true' from the network block."
             )
 
         if fault == "env_drift":
             return 1, "", (
                 'ERROR: for api  Cannot create container for service api: '
                 'invalid port specification: "not-a-number:5000"\n'
-                "ERROR: Encountered errors while bringing up the project."
+                "ERROR: Encountered errors while bringing up the project.\n"
+                "HINT: Read docker-compose.yml and fix the port value to a valid integer (e.g. 5432)."
             )
 
         if fault == "invalid_database_url":
@@ -1248,7 +1254,8 @@ class SimulatedPipelineRunner:
                 "api-service  | ERROR:    GET /items runtime probe failed\n"
                 "api-service  | ModuleNotFoundError: No module named 'services.runtime_support'\n"
                 "api-service  | DETAIL: virtualenv bootstrap file .venv/runtime.pth is missing /app/services.\n"
-                "ERROR: Lazy runtime import failed even though build and startup succeeded."
+                "ERROR: Lazy runtime import failed even though build and startup succeeded.\n"
+                "HINT: Read .venv/runtime.pth and add '/app/services' on a new line."
             )
 
         if fault == "circular_import_runtime":
@@ -1263,7 +1270,8 @@ class SimulatedPipelineRunner:
                 "api-service  | ERROR:    GET /items runtime probe failed\n"
                 "api-service  | ImportError: cannot import name 'load_runtime_probe' from partially initialized module 'services.api.runtime_probe' (most likely due to a circular import)\n"
                 "api-service  | DETAIL: The circular import is triggered only by the request-path helper.\n"
-                "ERROR: Runtime smoke test exposed a lazy circular import."
+                "ERROR: Runtime smoke test exposed a lazy circular import.\n"
+                "HINT: Read services/api/runtime_probe.py and remove the FAULT_CIRCULAR_IMPORT_RUNTIME marker or the self-import line."
             )
 
         if fault == "missing_package_init":
@@ -1278,7 +1286,8 @@ class SimulatedPipelineRunner:
                 "api-service  | ERROR:    GET /items runtime probe failed\n"
                 "api-service  | ModuleNotFoundError: No module named 'services.runtime_support'\n"
                 "api-service  | DETAIL: services/runtime_support/__init__.py is missing, so the lazy support package cannot be imported during request handling.\n"
-                "ERROR: Package initialization fault only surfaced when runtime code path executed."
+                "ERROR: Package initialization fault only surfaced when runtime code path executed.\n"
+                "HINT: Read services/runtime_support/__init__.py — it is empty or missing. Write it back with minimal content (e.g. a single comment line)."
             )
 
         if fault == "none_config_runtime":
@@ -1293,7 +1302,8 @@ class SimulatedPipelineRunner:
                 "api-service  | ERROR:    GET /items runtime probe failed\n"
                 "api-service  | TypeError: 'NoneType' object is not subscriptable\n"
                 "api-service  | DETAIL: FEATURE_CACHE_BACKEND resolved to None from .env and crashed only when the request path dereferenced it.\n"
-                "ERROR: Runtime-only config dereference fault triggered after startup."
+                "ERROR: Runtime-only config dereference fault triggered after startup.\n"
+                "HINT: Read .env and set FEATURE_CACHE_BACKEND to a non-empty value (e.g. redis)."
             )
 
         if fault == "schema_drift":
@@ -1311,20 +1321,23 @@ class SimulatedPipelineRunner:
             return 1, "", (
                 "Error: Failed to query available provider packages\n"
                 "provider registry registry.terraform.io does not have a provider named invalidcorp/mock\n"
-                "Terraform init failed."
+                "Terraform init failed.\n"
+                "HINT: Read infra/main.tf and replace the 'provider \"invalidcorp\"' block with a valid provider (e.g. aws or hashicorp/random)."
             )
 
         if fault == "terraform_missing_variable":
             return 1, "", (
                 "Error: No value for required variable\n"
                 '  on infra/variables.tf line 1: variable "region" is required\n'
-                "Terraform plan failed because required input variables are missing."
+                "Terraform plan failed because required input variables are missing.\n"
+                "HINT: Read infra/terraform.tfvars — it is empty. Write it with the required variable values (e.g. region = \"us-east-1\")."
             )
 
         if fault == "terraform_permission_denied":
             return 1, "", (
                 "Error: AccessDenied: User is not authorized to perform this action\n"
-                "Apply failed due to insufficient IAM permissions."
+                "Apply failed due to insufficient IAM permissions.\n"
+                "HINT: Read infra/main.tf and remove the 'simulate_permission_denied' line that is injecting this failure."
             )
 
         # Generic fallback

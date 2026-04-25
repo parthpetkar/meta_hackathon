@@ -10,7 +10,8 @@ BASE_SYSTEM_PROMPT_WS = textwrap.dedent(
           CRITICAL REASONING RULES - FOLLOW THESE BEFORE EVERY ACTION:
 
           1. The incident alert in your first message contains the pipeline failure logs.
-             Read them carefully — they name the exact file and error that caused the fault.
+             ALWAYS read to the end of the alert — the last line often contains a HINT:
+             that names the exact file to read and the fix to apply.
              DO NOT call trigger_pipeline for discovery; it has already been run for you.
 
           2. Read ONLY the file named in the failure output.
