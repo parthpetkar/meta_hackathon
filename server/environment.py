@@ -21,6 +21,10 @@ except (ImportError, ModuleNotFoundError):
     from models import MetaHackathonAction, MetaHackathonObservation
 
 from cicd.simulated_runner import SimulatedPipelineRunner, PipelineStatus as SimPipelineStatus
+if os.getenv("CICD_SUBPROCESS_RUNNER", "0") == "1":
+    from cicd.subprocess_runner import SubprocessPipelineRunner as _RunnerClass
+else:
+    _RunnerClass = SimulatedPipelineRunner  # type: ignore[assignment]
 from cicd.simulated_fault_injector import inject_fault_simulated
 from cicd.simulated_fix_applier import apply_fix_simulated
 from cicd.observation_builder import (
@@ -404,7 +408,7 @@ class SimulatedCICDRepairEnvironment(Environment):
         fault_metadata = injected[0] if injected else inject_fault_simulated(repo_dir, fault_type)
         cascading_faults: list = injected[1:] if len(injected) > 1 else []
 
-        runner = SimulatedPipelineRunner(
+        runner = _RunnerClass(
             workspace_path=repo_dir,
             fault_type=fault_type,
             scenario=adversarial_scenario,
@@ -567,11 +571,9 @@ class SimulatedCICDRepairEnvironment(Environment):
         obs_dict = self._build_step_observation(episode, reward, done)
         return self._dict_to_observation(obs_dict)
 
-    def state(self) -> dict:
-        return {
-            "episode_id": self._state.episode_id,
-            "step_count": self._state.step_count,
-        }
+    @property
+    def state(self):
+        return self._state
 
     # ── Action handlers ──────────────────────────────────────────────────────
 
@@ -697,7 +699,9 @@ class SimulatedCICDRepairEnvironment(Environment):
             ep.findings.append(f"Fix applied: {fix_result.description}")
             ep.pending_fix_outcome = "applied"
             ep.errors_stale_after_fix = True
-            return
+            if hasattr(ep.pipeline_runner, "commit_agent_fixes"):
+                ep.pipeline_runner.commit_agent_fixes()
+            return 0.10
         else:
             ep.findings.append(f"Fix could not be applied: {fix_result.error}")
             ep.pending_fix_outcome = "failed"
@@ -1113,6 +1117,11 @@ class SimulatedCICDRepairEnvironment(Environment):
         )
 
     def _cleanup_episode(self, ep: EpisodeState) -> None:
+        if ep.pipeline_runner and hasattr(ep.pipeline_runner, "cleanup"):
+            try:
+                ep.pipeline_runner.cleanup()
+            except Exception:
+                pass
         workspace_base = os.path.dirname(ep.workspace_dir)
         if workspace_base and os.path.exists(workspace_base) and "cicd-sim-episode" in workspace_base:
             try:
