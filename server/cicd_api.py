@@ -400,6 +400,30 @@ async def execute_pipeline_job(job_id: str) -> None:
     async def _push(msg: Dict[str, Any]) -> None:
         await ws_manager.send(job.workspace_id, msg)
 
+    async def _stream_stage_logs(stage_name: str, stage_result) -> str:
+        merged_lines: List[str] = []
+        chunks: List[tuple[str, str]] = []
+        if stage_result.stdout:
+            chunks.extend([("stdout", line) for line in stage_result.stdout.splitlines() if line.strip()])
+        if stage_result.stderr:
+            chunks.extend([("stderr", line) for line in stage_result.stderr.splitlines() if line.strip()])
+
+        total = max(1, len(chunks))
+        for idx, (stream_name, line) in enumerate(chunks, start=1):
+            merged_lines.append(line)
+            await _push({
+                "type": "log_chunk",
+                "stage": stage_name,
+                "job_id": job_id,
+                "stream": stream_name,
+                "line": line,
+                "line_index": idx,
+                "total_lines": total,
+                "timestamp": time.time(),
+            })
+            await asyncio.sleep(0.01)
+        return "\n".join(merged_lines)
+
     for stage_name in STAGE_ORDER:
         if overall_failed:
             job.stages[stage_name] = "skipped"
@@ -423,9 +447,7 @@ async def execute_pipeline_job(job_id: str) -> None:
         stage_status = str(stage_result.status)
         job.stages[stage_name] = stage_status
 
-        logs = stage_result.stdout
-        if stage_result.stderr:
-            logs = (logs + "\n" + stage_result.stderr).strip()
+        logs = await _stream_stage_logs(stage_name, stage_result)
 
         await _push({
             "type": "stage_completed",
@@ -523,6 +545,8 @@ async def websocket_endpoint(websocket: WebSocket, workspace_id: str):
       {"type": "file_list",       "request_id": "...", "files": [...], "directories": [...]}
       {"type": "pipeline_queued", "request_id": "...", "job_id": "..."}
       {"type": "stage_started",   "stage": "...", "job_id": "...", "timestamp": float}
+      {"type": "log_chunk",       "stage": "...", "job_id": "...", "stream": "stdout|stderr",
+                                  "line": "...", "line_index": int, "total_lines": int}
       {"type": "stage_completed", "stage": "...", "job_id": "...", "status": "...",
                                   "logs": "...", "duration": float}
       {"type": "stage_skipped",   "stage": "...", "job_id": "..."}

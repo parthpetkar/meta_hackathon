@@ -18,6 +18,7 @@ except ImportError:
 # Map each operation → the SRE phase it belongs to
 OP_TO_PHASE: Dict[str, str] = {
     "view_logs": "triage",
+    "tail_logs": "triage",
     "inspect_config": "investigation",
     "inspect_dockerfile": "investigation",
     "inspect_permissions": "investigation",

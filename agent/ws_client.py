@@ -96,9 +96,17 @@ class CICDWebSocketClient:
         if not _HAS_WEBSOCKETS:
             raise RuntimeError("websockets package is required for WS client")
         uri = f"{self.base_url}/api/ws/{self.workspace_id}"
-        self._ws = await websockets.connect(uri, ping_interval=30, ping_timeout=60)
+        # Disable library-level pings: the sync wrapper runs run_until_complete per call,
+        # leaving the loop idle between calls. The ping coroutine never gets CPU time during
+        # those gaps, which causes spurious ping-timeout disconnects.
+        self._ws = await websockets.connect(uri, ping_interval=None)
         self._recv_task = asyncio.create_task(self._recv_loop())
         logger.info("WS connected to %s", uri)
+
+    async def reconnect(self) -> None:
+        """Close the existing connection and open a fresh one."""
+        await self.close()
+        await self.connect()
 
     async def close(self) -> None:
         if self._recv_task:
@@ -153,11 +161,24 @@ class CICDWebSocketClient:
         # Pipeline push events
         if msg_type == "stage_completed" and self._current_pipeline_result is not None:
             stage = msg.get("stage", "")
+            existing = self._current_pipeline_result.stage_details.get(stage, {})
+            existing_logs = str(existing.get("logs", "") or "")
+            completed_logs = msg.get("logs", "") or ""
+            merged_logs = completed_logs or existing_logs
             self._current_pipeline_result.stage_details[stage] = {
                 "status": msg.get("status"),
-                "logs": msg.get("logs", ""),
+                "logs": merged_logs,
                 "duration": msg.get("duration"),
             }
+        elif msg_type == "log_chunk" and self._current_pipeline_result is not None:
+            stage = msg.get("stage", "")
+            line = str(msg.get("line", "") or "")
+            detail = self._current_pipeline_result.stage_details.setdefault(
+                stage,
+                {"status": "running", "logs": "", "duration": None},
+            )
+            prior = str(detail.get("logs", "") or "")
+            detail["logs"] = (prior + ("\n" if prior else "") + line).strip()
         elif msg_type == "stage_started":
             logger.debug("Pipeline stage started: %s", msg.get("stage"))
         elif msg_type == "pipeline_done":
@@ -292,14 +313,29 @@ class SyncCICDWebSocketClient:
         self._loop.run_until_complete(self._async_client.close())
         self._loop.close()
 
+    def _run_with_reconnect(self, coro_factory):
+        """Run a coroutine factory, reconnecting once if the connection is closed."""
+        try:
+            return self._loop.run_until_complete(coro_factory())
+        except Exception as exc:
+            err = str(exc).lower()
+            if "closed" in err or "connection" in err or isinstance(exc, (ConnectionError, OSError)):
+                logger.info("WS connection lost (%s), reconnecting…", exc)
+                try:
+                    self._loop.run_until_complete(self._async_client.reconnect())
+                except Exception as reconnect_exc:
+                    raise ConnectionError(f"WS reconnect failed: {reconnect_exc}") from exc
+                return self._loop.run_until_complete(coro_factory())
+            raise
+
     def read_file(self, path: str) -> Tuple[bool, str]:
-        return self._loop.run_until_complete(self._async_client.read_file(path))
+        return self._run_with_reconnect(lambda: self._async_client.read_file(path))
 
     def write_file(self, path: str, content: str) -> bool:
-        return self._loop.run_until_complete(self._async_client.write_file(path, content))
+        return self._run_with_reconnect(lambda: self._async_client.write_file(path, content))
 
     def list_files(self, directory: str = "") -> Tuple[List[str], List[str]]:
-        return self._loop.run_until_complete(self._async_client.list_files(directory))
+        return self._run_with_reconnect(lambda: self._async_client.list_files(directory))
 
     def trigger_pipeline(self) -> PipelineResult:
-        return self._loop.run_until_complete(self._async_client.trigger_pipeline())
+        return self._run_with_reconnect(lambda: self._async_client.trigger_pipeline())

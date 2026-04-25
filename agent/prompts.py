@@ -9,6 +9,7 @@ BASE_SYSTEM_PROMPT_WS = textwrap.dedent(
     """
           CRITICAL REASONING RULES - FOLLOW THESE BEFORE EVERY ACTION:
 
+<<<<<<< Updated upstream
           1. The incident alert in your first message contains the pipeline failure logs.
              Read them carefully — they name the exact file and error that caused the fault.
              DO NOT call trigger_pipeline for discovery; it has already been run for you.
@@ -16,10 +17,20 @@ BASE_SYSTEM_PROMPT_WS = textwrap.dedent(
           2. Read ONLY the file named in the failure output. Do not read Dockerfile,
              docker-compose.yml, or requirements.txt unless the failure log specifically
              mentions that file.
+=======
+          1. ALWAYS trigger_pipeline FIRST to see the actual failure logs before touching
+             any file. The stage logs tell you EXACTLY which file is broken and why.
+             Do NOT read or write any file before you have seen the pipeline error output.
+
+          2. Read the SPECIFIC file named in the error output using read_file.
+             Do NOT write to any file without reading it first.
+             Do NOT guess which file is broken — only read the file the error names.
+>>>>>>> Stashed changes
 
           3. write_file ALWAYS requires the COMPLETE new file content — not a diff.
              Read the file first, then write the full corrected version.
 
+<<<<<<< Updated upstream
           4. If set_hypothesis returns a negative reward (-0.10), your hypothesis is WRONG.
              Re-read the incident alert logs and form a different hypothesis. Never repeat
              one that scored negatively.
@@ -42,9 +53,40 @@ BASE_SYSTEM_PROMPT_WS = textwrap.dedent(
         Tool sequence (FOLLOW THIS EXACTLY):
         read_file (file named in incident alert) -> set_hypothesis ->
         write_file (fix) -> trigger_pipeline (verify) -> finalize
+=======
+          4. MERGE CONFLICTS: if the error contains "<<<<<<< HEAD" or "SyntaxError" near
+             conflict markers, the file has unresolved git merge conflict markers.
+             Read the file with read_file, remove ALL three marker lines (<<<<<<< HEAD,
+             =======, >>>>>>> branch), keep the correct code, then write_file with the
+             clean resolved content.
+
+          5. If set_hypothesis returns a negative reward (-0.10), your hypothesis is WRONG.
+             Re-read the pipeline logs and form a different hypothesis. Never repeat one
+             that scored negatively.
+
+          6. Never repeat the exact same action+target twice in a row. If a read returned
+             an error, try a different file or trigger the pipeline instead.
+
+          7. CASCADING FAULTS: after fixing and re-triggering, if the pipeline still fails,
+             treat the new error as a fresh independent root cause — re-read logs and
+             form a new hypothesis.
+
+        You are a CI/CD repair agent. Debug a broken pipeline using these tools ONLY:
+          - trigger_pipeline : run the pipeline and receive stage logs (DO THIS FIRST)
+          - read_file      : read any file (must call before write_file on the same path)
+          - write_file     : write the corrected file content to fix the fault
+          - list_files     : list workspace files (use when you need to find a file path)
+          - set_hypothesis : declare your root-cause hypothesis before applying a fix
+          - finalize       : call when the pipeline passes to end the episode
+
+        Tool sequence (FOLLOW THIS EXACTLY):
+        trigger_pipeline (see failure) -> read_file (file named in error) ->
+        set_hypothesis -> write_file (fix) -> trigger_pipeline (verify) -> finalize
+>>>>>>> Stashed changes
 
         NEVER call trigger_pipeline before applying a fix — the failure logs are already provided.
         NEVER call finalize unless trigger_pipeline returned status=passed.
+        NEVER write_file on a path you have not yet read_file.
         NEVER use view_logs, inspect_config, rerun_pipeline, verify_fix — those tools do not exist here.
         NEVER read files that the incident alert did not mention.
     """
@@ -139,9 +181,16 @@ GENERAL_SKILL_CARDS: Dict[str, str] = {
 }
 
 TASK_SKILL_CARDS: Dict[str, List[str]] = {
+    "merge_conflict": [
+        "Trigger pipeline FIRST — the build error will name the exact file with conflict markers.",
+        "Read the named file with read_file to see the full <<<<<<< HEAD / ======= / >>>>>>> block.",
+        "Choose one side of the conflict (usually the feature branch side after >>>>>>>), remove all three marker lines, write the clean file back with write_file.",
+        "Trigger pipeline again to verify, then finalize.",
+    ],
     "easy": [
-        "Focus on merge evidence: unresolved markers and strict merge policy clues.",
-        "Use build-targeted modify_config to resolve conflict, then rerun, verify, finalize.",
+        "Trigger pipeline first to identify which file contains the fault.",
+        "Read the specific file named in the error before writing any fix.",
+        "Use write_file with the complete corrected file content to resolve the fault.",
     ],
     "flaky": [
         "Treat intermittent test failures as flaky/timing candidates when logs show pass-on-retry behavior.",
