@@ -92,7 +92,7 @@ def step_env(
             detail = response.text
         print(
             f"[STEP ERROR] HTTP {response.status_code} from /step — "
-            f"action=({operation!r}, {target!r}, {value!r[:60]!r}) — "
+            f"action=({operation!r}, {target!r}, {value[:60]!r}) — "
             f"body={detail}",
             flush=True,
         )
