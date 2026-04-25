@@ -620,12 +620,20 @@ class SimulatedPipelineRunner:
         self.episode_id = episode_id or "sim-episode"
 
         # Collect all active faults (single fault_type OR scenario fault list)
+        # Always start with the explicitly injected fault_type so the runner
+        # checks for it even when the adversarial scenario lists a different
+        # root cause (e.g. LLM returned a mismatched fault type).
         self._active_faults: List[str] = []
-        if scenario and hasattr(scenario, 'steps'):
-            # Extract fault_type from each IncidentStep in the scenario
-            self._active_faults = [step.fault_type for step in scenario.steps]
-        elif fault_type:
+        if fault_type:
             self._active_faults = [fault_type]
+        if scenario and hasattr(scenario, 'steps'):
+            # Merge scenario faults, preserving fault_type as the first entry
+            # and deduplicating so the same fault isn't checked twice.
+            seen = set(self._active_faults)
+            for step in scenario.steps:
+                if step.fault_type not in seen:
+                    self._active_faults.append(step.fault_type)
+                    seen.add(step.fault_type)
 
         # Deterministic RNG seeded on episode + fault so reruns are identical
         seed_str = f"{self.episode_id}:{self.fault_type or 'none'}"

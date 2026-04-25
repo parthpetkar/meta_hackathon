@@ -83,6 +83,17 @@ def step_env(
         json={"action": {"operation": operation, "target": target, "value": value}},
         timeout=HTTP_TIMEOUT_SECONDS,
     )
+    if not response.ok:
+        try:
+            detail = response.json()
+        except Exception:
+            detail = response.text
+        print(
+            f"[STEP ERROR] HTTP {response.status_code} from /step — "
+            f"action=({operation!r}, {target!r}, {value!r[:60]!r}) — "
+            f"body={detail}",
+            flush=True,
+        )
     response.raise_for_status()
 
     payload = response.json()

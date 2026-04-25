@@ -44,6 +44,7 @@ class WorkspaceCreateResponse(BaseModel):
     status: str
     fault_injected: Optional[str] = None
     message: str
+    initial_failure_logs: Optional[str] = None  # pre-run failure output surfaced as the incident alert
 
 
 class FileReadRequest(BaseModel):
@@ -121,6 +122,7 @@ class WorkspaceState:
     last_modified: float
     fault_type: Optional[str] = None
     active_jobs: List[str] = field(default_factory=list)
+    initial_failure_logs: Optional[str] = None  # failure output from the pre-run at creation time
 
 
 @dataclass
@@ -230,12 +232,37 @@ class CICDAPIState:
             except Exception as exc:
                 logger.warning("Failed to inject fault %s: %s", fault_type, exc)
 
+        # Run the pipeline once synchronously to capture the initial failure output.
+        # This becomes the "incident alert" the agent receives without needing to
+        # trigger the pipeline itself for discovery — saving one expensive pipeline run.
+        initial_failure_logs: Optional[str] = None
+        try:
+            pre_runner = SimulatedPipelineRunner(
+                workspace_path=base_path,
+                fault_type=fault_type,
+                episode_id=f"init-{workspace_id[:8]}",
+            )
+            log_parts: List[str] = []
+            for stage_name in STAGE_ORDER:
+                stage_result = pre_runner.run_stage(stage_name, base_path)
+                stage_status = str(stage_result.status)
+                stage_logs = stage_result.stdout
+                if stage_result.stderr:
+                    stage_logs = (stage_logs + "\n" + stage_result.stderr).strip()
+                log_parts.append(f"--- {stage_name}: {stage_status} ---\n{stage_logs}")
+                if stage_status == StageStatus.FAILED:
+                    break
+            initial_failure_logs = "\n".join(log_parts)
+        except Exception as exc:
+            logger.warning("Pre-run pipeline failed during workspace init: %s", exc)
+
         workspace = WorkspaceState(
             workspace_id=workspace_id,
             base_path=base_path,
             created_at=time.time(),
             last_modified=time.time(),
             fault_type=fault_type,
+            initial_failure_logs=initial_failure_logs,
         )
         async with self._lock:
             self.workspaces[workspace_id] = workspace
@@ -619,6 +646,7 @@ async def create_workspace(request: WorkspaceCreateRequest):
             workspace_id=workspace.workspace_id,
             status="created",
             fault_injected=workspace.fault_type,
+            initial_failure_logs=workspace.initial_failure_logs,
             message=f"Workspace created with {workspace.fault_type or 'no'} fault",
         )
     except Exception as exc:
