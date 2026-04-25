@@ -21,7 +21,7 @@ except (ImportError, ModuleNotFoundError):
     from models import MetaHackathonAction, MetaHackathonObservation
 
 from cicd.simulated_runner import SimulatedPipelineRunner, PipelineStatus as SimPipelineStatus
-_runner_mode = os.getenv("CICD_RUNNER_MODE", "subprocess").strip().lower()
+_runner_mode = os.getenv("CICD_RUNNER_MODE", "simulated").strip().lower()
 if _runner_mode == "simulated":
     _RunnerClass = SimulatedPipelineRunner  # type: ignore[assignment]
 else:
@@ -53,10 +53,12 @@ try:
     from .curriculum import CurriculumController
     from .adversarial_designer import AdversarialDesigner
     from .adversarial_judge import AdversarialJudge
+    from .rubric_judge import OpenEnvLLMJudgeAdapter, DEFAULT_OPENROUTER_MODEL
 except (ImportError, ModuleNotFoundError):
     from server.curriculum import CurriculumController
     from server.adversarial_designer import AdversarialDesigner
     from server.adversarial_judge import AdversarialJudge
+    from server.rubric_judge import OpenEnvLLMJudgeAdapter, DEFAULT_OPENROUTER_MODEL
 
 
 # ── Constants ──────────────────────────────────────────────────────────────
@@ -402,9 +404,13 @@ class SimulatedCICDRepairEnvironment(Environment):
         fault_metadata = injected[0] if injected else inject_fault_simulated(repo_dir, fault_type)
         cascading_faults: list = injected[1:] if len(injected) > 1 else []
 
+        # Use the actually-injected fault type so the runner checks for what's in the files,
+        # not whatever the LLM scenario may have returned (which can diverge from seed_fault).
+        injected_fault_type = fault_metadata.fault_type if fault_metadata else fault_type
+
         runner = _RunnerClass(
             workspace_path=repo_dir,
-            fault_type=fault_type,
+            fault_type=injected_fault_type,
             scenario=adversarial_scenario,
             episode_id=episode_id,
         )
