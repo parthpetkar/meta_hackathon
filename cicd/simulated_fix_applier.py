@@ -252,6 +252,12 @@ _FAULT_FIX_MAP = {
     "missing_permission":  lambda ws: _fix_missing_permission(ws),
     "secret_exposure":     lambda ws: _fix_secret_exposure(ws),
     "env_drift":           lambda ws: _fix_env_drift(ws),
+    "invalid_database_url": lambda ws: _fix_invalid_database_url(ws),
+    "empty_secret_key":     lambda ws: _fix_empty_secret_key(ws),
+    "missing_pythonpath":   lambda ws: _fix_missing_pythonpath(ws),
+    "circular_import_runtime": lambda ws: _fix_circular_import_runtime(ws),
+    "missing_package_init": lambda ws: _fix_missing_package_init(ws),
+    "none_config_runtime":  lambda ws: _fix_none_config_runtime(ws),
     "log_pii_leak":        lambda ws: _fix_log_pii_leak(ws),
     "log_disabled":        lambda ws: _fix_log_disabled(ws),
     "bad_migration_sql":   lambda ws: _fix_bad_migration_sql(ws),
@@ -266,6 +272,12 @@ _FAULT_FIX_DESCRIPTIONS = {
     "missing_permission":  "Fixed docker-compose network configuration",
     "secret_exposure":     "Removed hardcoded secrets",
     "env_drift":           "Fixed docker-compose env/port configuration",
+    "invalid_database_url": "Fixed DATABASE_URL in .env",
+    "empty_secret_key":     "Restored SECRET_KEY in .env",
+    "missing_pythonpath":   "Restored PYTHONPATH bootstrap in virtualenv",
+    "circular_import_runtime": "Removed runtime circular import helper",
+    "missing_package_init": "Restored missing __init__.py in runtime support package",
+    "none_config_runtime":  "Replaced None-valued runtime config with a concrete backend",
     "log_pii_leak":        "Removed PII-leaking log call from routes.py",
     "log_disabled":        "Restored LOG_LEVEL to INFO from CRITICAL",
     "bad_migration_sql":   "Fixed SQL syntax error in migration file",
@@ -330,6 +342,24 @@ def _apply_heuristic_fix(workspace: str, fix_text: str, target: str = "") -> Fix
     elif any(kw in fix_lower for kw in ["secret", "credential", "api_key", "hardcoded"]):
         modified = _fix_secret_exposure(workspace)
         description = "Removed hardcoded secrets"
+    elif any(kw in fix_lower for kw in ["database_url", "wrong port", "db url", ".env"]):
+        modified = _fix_invalid_database_url(workspace)
+        description = "Fixed DATABASE_URL in .env"
+    elif any(kw in fix_lower for kw in ["secret_key", "empty secret", "blank secret"]):
+        modified = _fix_empty_secret_key(workspace)
+        description = "Restored SECRET_KEY"
+    elif any(kw in fix_lower for kw in ["pythonpath", "runtime.pth", "venv path"]):
+        modified = _fix_missing_pythonpath(workspace)
+        description = "Restored virtualenv PYTHONPATH"
+    elif any(kw in fix_lower for kw in ["circular import", "runtime probe", "lazy import"]):
+        modified = _fix_circular_import_runtime(workspace)
+        description = "Removed circular import from runtime probe"
+    elif any(kw in fix_lower for kw in ["__init__", "package init", "missing package"]):
+        modified = _fix_missing_package_init(workspace)
+        description = "Restored package __init__.py"
+    elif any(kw in fix_lower for kw in ["none config", "feature_cache_backend", "none runtime"]):
+        modified = _fix_none_config_runtime(workspace)
+        description = "Restored concrete runtime config"
 
     if not modified:
         return FixResult(
@@ -345,10 +375,13 @@ def _apply_heuristic_fix(workspace: str, fix_text: str, target: str = "") -> Fix
 # ── Strategy D: Generic auto-repair ─────────────────────────────────────────
 
 _SOURCE_FILES = [
+    ".env",
     "services/api/routes.py",
     "services/api/app.py",
     "services/api/logging_config.py",
+    "services/api/runtime_probe.py",
     "services/api/requirements.txt",
+    "services/runtime_support/__init__.py",
     "Dockerfile",
     "docker-compose.yml",
     "tests/test_api.py",
@@ -453,6 +486,20 @@ def _repair_docker_compose(content: str) -> str:
     fixed = re.sub(r'- "not-a-number:\d+"', '- "5000:5000"', fixed)
     fixed = re.sub(r'external: true\n?', '', fixed)
     return fixed
+
+
+def _upsert_env_value(content: str, key: str, value: str) -> str:
+    lines = content.splitlines()
+    updated = False
+    for idx, line in enumerate(lines):
+        if line.startswith(f"{key}="):
+            lines[idx] = f"{key}={value}"
+            updated = True
+            break
+    if not updated:
+        lines.append(f"{key}={value}")
+    normalized = "\n".join(lines).strip()
+    return normalized + "\n"
 
 
 # ── Per-fault fix implementations (no git) ───────────────────────────────────
@@ -586,6 +633,92 @@ def _fix_env_drift(workspace: str) -> List[str]:
     with open(path, "w", encoding="utf-8") as f:
         f.write(fixed)
     return ["docker-compose.yml"]
+
+
+def _fix_invalid_database_url(workspace: str) -> List[str]:
+    path = os.path.join(workspace, ".env")
+    content = ""
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+    fixed = _upsert_env_value(content, "DATABASE_URL", "postgresql://postgres:postgres@db:5432/appdb")
+    if fixed == content:
+        return []
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(fixed)
+    return [".env"]
+
+
+def _fix_empty_secret_key(workspace: str) -> List[str]:
+    path = os.path.join(workspace, ".env")
+    content = ""
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+    fixed = _upsert_env_value(content, "SECRET_KEY", "dev-secret-key")
+    if fixed == content:
+        return []
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(fixed)
+    return [".env"]
+
+
+def _fix_missing_pythonpath(workspace: str) -> List[str]:
+    path = os.path.join(workspace, ".venv", "runtime.pth")
+    desired = "/app\n/app/services\n"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    current = ""
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            current = f.read()
+    if current == desired:
+        return []
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(desired)
+    return [".venv/runtime.pth"]
+
+
+def _fix_circular_import_runtime(workspace: str) -> List[str]:
+    path = os.path.join(workspace, "services", "api", "runtime_probe.py")
+    if not os.path.exists(path):
+        return []
+    fixed = '"""Runtime probe helpers."""\n\n\ndef load_runtime_probe():\n    return "runtime-ok"\n'
+    with open(path, "r", encoding="utf-8") as f:
+        current = f.read()
+    if current == fixed:
+        return []
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(fixed)
+    return ["services/api/runtime_probe.py"]
+
+
+def _fix_missing_package_init(workspace: str) -> List[str]:
+    path = os.path.join(workspace, "services", "runtime_support", "__init__.py")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    content = "from .request_context import runtime_context\n"
+    current = ""
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            current = f.read()
+    if current == content:
+        return []
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return ["services/runtime_support/__init__.py"]
+
+
+def _fix_none_config_runtime(workspace: str) -> List[str]:
+    path = os.path.join(workspace, ".env")
+    content = ""
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+    fixed = _upsert_env_value(content, "FEATURE_CACHE_BACKEND", "redis")
+    if fixed == content:
+        return []
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(fixed)
+    return [".env"]
 
 
 def _fix_secret_exposure(workspace: str) -> List[str]:
