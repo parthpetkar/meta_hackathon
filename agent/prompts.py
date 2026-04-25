@@ -13,9 +13,11 @@ BASE_SYSTEM_PROMPT_WS = textwrap.dedent(
              Read them carefully — they name the exact file and error that caused the fault.
              DO NOT call trigger_pipeline for discovery; it has already been run for you.
 
-          2. Read ONLY the file named in the failure output. Do not read Dockerfile,
-             docker-compose.yml, or requirements.txt unless the failure log specifically
-             mentions that file.
+          2. Read ONLY the file named in the failure output.
+             EXCEPTION: if the error is a docker build step failure (contains "Step N/N : RUN"
+             or "returned a non-zero exit code"), read Dockerfile — the requirements file is NOT
+             missing, it just has not been COPY'd yet due to wrong instruction order.
+             Do not read requirements.txt or app code for docker build failures.
 
           3. write_file ALWAYS requires the COMPLETE new file content — not a diff.
              Read the file first, then write the full corrected version.
@@ -160,6 +162,12 @@ TASK_SKILL_CARDS: Dict[str, List[str]] = {
     "flaky": [
         "Treat intermittent test failures as flaky/timing candidates when logs show pass-on-retry behavior.",
         "Prefer retry policy or test isolation fixes over broad application logic rewrites.",
+    ],
+    "docker_order": [
+        "The error 'Step N/N : RUN pip install ... No such file or directory' is a Dockerfile build failure.",
+        "The requirements file exists in the workspace — it just has not been COPY'd into the image yet.",
+        "Read Dockerfile. Move the COPY line for requirements.txt BEFORE the RUN uv pip install line.",
+        "Write the corrected Dockerfile, then trigger_pipeline to verify.",
     ],
     "medium": [
         "Solve dependency compatibility first (requests/urllib3), then Docker install order.",

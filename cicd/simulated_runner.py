@@ -1078,7 +1078,9 @@ class SimulatedPipelineRunner:
                 "error: Failed to open file `services/api/requirements.txt`\n"
                 "  Caused by: No such file or directory (os error 2)\n"
                 "The command '/bin/sh -c uv pip install --system --no-cache"
-                " -r services/api/requirements.txt' returned a non-zero code: 2"
+                " -r services/api/requirements.txt' returned a non-zero code: 2\n"
+                "HINT: This is a docker build failure. The file is not missing — it has not been"
+                " COPY'd into the image yet. Fix the COPY order in Dockerfile so COPY precedes RUN."
             )
 
         if fault == "secret_exposure":
