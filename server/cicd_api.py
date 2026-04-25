@@ -226,11 +226,14 @@ class CICDAPIState:
                 else:
                     shutil.copy2(src, dst)
 
-        if fault_type and fault_type in FAULT_TYPES:
-            try:
-                inject_fault(base_path, fault_type)
-            except Exception as exc:
-                logger.warning("Failed to inject fault %s: %s", fault_type, exc)
+        # Pick a random fault when none is specified
+        if not fault_type or fault_type not in FAULT_TYPES:
+            import random as _random
+            fault_type = _random.choice(FAULT_TYPES)
+        try:
+            inject_fault(base_path, fault_type)
+        except Exception as exc:
+            logger.warning("Failed to inject fault %s: %s", fault_type, exc)
 
         # Run the pipeline once synchronously to capture the initial failure output.
         # This becomes the "incident alert" the agent receives without needing to

@@ -51,15 +51,15 @@ where `w = META_HACKATHON_RUBRIC_WEIGHT`.
 
 ### API
 
-- `POST /reset`
-- `POST /step`
-- `GET /state`
+- `POST /api/workspace/create` — create workspace, inject fault, return `initial_failure_logs`
+- `WS   /api/ws/{workspace_id}` — persistent WebSocket session (read_file / write_file / list_files / trigger_pipeline)
+- `GET  /health`
 
 ### Local run
 
 ```bash
 uv sync
-uv run uvicorn server.app:app --host 0.0.0.0 --port 8000
+uv run uvicorn server.cicd_api:app --host 0.0.0.0 --port 8000 --ws-ping-interval 30 --ws-ping-timeout 60
 ```
 
 ### Evaluation
