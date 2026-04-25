@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Set
 
 VALID_OPERATIONS: Set[str] = {
     "view_logs",
+    "tail_logs",
     "inspect_config",
     "inspect_dockerfile",
     "modify_config",
@@ -21,6 +22,28 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "function": {
             "name": "view_logs",
             "description": "Read pipeline/runtime logs for the active failure context.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "stage": {
+                        "type": "string",
+                        "enum": ["build", "test", "deploy"],
+                        "description": "Pipeline stage to inspect",
+                    },
+                    "detail": {
+                        "type": "string",
+                        "description": "Optional detail filter",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tail_logs",
+            "description": "Read only the latest log tail for quick, low-cost triage.",
             "parameters": {
                 "type": "object",
                 "properties": {

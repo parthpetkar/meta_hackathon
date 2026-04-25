@@ -32,6 +32,8 @@ def parse_observation_payload(payload: Dict[str, Any]) -> MetaHackathonObservati
         available_tools=obs_data.get("available_tools", []),
         visible_alerts=obs_data.get("visible_alerts", []),
         visible_logs=obs_data.get("visible_logs", []),
+        log_tokens_remaining=obs_data.get("log_tokens_remaining", 0),
+        log_access_mode=obs_data.get("log_access_mode", "full"),
         logs_by_stage=obs_data.get("logs_by_stage", {}),
         visible_metrics=obs_data.get("visible_metrics", []),
         config_files=obs_data.get("config_files", {}),
@@ -83,6 +85,17 @@ def step_env(
         json={"action": {"operation": operation, "target": target, "value": value}},
         timeout=HTTP_TIMEOUT_SECONDS,
     )
+    if not response.ok:
+        try:
+            detail = response.json()
+        except Exception:
+            detail = response.text
+        print(
+            f"[STEP ERROR] HTTP {response.status_code} from /step — "
+            f"action=({operation!r}, {target!r}, {value[:60]!r}) — "
+            f"body={detail}",
+            flush=True,
+        )
     response.raise_for_status()
 
     payload = response.json()
@@ -116,6 +129,10 @@ def format_obs_for_llm(observation: MetaHackathonObservation, step_num: int) -> 
         )
 
     parts: List[str] = []
+    parts.append(
+        f"Log budget: {int(getattr(observation, 'log_tokens_remaining', 0) or 0)} "
+        f"(mode={getattr(observation, 'log_access_mode', 'full')})"
+    )
     errors = observation.surfaced_errors or []
     if errors:
         parts.append("⚠️  ACTIVE ERRORS (start here):")

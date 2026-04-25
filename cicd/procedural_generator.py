@@ -14,13 +14,13 @@ from __future__ import annotations
 import random
 from typing import List, Optional
 
-from cicd.fault_injector import (
+from cicd.fault_types import (
     FAULT_KEYWORDS,
     FAULT_STAGE_MAP,
     FAULT_TYPES,
     FaultMetadata,
-    inject_fault,
 )
+from cicd.simulated_fault_injector import inject_fault_simulated as inject_fault
 
 try:
     from models import AdversarialCICDScenario, IncidentStep

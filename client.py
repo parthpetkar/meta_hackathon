@@ -86,6 +86,8 @@ class MetaHackathonEnv(
             available_tools=obs_data.get("available_tools", []),
             visible_alerts=obs_data.get("visible_alerts", []),
             visible_logs=obs_data.get("visible_logs", []),
+            log_tokens_remaining=obs_data.get("log_tokens_remaining", 0),
+            log_access_mode=obs_data.get("log_access_mode", "full"),
             logs_by_stage=obs_data.get("logs_by_stage", {}),
             visible_metrics=obs_data.get("visible_metrics", []),
             config_files=obs_data.get("config_files", {}),
