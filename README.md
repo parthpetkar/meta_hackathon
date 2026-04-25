@@ -39,7 +39,7 @@ OpenEnv API compliance:
 
 Runtime architecture (current):
 
-- `server/environment.py` hosts both `RealCICDRepairEnvironment` and `SimulatedCICDRepairEnvironment`; selection is controlled by `CICD_SIMULATE`.
+- `server/environment.py` hosts both `RealCICDRepairEnvironment` and `SimulatedCICDRepairEnvironment`; selection is controlled by `CICD_SIMULATE`. Within simulated mode, `CICD_SUBPROCESS_RUNNER=1` activates the subprocess-backed sandbox (see below).
 - `server/rubric_judge.py` provides delayed reward rubric scoring with provider-aware fallback.
 - `server/agent_memory.py` stores persistent cross-episode fix memory and optimal-path recall in SQLite.
 - `server/curriculum.py` adapts difficulty from episode outcomes using UCB1 + EMA scheduling.
@@ -49,7 +49,8 @@ Runtime architecture (current):
 - `cicd/simulated_fault_injector.py` injects the same 20 fault types via file mutations only — no git required.
 - `cicd/pipeline_runner.py` executes `clone -> build -> test -> deploy` via subprocess with BuildKit layer caching.
 - `cicd/simulated_runner.py` executes the same four stages in pure Python — no Docker required.
-- `cicd/observation_builder.py` builds surfaced errors/logs/config snapshots (works with both runners).
+- `cicd/subprocess_runner.py` executes real `uv pip install`, `pytest`, and `uvicorn` subprocesses inside a per-episode venv — no Docker required, but produces authentic tool output.
+- `cicd/observation_builder.py` builds surfaced errors/logs/config snapshots (works with all runners).
 - `cicd/fix_applier.py` applies structured JSON or heuristic fixes and commits successful changes via git.
 - `cicd/simulated_fix_applier.py` applies the same fix strategies without git commits.
 
@@ -64,16 +65,19 @@ The runtime follows a layered architecture to keep OpenEnv APIs stable while evo
 
 ### 2) Execution Layer
 
-Two parallel implementations — swap via `CICD_SIMULATE` env var:
+Three parallel pipeline runner implementations — swap via env vars:
 
-| Component | Real (`CICD_SIMULATE=false`) | Simulated (`CICD_SIMULATE=true`) |
-|---|---|---|
-| Pipeline runner | `cicd/pipeline_runner.py` — Docker + Git subprocess | `cicd/simulated_runner.py` — pure Python, no Docker |
-| Fault injector | `cicd/fault_injector.py` — file mutations + git commit | `cicd/simulated_fault_injector.py` — file mutations only |
-| Fix applier | `cicd/fix_applier.py` — file edits + git commit | `cicd/simulated_fix_applier.py` — file edits only |
-| Workspace setup | `git init` + initial commit | `shutil.copytree` (no git) |
+| Component | Real (`CICD_SIMULATE=false`) | Simulated (`CICD_SIMULATE=true`) | Subprocess sandbox (`CICD_SIMULATE=true` + `CICD_SUBPROCESS_RUNNER=1`) |
+|---|---|---|---|
+| Pipeline runner | `cicd/pipeline_runner.py` — Docker + Git | `cicd/simulated_runner.py` — pure Python | `cicd/subprocess_runner.py` — real uv/pytest/uvicorn, no Docker |
+| Fault injector | `cicd/fault_injector.py` — mutations + git | `cicd/simulated_fault_injector.py` — mutations only | same as simulated |
+| Fix applier | `cicd/fix_applier.py` — edits + git commit | `cicd/simulated_fix_applier.py` — file edits only | same (+ auto git commit) |
+| Workspace setup | `git init` + initial commit | `shutil.copytree` (no git) | `shutil.copytree` + `git init` (feature branch per episode) |
+| Build output | Real Docker/BuildKit logs | Synthetic uv-style logs | Real `uv pip install` output |
+| Test output | Real pytest output | Synthetic pytest-style logs | Real `pytest` output |
+| Deploy output | Real Docker Compose logs | Synthetic compose-style logs | Real `uvicorn` startup probe |
 
-Both implementations support all 20 fault types and use identical fix strategies (structured JSON → fault-type dispatch → heuristic → auto-repair).
+All three implementations support all fault types and use identical fix strategies (structured JSON → fault-type dispatch → heuristic → auto-repair).
 
 ### 3) Evidence Layer
 
@@ -306,6 +310,30 @@ Use this mode for:
 - Rapid agent iteration where pipeline latency is not a concern
 - CI environments without container runtimes
 
+### Run in subprocess sandbox mode (no Docker required)
+
+Set `CICD_SUBPROCESS_RUNNER=1` alongside `CICD_SIMULATE=true` to activate the subprocess-backed sandbox. This mode runs real `uv pip install`, `pytest`, and `uvicorn` inside a per-episode venv — producing authentic tool output without needing Docker.
+
+```bash
+uv sync
+CICD_SIMULATE=true CICD_SUBPROCESS_RUNNER=1 uv run uvicorn server.app:app --host 0.0.0.0 --port 8000
+```
+
+What happens per episode in this mode:
+
+1. Workspace is copied from `sample-app` via `shutil.copytree` (same as pure simulated mode).
+2. Faults are injected as real file mutations.
+3. A per-episode venv is created at `/tmp/episode_{id}/venv` via `uv venv`.
+4. A git repo is initialised in the workspace: faulted state committed on `main`, agent work happens on branch `fix/episode-{id[:8]}`.
+5. **Build stage**: `uv pip install -r services/api/requirements.txt` — real resolver errors surface from real dependency conflicts.
+6. **Test stage**: `python -m pytest tests/ --tb=short -q` against the workspace — real assertion tracebacks, real import errors.
+7. **Deploy stage**: `uvicorn services.api.app:app --port 0` probed for startup — real import errors, real startup crashes.
+8. After each successful fix, changes are committed on the feature branch (`git add -A && git commit`).
+9. On each pipeline rerun, the clone stage shows a diff stat (`git diff main..HEAD --stat`) — a simulated PR view of the agent's changes.
+10. On episode end, the venv and episode directory are cleaned up via `shutil.rmtree`.
+
+Episode startup latency is ~3–8 seconds (venv creation + install) vs ~0 ms for pure simulated mode. Use subprocess sandbox mode when authentic error messages matter for agent training.
+
 ### Run in real mode (Docker + Git required)
 
 ```bash
@@ -345,8 +373,9 @@ This lets you run the container without a Docker-in-Docker setup (e.g. in resour
 
 ## Design rationale and contribution angle
 
-- Dual-mode execution: the same agent, curriculum, reward structure, and observation schema work against both real Docker pipelines and a pure-Python simulator — swapped via a single env var.
+- Three-mode execution: the same agent, curriculum, reward structure, and observation schema work across real Docker pipelines, a pure-Python simulator, and the new subprocess sandbox — swapped via env vars with no API changes.
 - Real-world abstraction: fault injection always writes real file mutations (conflict markers, bad SQL, broken YAML) so agents see authentic evidence regardless of execution mode.
+- Subprocess sandbox closes the simulation gap without Docker: real `uv` resolver errors, real `pytest` tracebacks, and real `uvicorn` startup crashes are produced from genuinely faulted files — agents cannot learn to pattern-match synthetic log templates.
 - Why RL over rules: agents must sequence evidence gathering, hypothesis quality, safe edits, and verification under noisy logs.
 - Open-source contribution value: reproducible fault injection, transparent step/reward dynamics, and OpenEnv-compatible serving.
 - Extensibility entry points: environment/action logic in `server/environment.py`, pipeline/fault/fix subsystems in `cicd/`, deterministic regression eval in `eval_runner.py`, and agentic baseline modules in `agent/`.
@@ -357,11 +386,13 @@ For a deeper narrative of intended upstream value and extension strategy, see `D
 
 - `models.py` and `client.py`: OpenEnv action/observation models and client adapter.
 - `server/`: API app and environment runtime (`app.py`, `environment.py` — hosts both `RealCICDRepairEnvironment` and `SimulatedCICDRepairEnvironment`).
-- `cicd/`: pipeline runners, fault injectors, fix appliers, and observation builder — each with real and simulated variants:
-  - `pipeline_runner.py` / `simulated_runner.py`
+- `cicd/`: pipeline runners, fault injectors, fix appliers, and observation builder:
+  - `pipeline_runner.py` — Docker + Git subprocess runner (real mode)
+  - `simulated_runner.py` — pure Python runner (simulated mode)
+  - `subprocess_runner.py` — real uv/pytest/uvicorn subprocess runner (subprocess sandbox mode)
   - `fault_injector.py` / `simulated_fault_injector.py`
   - `fix_applier.py` / `simulated_fix_applier.py`
-  - `observation_builder.py` (shared)
+  - `observation_builder.py` (shared across all runners)
 - `agent/`: modular inference baseline (`config`, `prompts`, `tool_schemas`, action guards, fallback plans, HTTP environment helpers, model tool-call translation, and runner).
 - `inference.py`: thin compatibility entry point for the agentic baseline.
 - `eval_runner.py`: deterministic regression evaluator for calibration and smoke tests.
@@ -449,6 +480,11 @@ META_HACKATHON_PIPELINE_TIMEOUT_SECONDS=300
 # true  -> SimulatedCICDRepairEnvironment (pure Python, no Docker, no Git)
 # false -> RealCICDRepairEnvironment (Docker + Git subprocesses, default)
 CICD_SIMULATE=false
+
+# Subprocess sandbox mode (only applies when CICD_SIMULATE=true)
+# 0 -> pure Python simulation (synthetic logs, zero latency, default)
+# 1 -> real uv/pytest/uvicorn subprocesses in per-episode venv (authentic output, ~3-8s startup)
+CICD_SUBPROCESS_RUNNER=0
 
 # Optional provenance audit trail in reset/step metadata
 META_HACKATHON_AUDIT_TRAIL=true

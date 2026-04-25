@@ -78,7 +78,15 @@ def _run_cicd_api_server(host: str, port: int) -> None:
             level=logging.INFO,
             format="[CI/CD API] %(levelname)s: %(message)s",
         )
-        uvicorn.run(cicd_app, host=host, port=port, log_level="info", access_log=False)
+        uvicorn.run(
+            cicd_app,
+            host=host,
+            port=port,
+            log_level="info",
+            access_log=False,
+            ws_ping_interval=30,
+            ws_ping_timeout=60,
+        )
     except Exception as exc:
         logging.error("CI/CD API server failed to start: %s", exc)
         sys.exit(1)

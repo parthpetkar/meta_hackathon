@@ -96,7 +96,7 @@ class CICDWebSocketClient:
         if not _HAS_WEBSOCKETS:
             raise RuntimeError("websockets package is required for WS client")
         uri = f"{self.base_url}/api/ws/{self.workspace_id}"
-        self._ws = await websockets.connect(uri, ping_interval=20, ping_timeout=10)
+        self._ws = await websockets.connect(uri, ping_interval=30, ping_timeout=60)
         self._recv_task = asyncio.create_task(self._recv_loop())
         logger.info("WS connected to %s", uri)
 

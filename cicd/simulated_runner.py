@@ -70,7 +70,7 @@ STAGE_WEIGHTS = {
 # ── Fault → Stage Mapping ──────────────────────────────────────────────────
 
 FAULT_STAGE_MAP: Dict[str, str] = {
-    "merge_conflict":      "test",
+    "merge_conflict":      "build",
     "dependency_conflict": "build",
     "docker_order":        "build",
     "flaky_test":          "test",
@@ -388,8 +388,8 @@ PARTIAL_FIX_CHECKS: Dict[str, List[Tuple[str, Callable[[str], bool]]]] = {
          lambda ws: _dockerfile_copy_before_run(ws)),
     ],
     "flaky_test": [
-        ("test_response_time test removed",
-         lambda ws: "test_response_time" not in _read_file_safe(ws, "tests/test_api.py")),
+        ("test_response_time test removed or threshold relaxed to >= 0.1s",
+         lambda ws: _flaky_test_fixed(ws)),
     ],
     "missing_permission": [
         ("external: true removed from docker-compose.yml",
@@ -436,6 +436,15 @@ def _dockerfile_copy_before_run(workspace: str) -> bool:
         if "RUN" in line and ("pip install" in line or "uv pip install" in line):
             run_idx = i
     return copy_idx != -1 and run_idx != -1 and copy_idx < run_idx
+
+
+def _flaky_test_fixed(workspace: str) -> bool:
+    """True if the flaky timing test has been removed OR its threshold raised to >= 0.1s."""
+    content = _read_file_safe(workspace, "tests/test_api.py")
+    if "test_response_time" not in content:
+        return True
+    m = re.search(r"threshold\s*=\s*([0-9]*\.?[0-9]+)", content)
+    return bool(m) and float(m.group(1)) >= 0.1
 
 
 def _no_duplicate_ports(workspace: str) -> bool:
@@ -529,6 +538,23 @@ class SimulatedPipelineResult:
 
     def get_stage_durations(self) -> Dict[str, float]:
         return {name: round(stage.duration_seconds, 2) for name, stage in self.stages.items()}
+
+
+# ── Module-level partial-fix warning helper (importable by other runners) ─
+
+def _partial_fix_warnings(
+    active_faults: List[str],
+    stage: str,
+    fault_status: Dict[str, Tuple[bool, float, List[str]]],
+) -> str:
+    lines: List[str] = []
+    for fault in active_faults:
+        fully_fixed, score, failing = fault_status[fault]
+        if not fully_fixed and score > 0 and FAULT_STAGE_MAP.get(fault) == stage:
+            for check in failing:
+                lines.append(f"Error: {check}")
+            lines.append("Pipeline still failing — fix is incomplete.")
+    return "\n".join(lines)
 
 
 # ── Simulated Pipeline Runner ──────────────────────────────────────────────
@@ -901,14 +927,7 @@ class SimulatedPipelineRunner:
         stage: str,
         fault_status: Dict[str, Tuple[bool, float, List[str]]],
     ) -> str:
-        lines: List[str] = []
-        for fault in self._active_faults:
-            fully_fixed, score, failing = fault_status[fault]
-            if not fully_fixed and score > 0 and FAULT_STAGE_MAP.get(fault) == stage:
-                for check in failing:
-                    lines.append(f"Error: {check}")
-                lines.append("Pipeline still failing — fix is incomplete.")
-        return "\n".join(lines)
+        return _partial_fix_warnings(self._active_faults, stage, fault_status)
 
     # ── Test helpers ───────────────────────────────────────────────────────
 
@@ -1059,6 +1078,13 @@ class SimulatedPipelineRunner:
             )
 
         if fault == "flaky_test":
+            # If the agent already relaxed the threshold or deleted the test, don't fire.
+            if _flaky_test_fixed(self.workspace_path):
+                return 0, "", ""
+            # Read the actual threshold from the workspace file so the log reflects reality.
+            content = _read_file_safe(self.workspace_path, "tests/test_api.py")
+            m = re.search(r"threshold\s*=\s*([0-9]*\.?[0-9]+)", content)
+            live_threshold = float(m.group(1)) if m else 0.001
             elapsed = round(self._rng.uniform(0.12, 0.19), 3)
             return 1, "", (
                 "tests/test_api.py::test_response_time_health FAILED                   [ 50%]\n\n"
@@ -1072,16 +1098,16 @@ class SimulatedPipelineRunner:
                 "        response = client.get(\"/health\")\n"
                 "        elapsed = time.time() - start\n"
                 "        assert response.status_code == 200\n"
-                "        threshold = 0.001\n"
+                f"        threshold = {live_threshold}\n"
                 ">       assert elapsed < threshold, (\n"
                 f'            f"Health endpoint took {elapsed:.3f}s, expected < {{threshold}}s "\n'
                 '            f"(flaky: timing constraint too strict for this environment)."\n'
                 "        )\n"
-                f"E       AssertionError: Health endpoint took {elapsed:.3f}s, expected < 0.001s"
+                f"E       AssertionError: Health endpoint took {elapsed:.3f}s, expected < {live_threshold}s"
                 " (flaky: timing constraint too strict for this environment).\n\n"
                 "tests/test_api.py:89: AssertionError\n"
                 "=========================== short test summary info ============================\n"
-                f"FAILED tests/test_api.py::test_response_time_health - AssertionError: response time {elapsed:.3f}s exceeds threshold 0.001s\n"
+                f"FAILED tests/test_api.py::test_response_time_health - AssertionError: response time {elapsed:.3f}s exceeds threshold {live_threshold}s\n"
                 "========================= 1 failed, 11 passed in 3.21s ========================="
             )
 

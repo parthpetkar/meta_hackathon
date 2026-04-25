@@ -309,17 +309,27 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
         if recall_optimal_path is not None:
             prior_path = recall_optimal_path(fault_type)
             if prior_path:
+                mem = recall(initial_surfaced_errors, fault_type) if recall is not None else {}
+                _path_confidence_high = float(mem.get("historical_success_rate", 0.0)) >= 1.0
                 path_lines = "\n".join(
                     f"  {i+1}. [{s['operation']}] target={s.get('target','') or '—'}  "
                     f"{'value=' + repr(s['value'][:60]) + '  ' if s.get('value') else ''}"
                     f"→ {s.get('rationale', '')}"
                     for i, s in enumerate(prior_path)
                 )
-                optimal_path_hint = (
-                    f"Optimal path learned from a prior successful episode for fault_type={fault_type}:\n"
-                    f"{path_lines}\n"
-                    "Follow this sequence closely — it resolved the incident efficiently."
-                )
+                if _path_confidence_high:
+                    optimal_path_hint = (
+                        f"HIGH-CONFIDENCE memory hit for fault_type={fault_type} (100% success rate).\n"
+                        "Skip view_logs, inspect_config, and inspect_dockerfile — go directly to:\n"
+                        f"{path_lines}\n"
+                        "Do NOT inspect files first. Apply the fix, rerun_pipeline, verify_fix, finalize."
+                    )
+                else:
+                    optimal_path_hint = (
+                        f"Optimal path learned from a prior successful episode for fault_type={fault_type}:\n"
+                        f"{path_lines}\n"
+                        "Follow this sequence closely — it resolved the incident efficiently."
+                    )
 
         task_intro = f"Task: {task_title}\n\n{format_obs_for_llm(observation, 0)}"
         if memory_hint:
@@ -816,20 +826,34 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
         log_memory(memory_log)
 
     optimal_path_hint = ""
+    memory_confidence_high = False
     if recall_optimal_path is not None and fault_injected != "unknown":
         prior_path = recall_optimal_path(fault_injected)
         if prior_path:
+            # Check if the stored fix has a 1.0 success rate in the recall memory.
+            mem = recall([fault_injected], fault_injected) if recall is not None else {}
+            memory_confidence_high = float(mem.get("historical_success_rate", 0.0)) >= 1.0
+
             path_lines = "\n".join(
                 f"  {i+1}. [{s['operation']}] target={s.get('target','') or '—'}  "
                 f"{'value=' + repr(s['value'][:60]) + '  ' if s.get('value') else ''}"
                 f"→ {s.get('rationale', '')}"
                 for i, s in enumerate(prior_path)
             )
-            optimal_path_hint = (
-                f"Optimal path learned from a prior successful episode for fault_type={fault_injected}:\n"
-                f"{path_lines}\n"
-                "Follow this sequence closely — it resolved the incident efficiently."
-            )
+            if memory_confidence_high:
+                optimal_path_hint = (
+                    f"HIGH-CONFIDENCE memory hit for fault_type={fault_injected} (100% success rate).\n"
+                    "Skip list_files and all read_file steps — go directly to the fix using this exact sequence:\n"
+                    f"{path_lines}\n"
+                    "Do NOT read Dockerfile, docker-compose.yml, or requirements.txt first. "
+                    "Apply the write_file fix, trigger_pipeline, then finalize."
+                )
+            else:
+                optimal_path_hint = (
+                    f"Optimal path learned from a prior successful episode for fault_type={fault_injected}:\n"
+                    f"{path_lines}\n"
+                    "Follow this sequence closely — it resolved the incident efficiently."
+                )
             print(f"[MEMORY] Recalled optimal path for fault_type={fault_injected} ({len(prior_path)} steps)", flush=True)
 
     task_intro = (

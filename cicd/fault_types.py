@@ -34,7 +34,7 @@ FAULT_TYPES: List[str] = [
 ]
 
 FAULT_STAGE_MAP: Dict[str, str] = {
-    "merge_conflict":      "test",
+    "merge_conflict":      "build",
     "dependency_conflict": "build",
     "docker_order":        "build",
     "flaky_test":          "test",
