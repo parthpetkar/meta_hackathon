@@ -158,6 +158,8 @@ class EpisodeState:
     delayed_reward: float = 0.0
     rubric_judge_used: bool = False
     rubric_judge_error: str = ""
+    step_prm_scores: List[float] = field(default_factory=list)
+    step_reward_trace: List[Dict[str, Any]] = field(default_factory=list)
 
     used_inspections: Set[str] = field(default_factory=set)
 
@@ -502,27 +504,26 @@ class SimulatedCICDRepairEnvironment(Environment):
             episode.redundant_actions += 1
         episode.action_keys.add(action_key)
 
-        reward = 0.0
         finalize_blocked = operation == "finalize" and not episode.verified_for_latest_rerun
 
         if operation == "view_logs":
-            reward = self._handle_view_logs(episode, target)
+            self._handle_view_logs(episode, target)
         elif operation == "inspect_config":
-            reward = self._handle_inspect_config(episode, target)
+            self._handle_inspect_config(episode, target)
         elif operation == "inspect_dockerfile":
-            reward = self._handle_inspect_dockerfile(episode)
+            self._handle_inspect_dockerfile(episode)
         elif operation == "inspect_permissions":
-            reward = self._handle_inspect_permissions(episode, target)
+            self._handle_inspect_permissions(episode, target)
         elif operation == "set_hypothesis":
-            reward = self._handle_set_hypothesis(episode, value)
+            self._handle_set_hypothesis(episode, value)
         elif operation in ("modify_config", "add_dependency"):
-            reward = self._handle_modify(episode, operation, target, value)
+            self._handle_modify(episode, operation, target, value)
         elif operation == "rerun_pipeline":
-            reward = self._handle_rerun_pipeline(episode)
+            self._handle_rerun_pipeline(episode)
         elif operation == "verify_fix":
-            reward = self._handle_verify_fix(episode)
+            self._handle_verify_fix(episode)
         elif operation == "finalize":
-            reward = self._handle_finalize(episode)
+            self._handle_finalize(episode)
 
         if episode.adversarial_scenario is not None and not finalize_blocked:
             phase_bonus, phase_note = self._adv_judge.score_step(
@@ -531,14 +532,8 @@ class SimulatedCICDRepairEnvironment(Environment):
                 scenario=episode.adversarial_scenario,
                 history=episode.history,
             )
-            reward += phase_bonus
             if phase_note:
-                episode.findings.append(f"[Judge] {phase_note}")
-
-        if was_redundant and not finalize_blocked:
-            reward = min(reward, -0.08)
-        if finalize_blocked:
-            reward = -0.05
+                episode.findings.append(f"[Judge] {phase_note} (legacy bonus suppressed: {phase_bonus:+.2f})")
 
         done = False
         fault_type_for_steps = episode.fault_metadata.fault_type if episode.fault_metadata else "unknown"
@@ -550,6 +545,31 @@ class SimulatedCICDRepairEnvironment(Environment):
         elif self._state.step_count >= max_steps:
             done = True
 
+        reward, step_trace = self._score_step_reward(
+            episode,
+            operation=operation,
+            target=target,
+            value=value,
+            was_redundant=was_redundant,
+            finalize_blocked=finalize_blocked,
+        )
+        episode.step_prm_scores.append(step_trace["raw_score"])
+        episode.step_reward_trace.append(step_trace)
+        episode.findings.append(
+            f"[PRM] step={step_trace['step']} action={operation} raw={step_trace['raw_score']:.3f} "
+            f"reward={step_trace['reward']:+.3f} rationale={step_trace['rationale']}"
+        )
+        logger.info(
+            "[PRM] episode=%s step=%s action=%s raw=%.3f reward=%+.3f source=%s rationale=%s",
+            episode.episode_id,
+            step_trace["step"],
+            operation,
+            step_trace["raw_score"],
+            step_trace["reward"],
+            step_trace["source"],
+            step_trace["rationale"],
+        )
+
         obs_dict = self._build_step_observation(episode, reward, done)
         return self._dict_to_observation(obs_dict)
 
@@ -559,7 +579,7 @@ class SimulatedCICDRepairEnvironment(Environment):
 
     # ── Action handlers ──────────────────────────────────────────────────────
 
-    def _handle_view_logs(self, ep: EpisodeState, target: str) -> float:
+    def _handle_view_logs(self, ep: EpisodeState, target: str) -> None:
         stage = target.lower() if target else ""
         ep.used_inspections.add("view_logs")
         ep.inspected_since_last_rerun = True
@@ -574,13 +594,9 @@ class SimulatedCICDRepairEnvironment(Environment):
                     log_text = build_stage_log_response(ep.pipeline_result, failed_stage)
                     ep.findings.append(f"Logs for failed stage '{failed_stage}':\n{log_text[:300]}")
 
-        if ep.fault_metadata and stage == ep.fault_metadata.expected_fail_stage:
-            return 0.12
-        elif stage and ep.pipeline_result and stage == ep.pipeline_result.failed_stage:
-            return 0.12
-        return -0.05
+        return
 
-    def _handle_inspect_config(self, ep: EpisodeState, target: str) -> float:
+    def _handle_inspect_config(self, ep: EpisodeState, target: str) -> None:
         ep.used_inspections.add("inspect_config")
         ep.inspected_since_last_rerun = True
 
@@ -604,24 +620,16 @@ class SimulatedCICDRepairEnvironment(Environment):
             else:
                 ep.findings.append(f"Config file '{filename}':\n{content[:400]}")
 
-        if ep.fault_metadata:
-            relevant_files = set(ep.fault_metadata.affected_files)
-            if relevant_files & set(configs.keys()):
-                return 0.12
-        return -0.05
+        return
 
-    def _handle_inspect_dockerfile(self, ep: EpisodeState) -> float:
+    def _handle_inspect_dockerfile(self, ep: EpisodeState) -> None:
         ep.used_inspections.add("inspect_dockerfile")
         ep.inspected_since_last_rerun = True
         content = read_workspace_file(ep.workspace_dir, "Dockerfile")
         ep.findings.append(f"Dockerfile content:\n{content[:300]}")
-        if ep.fault_metadata and "Dockerfile" in ep.fault_metadata.affected_files:
-            return 0.12
-        elif ep.fault_metadata and ep.fault_metadata.fault_type == "docker_order":
-            return 0.12
-        return -0.05
+        return
 
-    def _handle_inspect_permissions(self, ep: EpisodeState, target: str) -> float:
+    def _handle_inspect_permissions(self, ep: EpisodeState, target: str) -> None:
         ep.used_inspections.add("inspect_permissions")
         ep.inspected_since_last_rerun = True
         files_to_check = ["Dockerfile", "docker-compose.yml", "services/api/app.py"]
@@ -635,17 +643,15 @@ class SimulatedCICDRepairEnvironment(Environment):
                     ep.findings.append(f"File '{filepath}': mode={oct(stat.st_mode)} size={stat.st_size}B")
                 except OSError as e:
                     ep.findings.append(f"Cannot stat '{filepath}': {e}")
-        if ep.fault_metadata and ep.fault_metadata.fault_type == "missing_permission":
-            return 0.12
-        return -0.05
+        return
 
-    def _handle_set_hypothesis(self, ep: EpisodeState, value: str) -> float:
+    def _handle_set_hypothesis(self, ep: EpisodeState, value: str) -> None:
         ep.current_hypothesis = value
         ep.hypothesis_history.append(value)
         ep.hypothesis_attempts += 1
 
         if not ep.fault_metadata:
-            return -0.10
+            return
 
         hypothesis_lower = value.lower()
 
@@ -668,20 +674,14 @@ class SimulatedCICDRepairEnvironment(Environment):
         if match_count >= 1 or file_mentioned:
             ep.hypothesis_correct = True
             ep.findings.append(f"Hypothesis partially aligns (matched {match_count}/{len(keywords)} keywords). Apply the fix.")
-            if ep.hypothesis_attempts == 1:
-                difficulty_scale = min(1.5, max(1.0, len(keywords) / 4.0))
-                base_high = round(min(0.25, 0.18 * difficulty_scale), 3)
-                base_low  = round(min(0.18, 0.12 * difficulty_scale), 3)
-                return base_high if match_ratio >= 0.4 else base_low
-            difficulty_scale = min(1.4, max(1.0, len(keywords) / 4.0))
-            return round(min(0.12, 0.08 * difficulty_scale), 3) if match_ratio >= 0.4 else round(min(0.08, 0.05 * difficulty_scale), 3)
+            return
         else:
             root_fault = ep.fault_metadata.fault_type
             hint_keywords = FAULT_KEYWORDS.get(root_fault, keywords)
             ep.findings.append("Hypothesis does not match current evidence. Try mentioning: " + ", ".join(hint_keywords))
-            return -0.10
+            return
 
-    def _handle_modify(self, ep: EpisodeState, operation: str, target: str, value: str) -> float:
+    def _handle_modify(self, ep: EpisodeState, operation: str, target: str, value: str) -> None:
         ep.attempted_fix = value
         ep.verified_for_latest_rerun = False
 
@@ -691,7 +691,7 @@ class SimulatedCICDRepairEnvironment(Environment):
             ep.recovery_cost += 4
             ep.pending_fix_outcome = "destructive"
             ep.findings.append("Unsafe fix worsened system stability and increased recovery cost.")
-            return -0.30
+            return
 
         fault_type = ep.fault_metadata.fault_type if ep.fault_metadata else ""
         fix_result = apply_fix_simulated(ep.workspace_dir, value, target, fault_type=fault_type)
@@ -710,9 +710,9 @@ class SimulatedCICDRepairEnvironment(Environment):
             ep.wrong_fixes += 1
             ep.pipeline_health = max(0.0, ep.pipeline_health - 0.10)
             ep.recovery_cost += 2
-            return -0.15
+            return
 
-    def _handle_rerun_pipeline(self, ep: EpisodeState) -> float:
+    def _handle_rerun_pipeline(self, ep: EpisodeState) -> None:
         ep.recovery_cost += 1
         ep.verified_for_latest_rerun = False
         ep.inspected_since_last_rerun = False
@@ -720,7 +720,7 @@ class SimulatedCICDRepairEnvironment(Environment):
 
         if not ep.pipeline_runner:
             ep.findings.append("No pipeline runner available for rerun.")
-            return -0.10
+            return
 
         old_status = str(ep.pipeline_result.status) if ep.pipeline_result else SimPipelineStatus.FAILED
         old_failed_stage = ep.pipeline_result.failed_stage if ep.pipeline_result else ""
@@ -776,39 +776,39 @@ class SimulatedCICDRepairEnvironment(Environment):
                 ep.findings.append(
                     "Pipeline progressed but is not yet passing. Call verify_fix next."
                 )
-            return 0.18
-        return 0.05
+            return
+        return
 
-    def _handle_verify_fix(self, ep: EpisodeState) -> float:
+    def _handle_verify_fix(self, ep: EpisodeState) -> None:
         if not ep.pipeline_result:
             ep.findings.append("No pipeline run to verify.")
-            return -0.06
+            return
         if ep.verified_for_latest_rerun:
             ep.findings.append("Latest rerun is already verified.")
-            return -0.06
+            return
         if ep.rerun_attempts == 0:
             ep.findings.append("Cannot verify: run rerun_pipeline after applying a fix before calling verify_fix.")
-            return -0.06
+            return
         if str(ep.pipeline_result.status) == SimPipelineStatus.PASSED:
             ep.incident_resolved = True
             ep.verified_for_latest_rerun = True
             ep.findings.append("VERIFIED: fix resolved the incident. Call finalize now.")
-            return 0.16
+            return
         elif ep.last_rerun_progressed:
             ep.verified_for_latest_rerun = True
             ep.findings.append("Verification confirms partial progress.")
-            return 0.08
+            return
         else:
             ep.findings.append("Verification failed: pipeline still shows unresolved failures.")
-            return -0.06
+            return
 
-    def _handle_finalize(self, ep: EpisodeState) -> float:
+    def _handle_finalize(self, ep: EpisodeState) -> None:
         if not ep.verified_for_latest_rerun:
             ep.findings.append("Run verify_fix before finalize")
-            return -0.05
+            return
         if ep.rerun_attempts == 0:
             ep.findings.append("Finalize without running rerun_pipeline — no terminal bonus awarded.")
-            return 0.05
+            return
         pipeline_passed = (
             ep.pipeline_result is not None
             and str(ep.pipeline_result.status) == SimPipelineStatus.PASSED
@@ -819,8 +819,8 @@ class SimulatedCICDRepairEnvironment(Environment):
             pipeline_passed=pipeline_passed,
             cascading_fault_count=len(ep.cascading_faults),
         )
-        ep.findings.append(f"[Judge] terminal: {note}")
-        return bonus
+        ep.findings.append(f"[Judge] terminal: {note} (legacy bonus suppressed: {bonus:+.2f})")
+        return
 
     # ── Scenario injection helpers ──────────────────────────────────────────
 
@@ -881,23 +881,12 @@ class SimulatedCICDRepairEnvironment(Environment):
         if done:
             deterministic_score = self._compute_final_score(ep)
             final_score = deterministic_score
-            if self._rubric_judge.is_active():
-                try:
-                    judge_result = self._rubric_judge.evaluate_hypothesis_quality(
-                        self._build_rubric_payload(ep, fault_type, difficulty)
-                    )
-                    rubric_score = float(judge_result.score)
-                    final_score = round(
-                        ((1.0 - self._rubric_weight) * deterministic_score)
-                        + (self._rubric_weight * rubric_score),
-                        3,
-                    )
-                    delayed_reward = round(final_score - deterministic_score, 3)
-                    reward = round(reward + delayed_reward, 3)
-                    rubric_judge_used = not judge_result.used_fallback
-                    rubric_judge_error = str(judge_result.error or "")
-                except Exception as exc:
-                    rubric_judge_error = f"Rubric judge failed: {exc}"
+            rubric_score = round(sum(ep.step_prm_scores) / max(1, len(ep.step_prm_scores)), 3)
+            delayed_reward = round(final_score - rubric_score, 3)
+            reward = round(reward + delayed_reward, 3)
+            rubric_judge_used = any(not item.get("used_fallback", True) for item in ep.step_reward_trace)
+            rubric_errors = [str(item.get("error", "")).strip() for item in ep.step_reward_trace if str(item.get("error", "")).strip()]
+            rubric_judge_error = " | ".join(rubric_errors[-3:])
 
             ep.deterministic_score = deterministic_score
             ep.rubric_score = rubric_score
@@ -934,7 +923,7 @@ class SimulatedCICDRepairEnvironment(Environment):
             deterministic_score=deterministic_score,
             rubric_score=rubric_score,
             delayed_reward=delayed_reward,
-            rubric_blend_weight=self._rubric_weight if self._rubric_judge.is_active() else 0.0,
+            rubric_blend_weight=1.0,
             rubric_judge_used=rubric_judge_used,
             rubric_judge_error=rubric_judge_error,
             findings=ep.findings[-10:],
@@ -948,6 +937,8 @@ class SimulatedCICDRepairEnvironment(Environment):
                 "supported_operations": CANONICAL_OPERATIONS,
                 "canonical_operations": CANONICAL_OPERATIONS,
                 "rubric_enabled": self._rubric_judge.is_active(),
+                "reward_model": "process_reward_model",
+                "reward_trace": ep.step_reward_trace[-12:],
                 "simulated": True,
             },
         )
@@ -985,38 +976,136 @@ class SimulatedCICDRepairEnvironment(Environment):
             },
         }
 
+    def _build_step_reward_payload(
+        self,
+        ep: EpisodeState,
+        *,
+        operation: str,
+        target: str,
+        value: str,
+        was_redundant: bool,
+        finalize_blocked: bool,
+    ) -> dict:
+        relevant_targets: List[str] = []
+        if ep.fault_metadata:
+            relevant_targets.extend(ep.fault_metadata.affected_files)
+            if ep.fault_metadata.expected_fail_stage:
+                relevant_targets.append(ep.fault_metadata.expected_fail_stage)
+
+        pipeline_passed = (
+            ep.pipeline_result is not None
+            and str(ep.pipeline_result.status) == SimPipelineStatus.PASSED
+        )
+
+        return {
+            "task_id": ep.episode_id,
+            "difficulty": self._get_difficulty(ep.fault_metadata.fault_type if ep.fault_metadata else "unknown"),
+            "current_action": {
+                "operation": operation,
+                "target": target,
+                "value": value,
+                "step": self._state.step_count,
+            },
+            "prior_context": {
+                "history": ep.history[-8:],
+                "was_redundant": was_redundant,
+                "finalize_blocked": finalize_blocked,
+                "pending_fix_outcome": ep.pending_fix_outcome,
+                "last_rerun_progressed": ep.last_rerun_progressed,
+                "verified_for_latest_rerun": ep.verified_for_latest_rerun,
+                "rerun_attempts": ep.rerun_attempts,
+                "hypothesis_correct": ep.hypothesis_correct,
+                "incident_resolved": ep.incident_resolved,
+                "errors_stale_after_fix": ep.errors_stale_after_fix,
+                "has_recent_evidence": bool(ep.findings),
+                "destructive_action": self._is_destructive_fix(value),
+                "pipeline_passed": pipeline_passed,
+            },
+            "evidence": {
+                "findings": ep.findings[-10:],
+                "surfaced_errors": build_surfaced_errors(ep.pipeline_result, ep.workspace_dir) if ep.pipeline_result else [],
+                "fault_keywords": ep.fault_metadata.keywords if ep.fault_metadata else [],
+                "relevant_targets": relevant_targets,
+                "hypothesis_history": ep.hypothesis_history[-8:],
+                "attempted_fix": ep.attempted_fix,
+            },
+            "rubric": {
+                "reasoning_quality": "The action should be justified by evidence and a coherent diagnosis.",
+                "coherence": "The action should logically follow earlier steps and current state.",
+                "evidence_use": "The action should make use of surfaced errors, findings, or known fault context.",
+                "anti_exploitation": "Premature rerun, verify, finalize, or redundant loops should score poorly unless clearly justified.",
+            },
+        }
+
+    def _score_step_reward(
+        self,
+        ep: EpisodeState,
+        *,
+        operation: str,
+        target: str,
+        value: str,
+        was_redundant: bool,
+        finalize_blocked: bool,
+    ) -> tuple[float, Dict[str, Any]]:
+        payload = self._build_step_reward_payload(
+            ep,
+            operation=operation,
+            target=target,
+            value=value,
+            was_redundant=was_redundant,
+            finalize_blocked=finalize_blocked,
+        )
+        judge_result = self._rubric_judge.evaluate_action_quality(payload)
+        raw_score = max(0.0, min(1.0, float(judge_result.score)))
+        reward = round((raw_score - 0.5) * 0.5, 3)
+        if finalize_blocked:
+            reward = min(reward, -0.15)
+        trace = {
+            "step": self._state.step_count,
+            "operation": operation,
+            "target": target,
+            "value": value,
+            "raw_score": round(raw_score, 3),
+            "reward": reward,
+            "rationale": str(judge_result.rationale or "").strip() or "semantic PRM score",
+            "source": judge_result.source,
+            "used_fallback": judge_result.used_fallback,
+            "error": str(judge_result.error or ""),
+        }
+        return reward, trace
+
     def _compute_final_score(self, ep: EpisodeState) -> float:
-        score = 0.0
+        if not ep.step_prm_scores:
+            return 0.0
+
+        weighted_total = 0.0
+        weight_sum = 0.0
+        for item in ep.step_reward_trace:
+            op = str(item.get("operation", ""))
+            weight = 1.0
+            if op in {"modify_config", "add_dependency", "rerun_pipeline", "verify_fix", "finalize"}:
+                weight = 1.2
+            if float(item.get("raw_score", 0.0) or 0.0) < 0.35:
+                weight += 0.1
+            weighted_total += float(item.get("raw_score", 0.0) or 0.0) * weight
+            weight_sum += weight
+
+        score = weighted_total / max(weight_sum, 1.0)
+        success_bonus = 0.0
+        if ep.incident_resolved and ep.verified_for_latest_rerun:
+            success_bonus = 0.08
+        elif ep.last_rerun_progressed:
+            success_bonus = 0.03
+
+        penalty = min(0.25, (ep.redundant_actions * 0.04) + (ep.destructive_actions * 0.12) + (ep.wrong_fixes * 0.05))
+        score = (score - penalty) * ep.pipeline_health
+
         genuine_work = ep.fix_hits > 0 and ep.rerun_attempts > 0
-
-        if genuine_work and ep.incident_resolved and ep.verified_for_latest_rerun:
-            score += 0.50
-        elif genuine_work and ep.incident_resolved:
-            score += 0.30
-        elif genuine_work and ep.last_rerun_progressed:
-            score += 0.20
-
-        if ep.hypothesis_correct:
-            score += 0.15
-        if ep.fix_hits > 0:
-            score += 0.10
-
-        step_count = self._state.step_count
-        fault_type_eff = ep.fault_metadata.fault_type if ep.fault_metadata else "medium"
-        cascade_count_eff = len(ep.cascading_faults) if ep.cascading_faults else 0
-        max_steps = self._get_max_steps(fault_type_eff, cascade_count=cascade_count_eff)
-        efficiency = max(0.0, 1.0 - (step_count / max_steps))
-        score += efficiency * 0.10
-
-        score -= ep.redundant_actions * 0.02
-        score -= ep.destructive_actions * 0.10
-        score -= ep.wrong_fixes * 0.05
-        score *= ep.pipeline_health
-
         if not genuine_work:
-            score = min(score, 0.15)
+            score = min(score, 0.45)
+            success_bonus = 0.0
 
-        return round(max(0.0, min(1.0, score)), 3)
+        return round(max(0.0, min(1.0, score + success_bonus)), 3)
 
     def _dict_to_observation(self, obs_dict: dict) -> MetaHackathonObservation:
         return MetaHackathonObservation(**obs_dict)
