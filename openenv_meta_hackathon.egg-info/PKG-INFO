@@ -8,6 +8,7 @@ Requires-Dist: pytest>=9.0.2
 Requires-Dist: python-dotenv>=1.2.2
 Requires-Dist: requests>=2.31.0
 Requires-Dist: openai>=1.30.0
+Requires-Dist: pyyaml>=6.0.2
 Requires-Dist: websockets>=12.0
 Requires-Dist: uvicorn[standard]>=0.24.0
 Provides-Extra: dev

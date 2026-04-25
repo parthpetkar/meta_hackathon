@@ -46,6 +46,9 @@ def inject_fault_simulated(workspace: str, fault_type: str) -> FaultMetadata:
         "log_disabled":        _inject_log_disabled,
         "bad_migration_sql":   _inject_bad_migration_sql,
         "schema_drift":        _inject_schema_drift,
+        "terraform_invalid_provider": _inject_terraform_invalid_provider,
+        "terraform_missing_variable": _inject_terraform_missing_variable,
+        "terraform_permission_denied": _inject_terraform_permission_denied,
     }
     if fault_type not in injectors:
         raise ValueError(f"Unknown fault type: {fault_type!r}. Valid: {list(injectors)}")
@@ -426,4 +429,80 @@ def _inject_schema_drift(workspace: str) -> FaultMetadata:
         fault_type="schema_drift",
         affected_files=["db/database.py"],
         description="CANONICAL_COLUMNS includes 'artifact_url' but no migration adds it",
+    )
+
+
+def _inject_terraform_invalid_provider(workspace: str) -> FaultMetadata:
+    infra_dir = os.path.join(workspace, "infra")
+    os.makedirs(infra_dir, exist_ok=True)
+    path = os.path.join(infra_dir, "main.tf")
+    _write(path, textwrap.dedent("""\
+        terraform {
+          required_version = ">= 1.6.0"
+        }
+
+        provider "invalidcorp" {}
+
+        resource "invalid_resource" "demo" {}
+    """))
+    return FaultMetadata(
+        fault_type="terraform_invalid_provider",
+        affected_files=["infra/main.tf"],
+        description="Terraform provider block uses an invalid provider source so init fails.",
+    )
+
+
+def _inject_terraform_missing_variable(workspace: str) -> FaultMetadata:
+    infra_dir = os.path.join(workspace, "infra")
+    os.makedirs(infra_dir, exist_ok=True)
+    main_tf = os.path.join(infra_dir, "main.tf")
+    vars_tf = os.path.join(infra_dir, "variables.tf")
+    tfvars = os.path.join(infra_dir, "terraform.tfvars")
+    _write(main_tf, textwrap.dedent("""\
+        provider "aws" {
+          region = var.region
+        }
+
+        resource "aws_s3_bucket" "artifacts" {
+          bucket = "${var.project_name}-artifacts"
+        }
+    """))
+    _write(vars_tf, textwrap.dedent("""\
+        variable "region" {
+          type = string
+        }
+
+        variable "project_name" {
+          type = string
+        }
+    """))
+    _write(tfvars, "")
+    return FaultMetadata(
+        fault_type="terraform_missing_variable",
+        affected_files=["infra/main.tf", "infra/variables.tf", "infra/terraform.tfvars"],
+        description="Terraform plan lacks required variable values in terraform.tfvars.",
+    )
+
+
+def _inject_terraform_permission_denied(workspace: str) -> FaultMetadata:
+    infra_dir = os.path.join(workspace, "infra")
+    os.makedirs(infra_dir, exist_ok=True)
+    path = os.path.join(infra_dir, "main.tf")
+    _write(path, textwrap.dedent("""\
+        provider "aws" {
+          region = "us-east-1"
+        }
+
+        locals {
+          simulate_permission_denied = true
+        }
+
+        resource "aws_iam_role" "deployer" {
+          name = "simulated-deployer-role"
+        }
+    """))
+    return FaultMetadata(
+        fault_type="terraform_permission_denied",
+        affected_files=["infra/main.tf"],
+        description="Terraform apply is configured to simulate IAM AccessDenied errors.",
     )

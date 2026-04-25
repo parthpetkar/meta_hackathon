@@ -31,7 +31,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from models import AdversarialCICDScenario
@@ -50,6 +50,13 @@ from cicd.simulated_runner import (
     _run_log_config_check,
     _partial_fix_warnings,
 )
+from cicd.github_actions_simulator import (
+    STAGE_ORDER as WORKFLOW_STAGE_ORDER,
+    discover_workflow_files,
+    execute_workflow_stage,
+    parse_workflow_file,
+)
+from cicd.terraform_simulator import has_terraform_config, simulate_terraform_pipeline
 
 
 # ── venv path helper ───────────────────────────────────────────────────────
@@ -178,6 +185,8 @@ class SubprocessPipelineRunner:
         self._venv_dir = os.path.join(episode_root, "venv")
         self._venv_ready = False
         self._git_initialised = False
+        self._workflow_loaded = False
+        self._workflow: Optional[Any] = None
 
     # ── Cleanup ────────────────────────────────────────────────────────────
 
@@ -280,6 +289,11 @@ class SubprocessPipelineRunner:
         active_faults: List[str],
         fault_status: Dict,
     ) -> Tuple[int, str, str, str]:
+        workflow_stage = self._try_workflow_stage(stage_name, ws)
+        if workflow_stage is not None:
+            exit_code, stdout, stderr = workflow_stage
+            return exit_code, stdout, stderr, f"github-actions-stage:{stage_name}"
+
         if stage_name == "clone":
             exit_code, stdout, stderr = self._stage_clone(ws)
             return exit_code, stdout, stderr, "git log --oneline -5"
@@ -293,6 +307,34 @@ class SubprocessPipelineRunner:
             exit_code, stdout, stderr = self._stage_deploy(ws, active_faults, fault_status)
             return exit_code, stdout, stderr, "uvicorn services.api.app:app --host 127.0.0.1 --port 0"
         return 1, "", f"Unknown stage: {stage_name}", ""
+
+    def _try_workflow_stage(
+        self,
+        stage_name: str,
+        workspace_path: str,
+    ) -> Optional[Tuple[int, str, str]]:
+        if stage_name not in WORKFLOW_STAGE_ORDER:
+            return None
+        workflow = self._load_workflow(workspace_path)
+        if workflow is None:
+            return None
+        return execute_workflow_stage(
+            workflow=workflow,
+            stage_name=stage_name,
+            workspace_path=workspace_path,
+            base_env={},
+        )
+
+    def _load_workflow(self, workspace_path: str):
+        if self._workflow_loaded:
+            return self._workflow
+        self._workflow_loaded = True
+        for workflow_file in discover_workflow_files(workspace_path):
+            parsed = parse_workflow_file(workflow_file)
+            if parsed is not None:
+                self._workflow = parsed
+                break
+        return self._workflow
 
     # ── Stage: clone ───────────────────────────────────────────────────────
 
@@ -400,6 +442,21 @@ class SubprocessPipelineRunner:
         fault_status: Dict,
     ) -> Tuple[int, str, str]:
         warnings = _partial_fix_warnings(self._active_faults, "deploy", fault_status)
+        if has_terraform_config(ws):
+            tf_code, tf_out, tf_err = simulate_terraform_pipeline(ws)
+            if tf_code != 0:
+                if warnings and tf_err:
+                    tf_err = warnings + "\n" + tf_err
+                elif warnings:
+                    tf_err = warnings
+                return 1, tf_out, tf_err
+            if tf_out:
+                # IaC runs before application startup checks so state changes are visible.
+                tf_prefix = tf_out + "\n\n"
+            else:
+                tf_prefix = ""
+        else:
+            tf_prefix = ""
 
         python = _venv_python(self._venv_dir)
         if not os.path.exists(python):
@@ -473,6 +530,7 @@ class SubprocessPipelineRunner:
 
         if startup_ok:
             stdout = (
+                tf_prefix +
                 captured_err + captured_out +
                 "\nINFO:     Application startup complete.\n"
                 "Deploy probe: startup successful — all services healthy."

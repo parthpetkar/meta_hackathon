@@ -262,6 +262,9 @@ _FAULT_FIX_MAP = {
     "log_disabled":        lambda ws: _fix_log_disabled(ws),
     "bad_migration_sql":   lambda ws: _fix_bad_migration_sql(ws),
     "schema_drift":        lambda ws: _fix_schema_drift(ws),
+    "terraform_invalid_provider": lambda ws: _fix_terraform_invalid_provider(ws),
+    "terraform_missing_variable": lambda ws: _fix_terraform_missing_variable(ws),
+    "terraform_permission_denied": lambda ws: _fix_terraform_permission_denied(ws),
 }
 
 _FAULT_FIX_DESCRIPTIONS = {
@@ -282,6 +285,9 @@ _FAULT_FIX_DESCRIPTIONS = {
     "log_disabled":        "Restored LOG_LEVEL to INFO from CRITICAL",
     "bad_migration_sql":   "Fixed SQL syntax error in migration file",
     "schema_drift":        "Aligned CANONICAL_COLUMNS with database schema",
+    "terraform_invalid_provider": "Replaced invalid Terraform provider with supported provider",
+    "terraform_missing_variable": "Supplied required Terraform variable values",
+    "terraform_permission_denied": "Removed Terraform permission-denied simulation flag",
 }
 
 
@@ -360,6 +366,15 @@ def _apply_heuristic_fix(workspace: str, fix_text: str, target: str = "") -> Fix
     elif any(kw in fix_lower for kw in ["none config", "feature_cache_backend", "none runtime"]):
         modified = _fix_none_config_runtime(workspace)
         description = "Restored concrete runtime config"
+    elif any(kw in fix_lower for kw in ["terraform provider", "invalid provider", "registry.terraform"]):
+        modified = _fix_terraform_invalid_provider(workspace)
+        description = "Replaced invalid Terraform provider"
+    elif any(kw in fix_lower for kw in ["terraform variable", "tfvars", "required variable"]):
+        modified = _fix_terraform_missing_variable(workspace)
+        description = "Added required Terraform variable values"
+    elif any(kw in fix_lower for kw in ["accessdenied", "permission denied", "iam", "terraform apply"]):
+        modified = _fix_terraform_permission_denied(workspace)
+        description = "Removed Terraform apply permission blocker"
 
     if not modified:
         return FixResult(
@@ -822,5 +837,49 @@ def _fix_schema_drift(workspace: str) -> List[str]:
     with open(path, "w", encoding="utf-8") as f:
         f.write(cleaned)
     return ["db/database.py"]
+
+
+def _fix_terraform_invalid_provider(workspace: str) -> List[str]:
+    path = os.path.join(workspace, "infra", "main.tf")
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    fixed = content.replace('provider "invalidcorp" {}', 'provider "aws" {\n  region = "us-east-1"\n}')
+    fixed = fixed.replace('resource "invalid_resource" "demo" {}', 'resource "aws_s3_bucket" "demo" {\n  bucket = "sim-demo-artifacts"\n}')
+    if fixed == content:
+        return []
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(fixed)
+    return ["infra/main.tf"]
+
+
+def _fix_terraform_missing_variable(workspace: str) -> List[str]:
+    path = os.path.join(workspace, "infra", "terraform.tfvars")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    content = 'region = "us-east-1"\nproject_name = "sample-app"\n'
+    current = ""
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            current = f.read()
+    if current == content:
+        return []
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return ["infra/terraform.tfvars"]
+
+
+def _fix_terraform_permission_denied(workspace: str) -> List[str]:
+    path = os.path.join(workspace, "infra", "main.tf")
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    fixed = re.sub(r"simulate_permission_denied\s*=\s*true", "simulate_permission_denied = false", content, flags=re.IGNORECASE)
+    if fixed == content:
+        return []
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(fixed)
+    return ["infra/main.tf"]
 
 
