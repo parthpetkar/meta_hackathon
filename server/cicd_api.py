@@ -252,9 +252,13 @@ class CICDAPIState:
                 stage_logs = stage_result.stdout
                 if stage_result.stderr:
                     stage_logs = (stage_logs + "\n" + stage_result.stderr).strip()
-                log_parts.append(f"--- {stage_name}: {stage_status} ---\n{stage_logs}")
                 if stage_status == StageStatus.FAILED:
+                    # Show failing stage in full — this is the diagnostic the agent needs
+                    log_parts.append(f"--- {stage_name}: {stage_status} ---\n{stage_logs}")
                     break
+                else:
+                    # Trim passed-stage logs to a single summary line to save space
+                    log_parts.append(f"--- {stage_name}: {stage_status} ---")
             initial_failure_logs = "\n".join(log_parts)
         except Exception as exc:
             logger.warning("Pre-run pipeline failed during workspace init: %s", exc)
