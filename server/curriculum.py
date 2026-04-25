@@ -16,9 +16,9 @@ from pathlib import Path
 from typing import Dict, Optional
 
 try:
-    from cicd.fault_injector import FAULT_TYPES
+    from cicd.fault_types import FAULT_TYPES
 except ImportError:
-    from ..cicd.fault_injector import FAULT_TYPES
+    from ..cicd.fault_types import FAULT_TYPES
 
 _DB_PATH = Path(__file__).parent / "agent_memory.db"
 

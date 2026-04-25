@@ -1134,3 +1134,7 @@ def cleanup_pipeline(result: SimulatedPipelineResult) -> None:
 def cleanup_cache_image(cache_tag: str) -> None:
     """No-op cleanup for simulated pipeline (no Docker images to remove)."""
     pass
+
+
+# Type aliases for API compatibility with observation_builder and other consumers
+PipelineResult = SimulatedPipelineResult

@@ -15,7 +15,7 @@ import os
 import random
 import textwrap
 
-from cicd.fault_injector import (
+from cicd.fault_types import (
     FaultMetadata,
     FAULT_TYPES,
     FAULT_KEYWORDS,

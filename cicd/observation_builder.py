@@ -6,7 +6,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
-from .pipeline_runner import PipelineResult, PipelineStatus, StageStatus, STAGE_ORDER
+from cicd.simulated_runner import PipelineResult, PipelineStatus, StageStatus, STAGE_ORDER
 
 
 # ── Error pattern matching ─────────────────────────────────────────────────

@@ -26,7 +26,8 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 from cicd.simulated_runner import SimulatedPipelineRunner, SimulatedPipelineResult, STAGE_ORDER, StageStatus
-from cicd.fault_injector import inject_fault, FAULT_TYPES
+from cicd.fault_types import FAULT_TYPES
+from cicd.simulated_fault_injector import inject_fault_simulated as inject_fault
 
 WORKSPACE_TTL_SECONDS = 1800  # evict workspaces idle for 30 minutes
 
