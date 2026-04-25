@@ -58,12 +58,10 @@ from cicd.observation_builder import (
 from cicd.fix_applier import apply_fix, FixResult
 from cicd.procedural_generator import generate_scenario as procedural_generate_scenario, inject_procedural
 try:
-    from .rubric_judge import DEFAULT_OPENROUTER_MODEL, OpenEnvLLMJudgeAdapter
     from .curriculum import CurriculumController
     from .adversarial_designer import AdversarialDesigner
     from .adversarial_judge import AdversarialJudge
 except (ImportError, ModuleNotFoundError):
-    from server.rubric_judge import DEFAULT_OPENROUTER_MODEL, OpenEnvLLMJudgeAdapter
     from server.curriculum import CurriculumController
     from server.adversarial_designer import AdversarialDesigner
     from server.adversarial_judge import AdversarialJudge
@@ -295,26 +293,6 @@ class RealCICDRepairEnvironment(Environment):
 
         self._task_order = FAULT_TYPES
         self._task_cursor = 0
-
-        self._pipeline_timeout = int(
-            os.getenv("META_HACKATHON_PIPELINE_TIMEOUT_SECONDS", "300")
-        )
-        self._rubric_enabled = os.getenv("META_HACKATHON_RUBRIC_ENABLED", "false").strip().lower() == "true"
-        self._rubric_weight = max(
-            0.0,
-            min(1.0, float(os.getenv("META_HACKATHON_RUBRIC_WEIGHT", "0.30"))),
-        )
-        self._rubric_timeout = int(os.getenv("META_HACKATHON_RUBRIC_TIMEOUT_SECONDS", "10"))
-        self._rubric_model = (
-            os.getenv("META_HACKATHON_RUBRIC_MODEL")
-            or os.getenv("MODEL_NAME")
-            or DEFAULT_OPENROUTER_MODEL
-        )
-        self._rubric_judge = OpenEnvLLMJudgeAdapter(
-            enabled=self._rubric_enabled,
-            model_name=self._rubric_model,
-            timeout_seconds=self._rubric_timeout,
-        )
 
         # Curriculum + adversarial always active together
         self._curriculum = CurriculumController()
@@ -1103,75 +1081,133 @@ class RealCICDRepairEnvironment(Environment):
                 "verified_since_last_rerun": ep.verified_for_latest_rerun,
                 "supported_operations": CANONICAL_OPERATIONS,
                 "canonical_operations": CANONICAL_OPERATIONS,
-                "rubric_enabled": self._rubric_judge.is_active(),
+                "rubric_enabled": False,
+                "log_tokens_remaining": ep.log_tokens_remaining,
+                "log_budget_total": ep.log_budget_total,
+                "log_access_mode": "tail_only" if ep.log_tokens_remaining <= 0 else "full",
+                "last_log_access": ep.last_log_access,
+                "reward_model": "process_reward_model",
+                "reward_trace": ep.step_reward_trace[-12:],
+                "simulated": True,
             },
         )
 
-    def _build_rubric_payload(self, ep: EpisodeState, fault_type: str, difficulty: str) -> Dict[str, Any]:
-        keywords = ep.fault_metadata.keywords if ep.fault_metadata else []
-        return {
-            "task_id": f"real_{fault_type}",
-            "difficulty": difficulty,
-            "evidence": {
-                "hypothesis_history": ep.hypothesis_history[-8:],
-                "current_hypothesis": ep.current_hypothesis,
-                "findings": ep.findings[-10:],
-                "surfaced_errors": build_surfaced_errors(ep.pipeline_result or PipelineResult(), ep.workspace_dir),
-                "incident_resolved": ep.incident_resolved,
-            },
-            "incident_chain": [
-                {
-                    "true_cause": fault_type.replace("_", " "),
-                    "hypothesis_terms": keywords,
-                    "family_term_sets": [keywords[:2], keywords[2:4]] if len(keywords) >= 4 else [keywords],
-                }
-            ],
-            "rubric": {
-                "semantic_correctness": "Hypothesis should match the real fault category",
-                "evidence_alignment": "Hypothesis should align with surfaced errors and logs",
-                "completeness": "Hypothesis should reference core affected component/file",
-            },
+        if ep.errors_stale_after_fix:
+            obs["surfaced_errors"] = [
+                "[Errors from previous run — rerun pipeline to see current state]"
+            ]
+
+        return obs
+
+    def _score_step_reward(
+        self,
+        ep: EpisodeState,
+        *,
+        operation: str,
+        target: str,
+        value: str,
+        was_redundant: bool,
+        finalize_blocked: bool,
+    ) -> tuple[float, Dict[str, Any]]:
+        raw_score = 0.5
+        rationale_parts: List[str] = []
+
+        if was_redundant:
+            raw_score -= 0.20
+            rationale_parts.append("redundant action")
+
+        if operation in {"view_logs", "tail_logs", "inspect_config", "inspect_dockerfile", "inspect_permissions"}:
+            raw_score += 0.10
+            rationale_parts.append("evidence gathering")
+
+        if operation == "set_hypothesis":
+            if ep.hypothesis_correct:
+                raw_score += 0.15
+                rationale_parts.append("hypothesis aligns with fault evidence")
+            else:
+                raw_score -= 0.10
+                rationale_parts.append("hypothesis weakly supported")
+
+        if operation in {"modify_config", "add_dependency"}:
+            if self._is_destructive_fix(value):
+                raw_score -= 0.35
+                rationale_parts.append("destructive fix")
+            elif ep.pending_fix_outcome == "applied":
+                raw_score += 0.20
+                rationale_parts.append("fix applied")
+            else:
+                raw_score -= 0.10
+                rationale_parts.append("fix not applied")
+
+        if operation == "rerun_pipeline":
+            if ep.last_fix_result and ep.last_fix_result.success:
+                raw_score += 0.15
+                rationale_parts.append("validated recent fix")
+            elif not ep.inspected_since_last_rerun:
+                raw_score -= 0.15
+                rationale_parts.append("rerun without new evidence")
+
+        if operation == "verify_fix":
+            if ep.rerun_attempts == 0:
+                raw_score -= 0.25
+                rationale_parts.append("verify before rerun")
+            elif ep.last_rerun_progressed or ep.incident_resolved:
+                raw_score += 0.20
+                rationale_parts.append("verification after progress")
+
+        if operation == "finalize":
+            if finalize_blocked:
+                raw_score -= 0.35
+                rationale_parts.append("finalize before verification")
+            elif ep.verified_for_latest_rerun:
+                raw_score += 0.20
+                rationale_parts.append("properly finalized")
+
+        raw_score = max(0.0, min(1.0, raw_score))
+        reward = round((raw_score - 0.5) * 0.5, 3)
+        if finalize_blocked:
+            reward = min(reward, -0.15)
+        trace = {
+            "step": self._state.step_count,
+            "operation": operation,
+            "target": target,
+            "value": value,
+            "raw_score": round(raw_score, 3),
+            "reward": reward,
+            "rationale": "; ".join(rationale_parts) if rationale_parts else "deterministic baseline score",
+            "source": "deterministic_rule_based",
+            "used_fallback": True,
+            "error": "",
         }
+        return reward, trace
 
     def _compute_final_score(self, ep: EpisodeState) -> float:
-        """Compute final episode score from real outcomes."""
-        score = 0.0
+        if not ep.step_prm_scores:
+            return 0.0
+
+        weighted_total = 0.0
+        weight_sum = 0.0
+        for item in ep.step_reward_trace:
+            op = str(item.get("operation", ""))
+            weight = 1.0
+            if op in {"modify_config", "add_dependency", "rerun_pipeline", "verify_fix", "finalize"}:
+                weight = 1.2
+            if float(item.get("raw_score", 0.0) or 0.0) < 0.35:
+                weight += 0.1
+            weighted_total += float(item.get("raw_score", 0.0) or 0.0) * weight
+            weight_sum += weight
+
+        score = weighted_total / max(weight_sum, 1.0)
+        success_bonus = 0.0
+        if ep.incident_resolved and ep.verified_for_latest_rerun:
+            success_bonus = 0.08
+        elif ep.last_rerun_progressed:
+            success_bonus = 0.03
+
+        penalty = min(0.25, (ep.redundant_actions * 0.04) + (ep.destructive_actions * 0.12) + (ep.wrong_fixes * 0.05))
+        score = (score - penalty) * ep.pipeline_health
 
         genuine_work = ep.fix_hits > 0 and ep.rerun_attempts > 0
-
-        # Base score from resolution — only credited if real repair work happened
-        if genuine_work and ep.incident_resolved and ep.verified_for_latest_rerun:
-            score += 0.50
-        elif genuine_work and ep.incident_resolved:
-            score += 0.30
-        elif genuine_work and ep.last_rerun_progressed:
-            score += 0.20
-
-        # Hypothesis quality
-        if ep.hypothesis_correct:
-            score += 0.15
-
-        # Fix quality
-        if ep.fix_hits > 0:
-            score += 0.10
-
-        # Efficiency bonus
-        step_count = self._state.step_count
-        fault_type_eff = ep.fault_metadata.fault_type if ep.fault_metadata else "medium"
-        cascade_count_eff = len(ep.cascading_faults) if ep.cascading_faults else 0
-        max_steps = self._get_max_steps(fault_type_eff, cascade_count=cascade_count_eff)
-        efficiency = max(0.0, 1.0 - (step_count / max_steps))
-        score += efficiency * 0.10
-
-        # Penalties
-        score -= ep.redundant_actions * 0.02
-        score -= ep.destructive_actions * 0.10
-        score -= ep.wrong_fixes * 0.05
-
-        # Pipeline health factor
-        score *= ep.pipeline_health
-
-        # Hard cap when no genuine repair work was performed
         if not genuine_work:
             score = min(score, 0.15)
 
