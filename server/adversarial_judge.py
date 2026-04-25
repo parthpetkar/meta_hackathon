@@ -99,7 +99,7 @@ class AdversarialJudge:
                 (s for s in scenario.steps if s.is_root_cause), None
             )
             if root_cause_step:
-                from cicd.fault_injector import FAULT_STAGE_MAP
+                from cicd.fault_types import FAULT_STAGE_MAP
                 expected_stage = FAULT_STAGE_MAP.get(root_cause_step.fault_type, "")
                 if expected_stage and expected_stage in value.lower():
                     bonus += 0.08

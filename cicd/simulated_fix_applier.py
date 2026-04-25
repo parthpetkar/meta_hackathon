@@ -15,14 +15,124 @@ import textwrap
 from dataclasses import dataclass
 from typing import List, Optional
 
-from cicd.fix_applier import (
-    FixResult,
-    _resolve_conflict_markers,
-    _resolve_workspace_path,
-    _looks_like_version_conflict,
-    _repair_dockerfile_order,
-    _repair_python_syntax,
-)
+@dataclass
+class FixResult:
+    success: bool
+    files_modified: List[str]
+    commit_sha: str = ""
+    strategy_used: str = ""
+    error: str = ""
+    description: str = ""
+
+
+_PATH_SEARCH_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv"}
+_VERSION_PIN_RE = re.compile(r'^([\w\-]+)([>=<!~][^\s,]+)', re.MULTILINE)
+
+
+def _resolve_workspace_path(workspace: str, rel: str, create_ok: bool = False) -> Optional[str]:
+    rel_norm = rel.replace("\\", "/").lstrip("./")
+    direct = os.path.join(workspace, rel_norm)
+    if os.path.exists(direct):
+        return rel_norm
+    basename = os.path.basename(rel_norm)
+    matches: List[str] = []
+    for root, dirs, files in os.walk(workspace):
+        dirs[:] = [d for d in dirs if d not in _PATH_SEARCH_SKIP_DIRS]
+        if basename in files:
+            matches.append(os.path.relpath(os.path.join(root, basename), workspace).replace("\\", "/"))
+            if len(matches) > 1:
+                break
+    if len(matches) == 1:
+        return matches[0]
+    if create_ok:
+        return rel_norm
+    return None
+
+
+def _resolve_conflict_markers(content: str, keep: str = "head") -> str:
+    result, in_conflict, in_theirs = [], False, False
+    for line in content.split("\n"):
+        if line.startswith("<<<<<<< "):
+            in_conflict, in_theirs = True, False
+        elif line.startswith("======="):
+            in_theirs = True
+        elif line.startswith(">>>>>>> "):
+            in_conflict, in_theirs = False, False
+        elif in_conflict:
+            if (keep == "head" and not in_theirs) or (keep == "theirs" and in_theirs):
+                result.append(line)
+        else:
+            result.append(line)
+    return "\n".join(result)
+
+
+def _looks_like_version_conflict(req_content: str) -> bool:
+    packages: dict = {}
+    for line in req_content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r'^([\w\-]+)[>=<!~]', line)
+        if m:
+            name = m.group(1).lower()
+            packages[name] = packages.get(name, 0) + 1
+    if any(count > 1 for count in packages.values()):
+        return True
+    seen_names = set(packages.keys())
+    pins = _VERSION_PIN_RE.findall(req_content)
+    pin_names = {p[0].lower() for p in pins}
+    return bool(pin_names & seen_names and len(pin_names) < len(seen_names))
+
+
+def _repair_python_syntax(content: str) -> str:
+    lines = content.splitlines()
+    cleaned = [l for l in lines if not (
+        l.startswith("<<<<<<<") or l.startswith("=======") or l.startswith(">>>>>>>")
+    )]
+    result: List[str] = []
+    seen_defs: set = set()
+    skip_block = False
+    indent_level = 0
+    for line in cleaned:
+        stripped = line.strip()
+        if stripped.startswith(("def ", "class ", "async def ")):
+            name = re.split(r'[\s(:]', stripped, maxsplit=2)[1]
+            if name in seen_defs:
+                skip_block = True
+                indent_level = len(line) - len(line.lstrip())
+                continue
+            seen_defs.add(name)
+            skip_block = False
+        elif skip_block:
+            current_indent = len(line) - len(line.lstrip()) if line.strip() else 999
+            if line.strip() and current_indent <= indent_level:
+                skip_block = False
+            else:
+                continue
+        result.append(line)
+    return "\n".join(result)
+
+
+def _repair_dockerfile_order(content: str) -> str:
+    lines = content.splitlines()
+    copy_req_idx = next(
+        (i for i, l in enumerate(lines) if "COPY" in l and "requirements" in l), None
+    )
+    run_install_idx = next(
+        (i for i, l in enumerate(lines) if re.search(r"RUN\s+(pip|uv)\s+", l)), None
+    )
+    if (
+        copy_req_idx is not None
+        and run_install_idx is not None
+        and run_install_idx < copy_req_idx
+    ):
+        run_line = lines.pop(run_install_idx)
+        copy_req_idx = next(
+            (i for i, l in enumerate(lines) if "COPY" in l and "requirements" in l), copy_req_idx - 1
+        )
+        lines.insert(copy_req_idx + 1, run_line)
+        return "\n".join(lines)
+    return content
 
 
 # ── Public API ──────────────────────────────────────────────────────────────

@@ -763,7 +763,7 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
     except Exception as exc:
         print(f"[WS-MODE] Curriculum unavailable ({exc}), using random fault", flush=True)
         import random
-        from cicd.fault_injector import FAULT_TYPES
+        from cicd.fault_types import FAULT_TYPES
         selected_fault = random.choice(FAULT_TYPES)
         curriculum_difficulty = 0.5
 

@@ -51,22 +51,15 @@ except Exception as e:  # pragma: no cover
 
 try:
     from ..models import MetaHackathonAction, MetaHackathonObservation
-    from .environment import RealCICDRepairEnvironment, SimulatedCICDRepairEnvironment
+    from .environment import SimulatedCICDRepairEnvironment
 except (ImportError, ModuleNotFoundError):
     from models import MetaHackathonAction, MetaHackathonObservation
-    from server.environment import RealCICDRepairEnvironment, SimulatedCICDRepairEnvironment
+    from server.environment import SimulatedCICDRepairEnvironment
 
 logger = logging.getLogger(__name__)
 
-# Select environment class based on CICD_SIMULATE env var.
-# CICD_SIMULATE=true  → SimulatedCICDRepairEnvironment (no Docker, no Git)
-# CICD_SIMULATE=false → RealCICDRepairEnvironment      (real subprocesses)
-_simulate = os.getenv("CICD_SIMULATE", "false").strip().lower() == "true"
-_EnvClass = SimulatedCICDRepairEnvironment if _simulate else RealCICDRepairEnvironment
-if _simulate:
-    logger.info("CICD_SIMULATE=true — using SimulatedCICDRepairEnvironment (no Docker/Git required)")
-else:
-    logger.info("CICD_SIMULATE=false — using RealCICDRepairEnvironment (Docker + Git required)")
+_EnvClass = SimulatedCICDRepairEnvironment
+logger.info("Using SimulatedCICDRepairEnvironment (no Docker/Git required)")
 
 _SHARED_REST_ENV = _EnvClass()
 _SHARED_REST_ENV.close = lambda: None  # prevent REST handlers from nuking _episode between requests
