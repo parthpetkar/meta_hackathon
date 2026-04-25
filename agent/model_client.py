@@ -49,6 +49,10 @@ def _tool_call_to_action_parts(tool_name: str, tool_args: Dict[str, Any]) -> Tup
         stage = str(tool_args.get("stage", "") or "")
         detail = str(tool_args.get("detail", "") or "")
         return "view_logs", stage, detail
+    if name == "tail_logs":
+        stage = str(tool_args.get("stage", "") or "")
+        detail = str(tool_args.get("detail", "") or "")
+        return "tail_logs", stage, detail
     if name == "inspect_config":
         return "inspect_config", str(tool_args.get("component", "") or ""), ""
     if name == "inspect_dockerfile":

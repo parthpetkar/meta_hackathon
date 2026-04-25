@@ -30,6 +30,7 @@ from cicd.simulated_fix_applier import apply_fix_simulated
 from cicd.observation_builder import (
     build_observation,
     build_stage_log_response,
+    build_stage_log_tail,
     build_surfaced_errors,
     build_visible_alerts,
     build_visible_logs,
@@ -60,7 +61,7 @@ except (ImportError, ModuleNotFoundError):
 # ── Constants ──────────────────────────────────────────────────────────────
 
 CANONICAL_OPERATIONS = [
-    "view_logs", "inspect_config", "inspect_dockerfile",
+    "view_logs", "tail_logs", "inspect_config", "inspect_dockerfile",
     "inspect_permissions", "set_hypothesis", "modify_config",
     "add_dependency", "rerun_pipeline", "verify_fix", "finalize",
 ]
@@ -162,6 +163,9 @@ class EpisodeState:
     rubric_judge_error: str = ""
     step_prm_scores: List[float] = field(default_factory=list)
     step_reward_trace: List[Dict[str, Any]] = field(default_factory=list)
+    log_budget_total: int = 120
+    log_tokens_remaining: int = 120
+    last_log_access: str = "reset"
 
     used_inspections: Set[str] = field(default_factory=set)
 
@@ -237,6 +241,8 @@ def _canonical_operation(operation: str) -> str:
     aliases = {
         "view-logs": "view_logs",
         "viewlogs": "view_logs",
+        "tail-logs": "tail_logs",
+        "taillogs": "tail_logs",
         "inspect-config": "inspect_config",
         "inspectconfig": "inspect_config",
         "inspect-dockerfile": "inspect_dockerfile",
@@ -356,9 +362,11 @@ class SimulatedCICDRepairEnvironment(Environment):
     async def reset_async(
         self, seed: Optional[int] = None, episode_id: Optional[str] = None, **kwargs: Any
     ) -> MetaHackathonObservation:
+        import asyncio
         options = kwargs.get("reset_options", {})
         task_key = options.get("task_key") or kwargs.get("task_key", "")
-        return self.reset(task_key=task_key)
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, lambda: self.reset(task_key=task_key))
 
     def reset(self, task_key: str = "") -> MetaHackathonObservation:
         if self._episode:
@@ -450,6 +458,8 @@ class SimulatedCICDRepairEnvironment(Environment):
             curriculum_difficulty=curriculum_difficulty,
             episode_seed=episode_seed,
             procedural_mode=use_procedural_style,
+            log_budget_total=max(20, int(os.getenv("META_HACKATHON_LOG_BUDGET", "120"))),
+            log_tokens_remaining=max(20, int(os.getenv("META_HACKATHON_LOG_BUDGET", "120"))),
         )
         self._episode = episode
 
@@ -462,8 +472,11 @@ class SimulatedCICDRepairEnvironment(Environment):
             task_id=f"sim_{fault_type}",
             task_title=f"Fix {fault_type.replace('_', ' ')} in CI/CD pipeline (simulated)",
             difficulty=difficulty,
+            available_tools=self._available_operations_for_episode(episode),
             reward=0.0,
             done=False,
+            log_tokens_remaining=episode.log_tokens_remaining,
+            log_access_mode="full",
             findings=episode.findings,
             metadata={
                 "task_key": fault_type,
@@ -473,8 +486,11 @@ class SimulatedCICDRepairEnvironment(Environment):
                 "ready_to_finalize": False,
                 "verification_required": False,
                 "verified_since_last_rerun": False,
-                "supported_operations": CANONICAL_OPERATIONS,
+                "supported_operations": self._available_operations_for_episode(episode),
                 "canonical_operations": CANONICAL_OPERATIONS,
+                "log_tokens_remaining": episode.log_tokens_remaining,
+                "log_budget_total": episode.log_budget_total,
+                "log_access_mode": "full",
                 "simulated": True,
             },
         )
@@ -509,7 +525,9 @@ class SimulatedCICDRepairEnvironment(Environment):
         finalize_blocked = operation == "finalize" and not episode.verified_for_latest_rerun
 
         if operation == "view_logs":
-            self._handle_view_logs(episode, target)
+            self._handle_view_logs(episode, target, full=True)
+        elif operation == "tail_logs":
+            self._handle_view_logs(episode, target, full=False)
         elif operation == "inspect_config":
             self._handle_inspect_config(episode, target)
         elif operation == "inspect_dockerfile":
@@ -581,20 +599,58 @@ class SimulatedCICDRepairEnvironment(Environment):
 
     # ── Action handlers ──────────────────────────────────────────────────────
 
-    def _handle_view_logs(self, ep: EpisodeState, target: str) -> None:
+    def _handle_view_logs(self, ep: EpisodeState, target: str, *, full: bool) -> None:
         stage = target.lower() if target else ""
-        ep.used_inspections.add("view_logs")
+        ep.used_inspections.add("view_logs" if full else "tail_logs")
         ep.inspected_since_last_rerun = True
 
         if ep.pipeline_result:
             if stage and stage in STAGE_ORDER:
-                log_text = build_stage_log_response(ep.pipeline_result, stage)
-                ep.findings.append(f"Logs for stage '{stage}':\n{log_text[:300]}")
+                if full:
+                    log_text = build_stage_log_response(ep.pipeline_result, stage)
+                    token_cost = self._consume_log_budget(ep, log_text, minimum_cost=8)
+                    if token_cost is None:
+                        tail_text = build_stage_log_tail(ep.pipeline_result, stage, tail_lines=10)
+                        ep.findings.append(
+                            f"Full log budget exhausted; tail only for stage '{stage}':\n{tail_text[:400]}"
+                        )
+                        ep.last_log_access = "tail_only"
+                        return
+                    ep.findings.append(
+                        f"Full logs for stage '{stage}' (cost {token_cost}, remaining {ep.log_tokens_remaining}):\n{log_text[:500]}"
+                    )
+                    ep.last_log_access = "full"
+                else:
+                    tail_text = build_stage_log_tail(ep.pipeline_result, stage, tail_lines=10)
+                    token_cost = self._consume_log_budget(ep, tail_text, minimum_cost=0)
+                    ep.findings.append(
+                        f"Tail logs for stage '{stage}' (cost {token_cost}, remaining {ep.log_tokens_remaining}):\n{tail_text[:300]}"
+                    )
+                    ep.last_log_access = "tail"
             else:
                 failed_stage = ep.pipeline_result.failed_stage
                 if failed_stage:
-                    log_text = build_stage_log_response(ep.pipeline_result, failed_stage)
-                    ep.findings.append(f"Logs for failed stage '{failed_stage}':\n{log_text[:300]}")
+                    if full:
+                        log_text = build_stage_log_response(ep.pipeline_result, failed_stage)
+                        token_cost = self._consume_log_budget(ep, log_text, minimum_cost=8)
+                        if token_cost is None:
+                            tail_text = build_stage_log_tail(ep.pipeline_result, failed_stage, tail_lines=10)
+                            ep.findings.append(
+                                f"Full log budget exhausted; tail only for failed stage '{failed_stage}':\n{tail_text[:400]}"
+                            )
+                            ep.last_log_access = "tail_only"
+                            return
+                        ep.findings.append(
+                            f"Full logs for failed stage '{failed_stage}' (cost {token_cost}, remaining {ep.log_tokens_remaining}):\n{log_text[:500]}"
+                        )
+                        ep.last_log_access = "full"
+                    else:
+                        tail_text = build_stage_log_tail(ep.pipeline_result, failed_stage, tail_lines=10)
+                        token_cost = self._consume_log_budget(ep, tail_text, minimum_cost=0)
+                        ep.findings.append(
+                            f"Tail logs for failed stage '{failed_stage}' (cost {token_cost}, remaining {ep.log_tokens_remaining}):\n{tail_text[:300]}"
+                        )
+                        ep.last_log_access = "tail"
 
         return
 
@@ -870,6 +926,24 @@ class SimulatedCICDRepairEnvironment(Environment):
         normalized = (value or "").strip().lower()
         return any(phrase in normalized for phrase in DESTRUCTIVE_FIXES)
 
+    def _consume_log_budget(self, ep: EpisodeState, log_text: str, *, minimum_cost: int) -> Optional[int]:
+        if minimum_cost <= 0:
+            return 0
+        if minimum_cost <= 1:
+            cost = 1
+        else:
+            line_count = max(1, len([line for line in str(log_text or "").splitlines() if line.strip()]))
+            cost = max(minimum_cost, min(40, line_count // 4))
+        if cost > ep.log_tokens_remaining:
+            return None
+        ep.log_tokens_remaining = max(0, ep.log_tokens_remaining - cost)
+        return cost
+
+    def _available_operations_for_episode(self, ep: EpisodeState) -> List[str]:
+        if ep.log_tokens_remaining <= 0:
+            return [op for op in CANONICAL_OPERATIONS if op != "view_logs"]
+        return list(CANONICAL_OPERATIONS)
+
     def _build_step_observation(self, ep: EpisodeState, reward: float, done: bool) -> dict:
         fault_type = ep.fault_metadata.fault_type if ep.fault_metadata else "unknown"
         difficulty = self._get_difficulty(fault_type)
@@ -916,6 +990,7 @@ class SimulatedCICDRepairEnvironment(Environment):
             task_id=f"sim_{fault_type}",
             task_title=f"Fix {fault_type.replace('_', ' ')} in CI/CD pipeline (simulated)",
             difficulty=difficulty,
+            available_tools=self._available_operations_for_episode(ep),
             reward=reward,
             done=done,
             action_history=action_history,
@@ -934,6 +1009,8 @@ class SimulatedCICDRepairEnvironment(Environment):
             rubric_blend_weight=1.0,
             rubric_judge_used=rubric_judge_used,
             rubric_judge_error=rubric_judge_error,
+            log_tokens_remaining=ep.log_tokens_remaining,
+            log_access_mode="tail_only" if ep.log_tokens_remaining <= 0 else "full",
             findings=ep.findings[-10:],
             metadata={
                 "task_key": fault_type,
@@ -942,9 +1019,13 @@ class SimulatedCICDRepairEnvironment(Environment):
                 "ready_to_finalize": ep.incident_resolved and ep.verified_for_latest_rerun,
                 "verification_required": ep.incident_resolved and not ep.verified_for_latest_rerun,
                 "verified_since_last_rerun": ep.verified_for_latest_rerun,
-                "supported_operations": CANONICAL_OPERATIONS,
+                "supported_operations": self._available_operations_for_episode(ep),
                 "canonical_operations": CANONICAL_OPERATIONS,
                 "rubric_enabled": self._rubric_judge.is_active(),
+                "log_tokens_remaining": ep.log_tokens_remaining,
+                "log_budget_total": ep.log_budget_total,
+                "log_access_mode": "tail_only" if ep.log_tokens_remaining <= 0 else "full",
+                "last_log_access": ep.last_log_access,
                 "reward_model": "process_reward_model",
                 "reward_trace": ep.step_reward_trace[-12:],
                 "simulated": True,

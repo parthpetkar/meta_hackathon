@@ -55,6 +55,7 @@ except Exception as e:  # pragma: no cover
 
 CANONICAL_OPERATIONS = [
     "view_logs",
+    "tail_logs",
     "inspect_config",
     "inspect_dockerfile",
     "inspect_permissions",
@@ -423,11 +424,11 @@ def _suggest_next_action(observation: Dict[str, Any]) -> Dict[str, str]:
             }
         if surfaced_errors or current_stage or pipeline_status in {"failed", "error", "running"}:
             return {
-                "operation": "view_logs",
+                "operation": "tail_logs",
                 "target": current_stage or metadata.get("expected_fail_stage", "") or "clone",
                 "value": "",
-                "title": "Inspect the failing stage",
-                "reason": "Start with the logs for the stage that is visibly failing or stalled.",
+                "title": "Tail the failing stage",
+                "reason": "Start with the live tail so you can triage cheaply before spending budget on full logs.",
             }
 
     if current_hypothesis and not attempted_fix:
@@ -901,16 +902,18 @@ app.add_middleware(_FlatActionNormalizerMiddleware)
 @app.on_event("startup")
 async def startup_event():
     """Start the CI/CD API server when main server starts"""
+    import asyncio
     cicd_api_port = int(os.getenv("CICD_API_PORT", "8001"))
     cicd_api_host = os.getenv("CICD_API_HOST", "0.0.0.0")
-    
+
     logger.info("=" * 60)
     logger.info("Starting Meta Hackathon Environment Server")
     logger.info("=" * 60)
-    
-    # Start CI/CD API server
-    _start_cicd_api_server(port=cicd_api_port, host=cicd_api_host)
-    
+
+    # Run in thread pool so the sync polling loop doesn't block the event loop
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _start_cicd_api_server, cicd_api_port, cicd_api_host)
+
     logger.info("=" * 60)
     logger.info("All services started successfully")
     logger.info("=" * 60)

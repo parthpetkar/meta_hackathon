@@ -58,12 +58,21 @@ def _normalize_hypothesis(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").strip().lower())
 
 
-# Structured JSON fix template injected as a hint after hypothesis is accepted.
+# Structured fix hint injected after hypothesis is accepted — one variant per tool schema.
 _STRUCTURED_FIX_HINT = (
     "Hypothesis accepted. Now apply the fix using modify_config with a structured JSON value:\n"
     '{"file": "<path/to/file>", "action": "replace", "old": "<exact broken lines>", "new": "<fixed lines>"}\n'
     "Use the file content you already inspected to fill in the exact old/new strings. "
     "Do not inspect or view_logs again — go straight to the fix."
+)
+
+_STRUCTURED_FIX_HINT_WS = (
+    "Hypothesis accepted. Now apply the fix using write_file.\n"
+    "You MUST supply BOTH arguments — path AND content:\n"
+    '  path    = "<the exact relative file path you read, e.g. tests/test_api.py>"\n'
+    '  content = "<complete new file content — the entire file, not just the changed lines>"\n'
+    "Do NOT call write_file without a path. "
+    "Do NOT trigger_pipeline until write_file succeeds."
 )
 
 
@@ -814,6 +823,7 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
     last_fix_value: str = ""
     step_trace: List[Dict[str, Any]] = []
     task_max_steps = MAX_STEPS
+    read_files: set[str] = set()  # tracks paths that have been read_file'd this episode
 
     log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
     print(
@@ -858,6 +868,7 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
                 )
             print(f"[MEMORY] Recalled optimal path for fault_type={fault_injected} ({len(prior_path)} steps)", flush=True)
 
+<<<<<<< Updated upstream
     if initial_failure_logs:
         # Incident alert already available — agent does not need a discovery pipeline run.
         pipeline_triggered_once = True
@@ -877,6 +888,15 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
             "Read ONLY the file the failure output names, diagnose the fault, apply a fix, "
             "and re-run the pipeline until it passes. Call finalize when the pipeline passes."
         )
+=======
+    task_intro = (
+        f"You are debugging a CI/CD pipeline in workspace {workspace_id}.\n"
+        "Call trigger_pipeline FIRST to see the current failure output. "
+        "The error logs will name the exact file that is broken. "
+        "Read that specific file with read_file, apply the fix with write_file, "
+        "then trigger_pipeline again to verify. Call finalize when the pipeline passes."
+    )
+>>>>>>> Stashed changes
     if memory_hint:
         task_intro += f"\n\n{memory_hint}"
     if optimal_path_hint:
@@ -953,6 +973,37 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
                                 })
                             should_resample = True
 
+                    # Hard block: write_file with no path is always wrong — fire every attempt
+                    if operation == "write_file" and not target:
+                        _last_read = next(
+                            (t for op, t, v in reversed(action_history) if op == "read_file" and t),
+                            "",
+                        )
+                        _path_hint = f"'{_last_read}'" if _last_read else "<relative file path>"
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "ERROR: write_file was called without a 'path' argument — the tool call is invalid.\n"
+                                f"You must provide BOTH arguments: path={_path_hint} and content='<complete file content>'.\n"
+                                "Re-issue write_file with the correct path and the full corrected file content."
+                            ),
+                        })
+                        should_resample = True
+
+                    # Read-before-write guardrail: block write_file if the file was never read
+                    if operation == "write_file" and target and target not in read_files:
+                        _rbw_key = f"rbw:{target}"
+                        if _rbw_key not in injected_guardrails:
+                            injected_guardrails.add(_rbw_key)
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    f"You must read_file('{target}') before writing it. "
+                                    "Call read_file on that path now so you have the current content."
+                                ),
+                            })
+                        should_resample = True
+
                     if should_resample and guard_attempts < 3:
                         messages = trim_messages(messages)
                         continue
@@ -966,6 +1017,26 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
 
             if _model_failed:
                 break
+
+            # Hard redirect: write_file with empty path must never reach the API
+            if operation == "write_file" and not target:
+                _last_read = next(
+                    (t for op, t, v in reversed(action_history) if op == "read_file" and t),
+                    "",
+                )
+                operation = "read_file" if _last_read else "trigger_pipeline"
+                target = _last_read
+                value = ""
+                assistant_message = {
+                    "role": "assistant",
+                    "content": f"Hard redirect: write_file had no path → {operation}|{target}",
+                }
+                tool_call_id = None
+                forced_messages.append(
+                    f"write_file was blocked because 'path' was missing. "
+                    f"Now call write_file(path='{_last_read or '<file_path>'}', "
+                    "content='<the complete corrected file>') — both arguments are required."
+                )
 
             # Repetition escape — force a different action after too many identical attempts
             action_tuple = (operation, target, value)
@@ -1061,6 +1132,12 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
                 truncated = tool_result_str[:1500] + ("..." if len(tool_result_str) > 1500 else "")
                 print(_tw.indent(truncated, "    "), flush=True)
 
+            # Track successfully read files so the read-before-write guardrail can allow them.
+            # Also clear the guardrail key so re-attempting write_file on the same path is allowed.
+            if operation == "read_file" and op_success and result.get("exists"):
+                read_files.add(target)
+                injected_guardrails.discard(f"rbw:{target}")
+
             # ── Post-step forced messages ─────────────────────────────────
             if operation == "write_file":
                 fix_applied_since_rerun = True
@@ -1083,11 +1160,22 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
                     hypothesis_accepted = True
                     if "fix_hint_sent" not in injected_guardrails:
                         injected_guardrails.add("fix_hint_sent")
-                        forced_messages.append(_STRUCTURED_FIX_HINT)
+                        forced_messages.append(_STRUCTURED_FIX_HINT_WS)
                 elif reward < 0:
                     forced_messages.append(
                         "Your last hypothesis was incorrect (negative reward). "
                         "Re-read the pipeline logs and form a new hypothesis targeting a different root cause."
+                    )
+
+            # Recovery: write_file failed because path was missing — remind the model of correct usage
+            if operation == "write_file" and not op_success and "requires 'path'" in (tool_error or ""):
+                _rbw_recovery_key = "write_file_path_missing"
+                if _rbw_recovery_key not in injected_guardrails:
+                    injected_guardrails.add(_rbw_recovery_key)
+                    forced_messages.append(
+                        "write_file failed because 'path' was missing. "
+                        "You must call write_file with BOTH path='<file path>' AND content='<complete file content>'. "
+                        "Example: write_file(path='tests/test_api.py', content='<the entire corrected file>')"
                     )
 
             messages.append(assistant_message)
