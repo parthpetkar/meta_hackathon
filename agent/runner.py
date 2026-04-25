@@ -790,6 +790,7 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
         ws_resp = resp.json()
         workspace_id = ws_resp["workspace_id"]
         fault_injected = ws_resp.get("fault_injected") or selected_fault
+        initial_failure_logs = ws_resp.get("initial_failure_logs") or ""
     except Exception as exc:
         print(f"[WS-MODE] Failed to create workspace: {exc}", flush=True)
         return episode_label, False, 0, 0.0
@@ -807,6 +808,7 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
     fix_applied_since_rerun: bool = False
     hypothesis_accepted: bool = False
     pipeline_passed = False
+    pipeline_triggered_once: bool = False  # tracks whether agent has seen failure output
     model_calls_used = 0
     tool_call_misses = 0
     last_fix_value: str = ""
@@ -856,13 +858,25 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
                 )
             print(f"[MEMORY] Recalled optimal path for fault_type={fault_injected} ({len(prior_path)} steps)", flush=True)
 
-    task_intro = (
-        f"You are debugging a CI/CD pipeline in workspace {workspace_id}.\n"
-        "Start by listing the workspace files, then read the key config files "
-        "(Dockerfile, docker-compose.yml, requirements.txt) and trigger the pipeline "
-        "to see the current failure. Diagnose the fault, apply a fix, and re-run the "
-        "pipeline until it passes. Call finalize when the pipeline passes."
-    )
+    if initial_failure_logs:
+        # Incident alert already available — agent does not need a discovery pipeline run.
+        pipeline_triggered_once = True
+        task_intro = (
+            f"You are debugging a CI/CD pipeline in workspace {workspace_id}.\n"
+            "An incident was detected. The pipeline has already been run and the failure "
+            "logs are included below as your incident alert.\n\n"
+            "Read ONLY the file the failure output names, set your hypothesis, apply the fix, "
+            "then call trigger_pipeline once to verify. Call finalize when the pipeline passes.\n\n"
+            f"=== INCIDENT ALERT — PIPELINE FAILURE LOGS ===\n{initial_failure_logs}\n"
+            "=== END OF INCIDENT ALERT ==="
+        )
+    else:
+        task_intro = (
+            f"You are debugging a CI/CD pipeline in workspace {workspace_id}.\n"
+            "Start by calling trigger_pipeline to see the current failure logs. "
+            "Read ONLY the file the failure output names, diagnose the fault, apply a fix, "
+            "and re-run the pipeline until it passes. Call finalize when the pipeline passes."
+        )
     if memory_hint:
         task_intro += f"\n\n{memory_hint}"
     if optimal_path_hint:
@@ -988,8 +1002,11 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
 
             # ── Reward ────────────────────────────────────────────────────
             op_success = result.get("success", False)
+            # Per-step cost encourages efficiency; finalize is exempt.
+            STEP_PENALTY = -0.01
             if operation == "trigger_pipeline":
                 pipeline_passed = result.get("passed", False)
+                pipeline_triggered_once = True
                 if pipeline_passed:
                     reward = 0.30
                 elif op_success:
@@ -1001,15 +1018,24 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
             elif operation == "write_file":
                 reward = 0.10 if op_success else -0.15
             elif operation == "read_file":
-                reward = 0.05 if op_success and result.get("exists") else -0.05
+                # Only reward reads that follow a pipeline run (agent has seen the error).
+                # Blind pre-trigger reads score negatively to discourage the preamble pattern.
+                if op_success and result.get("exists"):
+                    reward = 0.05 if pipeline_triggered_once else -0.02
+                else:
+                    reward = -0.05
             elif operation == "list_files":
-                reward = 0.02 if op_success and result.get("files") else 0.0
+                # list_files is rarely necessary; give no positive reward to avoid padding.
+                reward = 0.0
             elif operation == "finalize":
                 reward = 1.0 if pipeline_passed else 0.0
                 score = reward
                 success = pipeline_passed
             else:
                 reward = 0.0
+            # Apply step penalty to all non-finalize actions.
+            if operation != "finalize":
+                reward += STEP_PENALTY
 
             rewards.append(reward)
             step_trace.append({

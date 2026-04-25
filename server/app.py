@@ -236,12 +236,41 @@ def _episode_snapshot(web_manager: Any) -> Dict[str, Any]:
     episode_state = getattr(web_manager, "episode_state", None)
     current_observation = _as_dict(getattr(episode_state, "current_observation", None))
     action_logs = getattr(episode_state, "action_logs", None)
+    manager_state: Dict[str, Any] = {}
+
+    # Prefer direct state attributes when the runtime exposes pydantic-v1 models
+    # (dict()) but not pydantic-v2 (model_dump()), because some get_state()
+    # implementations unconditionally call model_dump().
+    for attr_name in ("state", "_state"):
+        raw_state = getattr(web_manager, attr_name, None)
+        if raw_state is None:
+            continue
+        if hasattr(raw_state, "dict") and not hasattr(raw_state, "model_dump"):
+            manager_state = _as_dict(raw_state)
+            break
+
+    if not manager_state and hasattr(web_manager, "get_state"):
+        try:
+            manager_state = _as_dict(web_manager.get_state())
+        except Exception as exc:
+            logging.getLogger(__name__).debug(
+                "Falling back to attribute state after get_state() failure: %s",
+                exc,
+            )
+
+    if not manager_state:
+        for attr_name in ("state", "_state"):
+            candidate = _as_dict(getattr(web_manager, attr_name, None))
+            if candidate:
+                manager_state = candidate
+                break
+
     return {
         "episode_id": _safe_text(getattr(episode_state, "episode_id", "")),
         "step_count": int(getattr(episode_state, "step_count", 0) or 0),
         "action_logs": action_logs if isinstance(action_logs, list) else [],
         "current_observation": current_observation,
-        "state": _as_dict(web_manager.get_state() if hasattr(web_manager, "get_state") else {}),
+        "state": manager_state,
     }
 
 
@@ -448,9 +477,10 @@ def _suggest_next_action(observation: Dict[str, Any]) -> Dict[str, str]:
 def my_custom_ui(web_manager, action_fields, metadata, is_chat_env, title, quick_start_md):
     import gradio as gr
 
+    metadata_dict = _as_dict(metadata)
     supported_operations = list(
-        (metadata or {}).get("supported_operations")
-        or (metadata or {}).get("canonical_operations")
+        metadata_dict.get("supported_operations")
+        or metadata_dict.get("canonical_operations")
         or CANONICAL_OPERATIONS
     )
 
@@ -787,6 +817,84 @@ app = create_app(
     max_concurrent_envs=1,  # increase this number to allow more concurrent WebSocket sessions
     gradio_builder=my_custom_ui,
 )
+
+
+# ── Middleware: normalise flat action payloads on /step ────────────────────
+# Some clients send {"operation": ..., "target": ..., "value": ...} directly
+# instead of the OpenEnv-required {"action": {"operation": ..., ...}}.
+# This middleware rewrites the request body before FastAPI validates it so
+# those clients get a 200 instead of a 422 Unprocessable Entity.
+
+import json as _json
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as _StarletteRequest
+from starlette.responses import Response as _StarletteResponse
+from starlette.datastructures import Headers
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse as _JSONResponse
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error_handler(request: _StarletteRequest, exc: RequestValidationError):
+    """Log 422 validation errors with the offending body so they are visible in server logs."""
+    try:
+        body = await request.body()
+        body_preview = body.decode("utf-8", errors="replace")[:500]
+    except Exception:
+        body_preview = "<unreadable>"
+    logger.error(
+        "422 Unprocessable Entity on %s %s — errors=%s — body=%s",
+        request.method,
+        request.url.path,
+        exc.errors(),
+        body_preview,
+    )
+    return _JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors(), "body_preview": body_preview},
+    )
+
+
+class _FlatActionNormalizerMiddleware(BaseHTTPMiddleware):
+    """Wrap flat action dicts in {"action": ...} for /step requests."""
+
+    _ACTION_FIELDS = frozenset({"operation", "target", "value"})
+
+    async def dispatch(self, request: _StarletteRequest, call_next):
+        if request.method == "POST" and "/step" in request.url.path:
+            try:
+                body_bytes = await request.body()
+                if body_bytes:
+                    body = _json.loads(body_bytes)
+                    # Rewrite only when the payload is a flat action dict
+                    # (has at least "operation" but no top-level "action" key).
+                    if (
+                        isinstance(body, dict)
+                        and "action" not in body
+                        and self._ACTION_FIELDS.intersection(body)
+                    ):
+                        body = {"action": body}
+                        body_bytes = _json.dumps(body).encode()
+
+                        # Rebuild the request with the patched body so FastAPI
+                        # sees the correct payload. receive() must return an
+                        # ASGI http.request message dict, not raw bytes.
+                        async def _patched_receive(
+                            _b=body_bytes,
+                        ):
+                            return {"type": "http.request", "body": _b, "more_body": False}
+
+                        request = _StarletteRequest(
+                            scope=request.scope,
+                            receive=_patched_receive,
+                        )
+            except Exception:
+                pass  # Let FastAPI handle malformed JSON normally
+
+        return await call_next(request)
+
+
+app.add_middleware(_FlatActionNormalizerMiddleware)
 
 
 # Add startup event to launch CI/CD API server
