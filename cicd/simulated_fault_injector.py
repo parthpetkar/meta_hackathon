@@ -4,6 +4,7 @@ Mirrors fault_injector.py's inject_fault() API exactly but:
 - Writes real file mutations (so SimulatedPipelineRunner's file-read checks work)
 - Skips all git add/commit operations (no git required)
 - Returns the same FaultMetadata dataclass
+- Supports the same 11 fault types as fault_injector.py
 
 This is used by SimulatedCICDRepairEnvironment when CICD_SIMULATE=true.
 """
@@ -13,7 +14,6 @@ from __future__ import annotations
 import os
 import random
 import textwrap
-from typing import Dict, List, Optional
 
 from cicd.fault_injector import (
     FaultMetadata,
@@ -40,17 +40,6 @@ def inject_fault_simulated(workspace: str, fault_type: str) -> FaultMetadata:
         "log_disabled":        _inject_log_disabled,
         "bad_migration_sql":   _inject_bad_migration_sql,
         "schema_drift":        _inject_schema_drift,
-        # Extended fault types (present in simulated_runner but not in fault_injector)
-        "log_bad_config":          _inject_log_bad_config,
-        "log_path_unwritable":     _inject_log_path_unwritable,
-        "log_rotation_missing":    _inject_log_rotation_missing,
-        "log_volume_missing":      _inject_log_volume_missing,
-        "shared_secret_rotation":  _inject_shared_secret_rotation,
-        "infra_port_conflict":     _inject_infra_port_conflict,
-        "dependency_version_drift": _inject_dependency_version_drift,
-        "wrong_db_url":            _inject_wrong_db_url,
-        "init_order_race":         _inject_init_order_race,
-        "missing_volume_mount":    _inject_missing_volume_mount,
     }
     if fault_type not in injectors:
         raise ValueError(f"Unknown fault type: {fault_type!r}. Valid: {list(injectors)}")
@@ -82,7 +71,7 @@ def _read(path: str) -> str:
         return ""
 
 
-# ── Core fault injectors (mirrors fault_injector.py, no git) ────────────────
+# ── Fault injectors (mirrors fault_injector.py exactly, no git) ─────────────
 
 def _inject_merge_conflict(workspace: str) -> FaultMetadata:
     path = os.path.join(workspace, "services", "api", "routes.py")
@@ -157,7 +146,7 @@ def _inject_flaky_test(workspace: str) -> FaultMetadata:
         response = client.get("/health")
         elapsed = time.time() - start
         assert response.status_code == 200
-        # Threshold is unrealistically tight — always fails after the sleep
+        # Threshold is unrealistically tight -- always fails after the sleep
         threshold = 0.001
         assert elapsed < threshold, (
             f"Health endpoint took {elapsed:.3f}s, expected < {threshold}s "
@@ -327,295 +316,4 @@ def _inject_schema_drift(workspace: str) -> FaultMetadata:
         fault_type="schema_drift",
         affected_files=["db/database.py"],
         description="CANONICAL_COLUMNS includes 'artifact_url' but no migration adds it",
-    )
-
-
-# ── Extended fault injectors (present in simulated_runner, not in fault_injector) ──
-
-def _inject_log_bad_config(workspace: str) -> FaultMetadata:
-    """Replace json.dumps with str() so log records are not valid JSON."""
-    path = os.path.join(workspace, "services", "api", "logging_config.py")
-    content = _read(path)
-    # Replace json.dumps with str() to break JSON formatting
-    import re
-    patched = re.sub(r'\bjson\.dumps\b', 'str', content)
-    if patched == content:
-        # Fallback: insert a broken formatter definition
-        patched = content + textwrap.dedent("""
-
-        # FAULT(log_bad_config): formatter uses str() instead of json.dumps
-        def _bad_formatter(record):
-            return str({"timestamp": record.created, "level": record.levelname,
-                        "message": record.getMessage()})
-        """)
-    _write(path, patched)
-    return FaultMetadata(
-        fault_type="log_bad_config",
-        affected_files=["services/api/logging_config.py"],
-        description="Logging formatter uses str() instead of json.dumps — log records not valid JSON",
-    )
-
-
-def _inject_log_path_unwritable(workspace: str) -> FaultMetadata:
-    """Set LOG_PATH to a restricted system directory."""
-    path = os.path.join(workspace, "services", "api", "logging_config.py")
-    content = _read(path)
-    import re
-    patched = re.sub(
-        r'LOG_PATH\s*(?::\s*str)?\s*=\s*["\'][^"\']*["\']',
-        'LOG_PATH: str = "/var/log/restricted/app.log"  # FAULT(log_path_unwritable)',
-        content,
-    )
-    if patched == content:
-        patched = content + '\nLOG_PATH: str = "/var/log/restricted/app.log"  # FAULT(log_path_unwritable)\n'
-    _write(path, patched)
-    return FaultMetadata(
-        fault_type="log_path_unwritable",
-        affected_files=["services/api/logging_config.py"],
-        description="LOG_PATH set to /var/log/restricted/app.log — root-only directory, app cannot write",
-    )
-
-
-def _inject_log_rotation_missing(workspace: str) -> FaultMetadata:
-    """Replace RotatingFileHandler with plain FileHandler."""
-    path = os.path.join(workspace, "services", "api", "logging_config.py")
-    content = _read(path)
-    patched = content.replace("RotatingFileHandler", "FileHandler")
-    if patched == content:
-        # Fallback: comment out the RotatingFileHandler import/usage
-        patched = content.replace(
-            "from logging.handlers import RotatingFileHandler",
-            "# FAULT(log_rotation_missing): RotatingFileHandler removed\nfrom logging import FileHandler",
-        )
-    _write(path, patched)
-    return FaultMetadata(
-        fault_type="log_rotation_missing",
-        affected_files=["services/api/logging_config.py"],
-        description="RotatingFileHandler replaced with FileHandler — logs may grow unboundedly",
-    )
-
-
-def _inject_log_volume_missing(workspace: str) -> FaultMetadata:
-    """Remove the ./logs:/app/logs volume mount from docker-compose.yml."""
-    path = os.path.join(workspace, "docker-compose.yml")
-    content = _read(path)
-    import re
-    # Remove the volumes section line for app logs
-    patched = re.sub(r'\s*-\s*\./logs:/app/logs\n?', '\n', content)
-    if patched == content:
-        # No volume to remove — write a compose without it
-        _write(path, textwrap.dedent("""\
-            version: "3.8"
-
-            services:
-              api:
-                build:
-                  context: .
-                  dockerfile: Dockerfile
-                ports:
-                  - "5000:5000"
-                environment:
-                  - FLASK_ENV=production
-                  - LOG_PATH=/app/logs/app.log
-                healthcheck:
-                  test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
-                  interval: 30s
-                  timeout: 5s
-                  retries: 3
-        """))
-    else:
-        _write(path, patched)
-    return FaultMetadata(
-        fault_type="log_volume_missing",
-        affected_files=["docker-compose.yml"],
-        description="docker-compose missing ./logs:/app/logs volume — app cannot write log files",
-    )
-
-
-def _inject_shared_secret_rotation(workspace: str) -> FaultMetadata:
-    """Add stale secret literal and mismatched SECRET_VERSION to docker-compose."""
-    path = os.path.join(workspace, "docker-compose.yml")
-    content = _read(path)
-    import re
-    # Add old secret references to environment block
-    patched = re.sub(
-        r'(environment:\s*\n(?:\s+-[^\n]*\n)*)',
-        lambda m: m.group(0) + '              - WEBHOOK_SECRET=whsec_old_a1b2c3d4e5f6\n'
-                               '              - SECRET_VERSION=v1\n',
-        content,
-    )
-    if patched == content:
-        patched = content + textwrap.dedent("""
-        # FAULT(shared_secret_rotation): stale secret version
-        # SECRET_VERSION=v1 — peer expects v2
-        """)
-    _write(path, patched)
-    # Also inject stale secret in app.py
-    app_path = os.path.join(workspace, "services", "api", "app.py")
-    app_content = _read(app_path)
-    if "whsec_old_" not in app_content:
-        _write(app_path, app_content + '\n# FAULT(shared_secret_rotation)\nWEBHOOK_SECRET = "whsec_old_a1b2c3d4e5f6"\n')
-    return FaultMetadata(
-        fault_type="shared_secret_rotation",
-        affected_files=["docker-compose.yml", "services/api/app.py"],
-        description="Secret rotation not propagated — stale whsec_old_ secret in app, SECRET_VERSION mismatch",
-    )
-
-
-def _inject_infra_port_conflict(workspace: str) -> FaultMetadata:
-    """Change api-service port to 5000, clashing with another binding."""
-    path = os.path.join(workspace, "docker-compose.yml")
-    content = _read(path)
-    import re
-    # Change the host port to 5000:5000 and add a second service also on 5000
-    patched = re.sub(r'ports:\s*\n\s*-\s*"5000:5000"', 'ports:\n              - "5000:5000"\n              - "5000:8001"', content)
-    if patched == content:
-        # Simpler: just duplicate the port mapping
-        _write(path, textwrap.dedent("""\
-            version: "3.8"
-
-            services:
-              api:
-                build:
-                  context: .
-                  dockerfile: Dockerfile
-                ports:
-                  - "5000:5000"
-                environment:
-                  - FLASK_ENV=production
-              frontend:
-                image: nginx:alpine
-                ports:
-                  - "5000:80"
-        """))
-    else:
-        _write(path, patched)
-    return FaultMetadata(
-        fault_type="infra_port_conflict",
-        affected_files=["docker-compose.yml"],
-        description="Duplicate port 5000 binding across services causes deploy failure",
-    )
-
-
-def _inject_dependency_version_drift(workspace: str) -> FaultMetadata:
-    """Pin fastapi/pydantic with known incompatible versions."""
-    path = os.path.join(workspace, "services", "api", "requirements.txt")
-    _write(path, textwrap.dedent("""\
-        flask>=3.0.0
-        requests>=2.31.0
-        urllib3>=1.26,<2
-        gunicorn>=21.2.0
-        pytest>=8.0.0
-        # FAULT(dependency_version_drift): conflicting urllib3 range with requests>=2.31
-        # requests>=2.31 requires urllib3>=2, but this pins <2
-    """))
-    return FaultMetadata(
-        fault_type="dependency_version_drift",
-        affected_files=["services/api/requirements.txt"],
-        description="urllib3 pinned <2 conflicts with requests>=2.31 which requires urllib3>=2",
-    )
-
-
-def _inject_wrong_db_url(workspace: str) -> FaultMetadata:
-    """Inject a malformed DATABASE_URL with a double-slash hostname."""
-    path = os.path.join(workspace, "docker-compose.yml")
-    content = _read(path)
-    import re
-    patched = re.sub(
-        r'(environment:\s*\n(?:\s+-[^\n]*\n)*)',
-        lambda m: m.group(0) + '              - DATABASE_URL=postgresql://user:pass@db-host-missing/mydb\n',
-        content,
-    )
-    if patched == content:
-        _write(path, textwrap.dedent("""\
-            version: "3.8"
-
-            services:
-              api:
-                build:
-                  context: .
-                  dockerfile: Dockerfile
-                ports:
-                  - "5000:5000"
-                environment:
-                  - FLASK_ENV=production
-                  - DATABASE_URL=postgresql://user:pass@db-host-missing/mydb
-        """))
-    else:
-        _write(path, patched)
-    return FaultMetadata(
-        fault_type="wrong_db_url",
-        affected_files=["docker-compose.yml"],
-        description="DATABASE_URL references unresolvable hostname 'db-host-missing'",
-    )
-
-
-def _inject_init_order_race(workspace: str) -> FaultMetadata:
-    """Remove depends_on healthcheck so api starts before db is ready."""
-    path = os.path.join(workspace, "docker-compose.yml")
-    content = _read(path)
-    import re
-    # Remove depends_on block
-    patched = re.sub(r'\s*depends_on:[^\n]*\n(?:\s+[^\n]*\n)*', '\n', content)
-    if patched == content:
-        # Write fresh compose without depends_on
-        _write(path, textwrap.dedent("""\
-            version: "3.8"
-
-            services:
-              db:
-                image: postgres:15-alpine
-                environment:
-                  - POSTGRES_DB=mydb
-                  - POSTGRES_USER=user
-                  - POSTGRES_PASSWORD=pass
-              api:
-                build:
-                  context: .
-                  dockerfile: Dockerfile
-                ports:
-                  - "5000:5000"
-                environment:
-                  - FLASK_ENV=production
-                  - DATABASE_URL=postgresql://user:pass@db/mydb
-                # FAULT(init_order_race): depends_on removed — api may start before db
-        """))
-    else:
-        _write(path, patched)
-    return FaultMetadata(
-        fault_type="init_order_race",
-        affected_files=["docker-compose.yml"],
-        description="depends_on healthcheck removed — api starts before db is ready, connection race",
-    )
-
-
-def _inject_missing_volume_mount(workspace: str) -> FaultMetadata:
-    """Remove volume mount for /app/logs so log directory doesn't exist in container."""
-    path = os.path.join(workspace, "docker-compose.yml")
-    content = _read(path)
-    import re
-    patched = re.sub(r'\s*-\s*\./logs:/app/logs\n?', '\n', content)
-    if patched == content:
-        _write(path, textwrap.dedent("""\
-            version: "3.8"
-
-            services:
-              api:
-                build:
-                  context: .
-                  dockerfile: Dockerfile
-                ports:
-                  - "5000:5000"
-                environment:
-                  - FLASK_ENV=production
-                  - LOG_PATH=/app/logs/app.log
-                # FAULT(missing_volume_mount): ./logs:/app/logs volume not mounted
-                # /app/logs directory will not exist in container
-        """))
-    else:
-        _write(path, patched)
-    return FaultMetadata(
-        fault_type="missing_volume_mount",
-        affected_files=["docker-compose.yml"],
-        description="./logs:/app/logs volume mount missing — log directory absent in container",
     )

@@ -70,27 +70,17 @@ STAGE_WEIGHTS = {
 # ── Fault → Stage Mapping ──────────────────────────────────────────────────
 
 FAULT_STAGE_MAP: Dict[str, str] = {
-    "merge_conflict": "test",
+    "merge_conflict":      "test",
     "dependency_conflict": "build",
-    "docker_order": "build",
-    "flaky_test": "test",
-    "missing_permission": "deploy",
-    "secret_exposure": "build",
-    "env_drift": "deploy",
-    "log_pii_leak": "build",
-    "log_disabled": "build",
-    "log_bad_config": "build",
-    "log_path_unwritable": "build",
-    "log_rotation_missing": "build",
-    "log_volume_missing": "deploy",
-    "shared_secret_rotation": "deploy",
-    "infra_port_conflict": "deploy",
-    "dependency_version_drift": "build",
-    "bad_migration_sql": "build",
-    "schema_drift": "deploy",
-    "wrong_db_url": "deploy",
-    "init_order_race": "deploy",
-    "missing_volume_mount": "deploy",
+    "docker_order":        "build",
+    "flaky_test":          "test",
+    "missing_permission":  "deploy",
+    "secret_exposure":     "build",
+    "env_drift":           "deploy",
+    "log_pii_leak":        "build",
+    "log_disabled":        "build",
+    "bad_migration_sql":   "build",
+    "schema_drift":        "deploy",
 }
 
 
@@ -421,36 +411,6 @@ PARTIAL_FIX_CHECKS: Dict[str, List[Tuple[str, Callable[[str], bool]]]] = {
         ("log config check passes (LOG_LEVEL not CRITICAL)",
          lambda ws: _run_log_config_check(ws)[0] == 0),
     ],
-    "log_bad_config": [
-        ("log config check passes (all required fields present)",
-         lambda ws: _run_log_config_check(ws)[0] == 0),
-    ],
-    "log_path_unwritable": [
-        ("LOG_PATH does not point to a restricted system directory",
-         lambda ws: _run_log_config_check(ws)[0] == 0),
-    ],
-    "log_rotation_missing": [
-        ("RotatingFileHandler present in logging_config.py",
-         lambda ws: "RotatingFileHandler(" in _read_file_safe(ws, "services/api/logging_config.py")),
-    ],
-    "log_volume_missing": [
-        ("./logs:/app/logs mount present in docker-compose.yml",
-         lambda ws: "./logs:/app/logs" in _read_file_safe(ws, "docker-compose.yml")),
-    ],
-    "shared_secret_rotation": [
-        ("SECRET_VERSION env var present in docker-compose.yml",
-         lambda ws: "SECRET_VERSION" in _read_file_safe(ws, "docker-compose.yml")),
-        ("no stale secret literals in app.py",
-         lambda ws: "whsec_old_" not in _read_file_safe(ws, "services/api/app.py")),
-    ],
-    "infra_port_conflict": [
-        ("no duplicate port mappings in docker-compose.yml",
-         lambda ws: _no_duplicate_ports(ws)),
-    ],
-    "dependency_version_drift": [
-        ("all packages have compatible version pins",
-         lambda ws: _run_secret_scan(ws)[0] == 0 and _no_version_drift(ws)),
-    ],
     "bad_migration_sql": [
         ("CREAT TABLE typo corrected in 001_init.sql",
          lambda ws: "CREAT TABLE" not in _read_file_safe(ws, "db/migrations/001_init.sql")),
@@ -460,19 +420,6 @@ PARTIAL_FIX_CHECKS: Dict[str, List[Tuple[str, Callable[[str], bool]]]] = {
     "schema_drift": [
         ("artifact_url removed from database.py CANONICAL_COLUMNS",
          lambda ws: "artifact_url" not in _read_file_safe(ws, "db/database.py")),
-    ],
-    "wrong_db_url": [
-        ("DATABASE_URL does not contain placeholder hostname",
-         lambda ws: "db-host-missing" not in _read_file_safe(ws, "docker-compose.yml")
-         and "wrong_host" not in _read_file_safe(ws, "docker-compose.yml")),
-    ],
-    "init_order_race": [
-        ("depends_on db present in docker-compose.yml",
-         lambda ws: "depends_on" in _read_file_safe(ws, "docker-compose.yml")),
-    ],
-    "missing_volume_mount": [
-        ("./logs:/app/logs mount present in docker-compose.yml",
-         lambda ws: "./logs:/app/logs" in _read_file_safe(ws, "docker-compose.yml")),
     ],
 }
 
@@ -778,8 +725,7 @@ class SimulatedPipelineRunner:
     # Fault types that fail very early (< 1 s into the stage)
     _FAST_FAIL_FAULTS = {
         "dependency_conflict", "docker_order", "secret_exposure",
-        "log_pii_leak", "log_disabled", "log_bad_config", "log_path_unwritable",
-        "log_rotation_missing", "dependency_version_drift", "bad_migration_sql",
+        "log_pii_leak", "log_disabled", "bad_migration_sql",
         "merge_conflict",  # SyntaxError caught at pytest import, fast
     }
 
@@ -1053,12 +999,10 @@ class SimulatedPipelineRunner:
                 )
             return 1, "", stderr
 
-        if fault in ("log_pii_leak", "log_disabled", "log_bad_config",
-                     "log_path_unwritable", "log_rotation_missing"):
+        if fault in ("log_pii_leak", "log_disabled"):
             # Use real log config check so logs match actual file state
             _, _, stderr = _run_log_config_check(self.workspace_path)
             if not stderr:
-                # Fallback per-fault message if check unexpectedly passes
                 _fallbacks = {
                     "log_pii_leak": (
                         "LOG CONFIG CHECK FAILED\n"
@@ -1073,38 +1017,9 @@ class SimulatedPipelineRunner:
                         "  ERROR: services/api/logging_config.py:12: LOG_LEVEL hardcoded to CRITICAL\n\n"
                         "Build blocked: logging configuration violates observability requirements"
                     ),
-                    "log_bad_config": (
-                        "LOG CONFIG CHECK FAILED\n"
-                        "  FAIL: JSON formatter does not call json.dumps() — log records will not be valid JSON\n"
-                        "  FAIL: JSON formatter missing required field: 'timestamp'\n\n"
-                        "Build blocked: logging configuration violates observability requirements"
-                    ),
-                    "log_path_unwritable": (
-                        "LOG CONFIG CHECK FAILED\n"
-                        "  FAIL: LOG_PATH default '/var/log/app.log' points to a restricted system directory\n\n"
-                        "Build blocked: logging configuration violates observability requirements"
-                    ),
-                    "log_rotation_missing": (
-                        "LOG CONFIG CHECK FAILED\n"
-                        "  FAIL: logging_config.py does not use RotatingFileHandler —"
-                        " logs may grow unboundedly without rotation\n\n"
-                        "Build blocked: logging configuration violates observability requirements"
-                    ),
                 }
                 stderr = _fallbacks.get(fault, "LOG CONFIG CHECK FAILED\nBuild blocked.")
             return 1, "", stderr
-
-        if fault == "dependency_version_drift":
-            return 1, "", (
-                "  × No solution found when resolving dependencies:\n"
-                "  ╰─▶ Because your project requires requests>=2.31.0\n"
-                "      and requests 2.31.0 requires urllib3>=1.21.1,<2\n"
-                "      and urllib3==1.26.19 is the latest compatible version,\n"
-                "      we can conclude that urllib3>=2.0 is incompatible with requests>=2.31.0.\n\n"
-                "ERROR: ResolutionImpossible — package version drift detected\n"
-                "The command '/bin/sh -c uv pip install --system --no-cache -r requirements.txt'"
-                " returned a non-zero code: 1"
-            )
 
         if fault == "bad_migration_sql":
             # Use real SQL validator for accurate line/column info
@@ -1185,36 +1100,6 @@ class SimulatedPipelineRunner:
                 "ERROR: Encountered errors while bringing up the project."
             )
 
-        if fault == "log_volume_missing":
-            return 1, "", (
-                "api-service  | ERROR: cannot open log file /app/logs/app.log: "
-                "[Errno 2] No such file or directory: '/app/logs/app.log'\n"
-                "api-service  | CRITICAL: logging setup failed — no log volume mounted\n"
-                "api-service exited with code 1\n"
-                "ERROR: Service 'api' failed to start: container exited with code 1.\n"
-                "Config clue: docker-compose.yml is missing the ./logs:/app/logs volume mount."
-            )
-
-        if fault == "shared_secret_rotation":
-            return 1, "", (
-                "api-service  | ERROR: Failed to authenticate with upstream service\n"
-                "api-service  | ERROR: HMAC signature mismatch — secret version mismatch\n"
-                "api-service  |   expected SECRET_VERSION=v2, peer is using SECRET_VERSION=v1\n"
-                "api-service  | ERROR: SharedSecretRotationError: secret rotation not propagated to all services\n"
-                "api-service exited with code 1\n"
-                "ERROR: Service 'api' failed health check after deploy.\n"
-                "Hint: Ensure SECRET_VERSION env var is updated in docker-compose.yml and redeployed atomically."
-            )
-
-        if fault == "infra_port_conflict":
-            return 1, "", (
-                "ERROR: for api  Cannot start service api: driver failed programming external "
-                "connectivity on endpoint sample-app_api_1: "
-                "Bind for 0.0.0.0:5000 failed: port is already allocated\n"
-                "ERROR: Encountered errors while bringing up the project.\n"
-                "Hint: Check for duplicate port mappings in docker-compose.yml or another service using port 5000."
-            )
-
         if fault == "schema_drift":
             return 1, "", (
                 'sqlalchemy.exc.OperationalError: (psycopg2.errors.UndefinedColumn) '
@@ -1224,36 +1109,6 @@ class SimulatedPipelineRunner:
                 'HINT:  Perhaps you meant to reference the column "builds.exit_code".\n'
                 "ERROR: Schema mismatch detected in database.py CANONICAL_COLUMNS\n"
                 "Hint: Either add a migration to CREATE the column, or remove it from CANONICAL_COLUMNS."
-            )
-
-        if fault == "wrong_db_url":
-            return 1, "", (
-                "api-service  | sqlalchemy.exc.OperationalError: (psycopg2.OperationalError)\n"
-                'api-service  |   could not translate host name "db-host-missing" to address: '
-                "Name or service not known\n"
-                "api-service  | ERROR: Database connection failed — check DATABASE_URL in docker-compose.yml\n"
-                "api-service exited with code 1\n"
-                "ERROR: Service 'api' failed to start: could not connect to database."
-            )
-
-        if fault == "init_order_race":
-            return 1, "", (
-                "api-service  | sqlalchemy.exc.OperationalError: (psycopg2.OperationalError)\n"
-                "api-service  |   FATAL: the database system is starting up\n"
-                "api-service  | ERROR: api started before db was ready — "
-                "add depends_on with condition: service_healthy to docker-compose.yml\n"
-                "api-service exited with code 1\n"
-                "ERROR: Service startup race condition: 'api' attempted DB connection before 'db' was ready."
-            )
-
-        if fault == "missing_volume_mount":
-            return 1, "", (
-                "api-service  | ERROR: cannot open log file /app/logs/app.log: "
-                "[Errno 2] No such file or directory: '/app/logs/app.log'\n"
-                "api-service  | CRITICAL: log directory /app/logs does not exist in container\n"
-                "api-service exited with code 1\n"
-                "ERROR: Service 'api' failed to start: missing volume mount for /app/logs.\n"
-                "Hint: Add './logs:/app/logs' under volumes in docker-compose.yml."
             )
 
         # Generic fallback
