@@ -77,6 +77,12 @@ FAULT_STAGE_MAP: Dict[str, str] = {
     "missing_permission":  "deploy",
     "secret_exposure":     "build",
     "env_drift":           "deploy",
+    "invalid_database_url": "deploy",
+    "empty_secret_key":     "deploy",
+    "missing_pythonpath":   "deploy",
+    "circular_import_runtime": "deploy",
+    "missing_package_init": "deploy",
+    "none_config_runtime":  "deploy",
     "log_pii_leak":        "build",
     "log_disabled":        "build",
     "bad_migration_sql":   "build",
@@ -120,6 +126,18 @@ def _read_file_safe(workspace: str, rel_path: str) -> str:
             return f.read()
     except (OSError, FileNotFoundError):
         return ""
+
+
+def _parse_env_file(workspace: str, rel_path: str = ".env") -> Dict[str, str]:
+    content = _read_file_safe(workspace, rel_path)
+    values: Dict[str, str] = {}
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip()
+    return values
 
 
 def _find_python_files(workspace: str, subdir: str = "") -> List[str]:
@@ -402,6 +420,30 @@ PARTIAL_FIX_CHECKS: Dict[str, List[Tuple[str, Callable[[str], bool]]]] = {
     "env_drift": [
         ("not-a-number port removed from docker-compose.yml",
          lambda ws: "not-a-number" not in _read_file_safe(ws, "docker-compose.yml")),
+    ],
+    "invalid_database_url": [
+        ("DATABASE_URL points at the healthy db port",
+         lambda ws: ":15432/" not in _parse_env_file(ws).get("DATABASE_URL", "")),
+    ],
+    "empty_secret_key": [
+        ("SECRET_KEY is non-empty in .env",
+         lambda ws: bool(_parse_env_file(ws).get("SECRET_KEY", "").strip())),
+    ],
+    "missing_pythonpath": [
+        ("virtualenv runtime.pth includes /app/services",
+         lambda ws: "/app/services" in _read_file_safe(ws, ".venv/runtime.pth")),
+    ],
+    "circular_import_runtime": [
+        ("runtime probe helper no longer contains the circular import marker",
+         lambda ws: "FAULT_CIRCULAR_IMPORT_RUNTIME" not in _read_file_safe(ws, "services/api/runtime_probe.py")),
+    ],
+    "missing_package_init": [
+        ("runtime support package has __init__.py restored",
+         lambda ws: bool(_read_file_safe(ws, "services/runtime_support/__init__.py").strip())),
+    ],
+    "none_config_runtime": [
+        ("FEATURE_CACHE_BACKEND no longer resolves to None",
+         lambda ws: _parse_env_file(ws).get("FEATURE_CACHE_BACKEND", "").strip().lower() not in {"", "none"}),
     ],
     "log_pii_leak": [
         ("log config check passes (no PII in log calls)",
@@ -916,6 +958,7 @@ class SimulatedPipelineRunner:
             "api-service  | INFO:     Application startup complete.\n"
             "api-service  | INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)\n"
             f"{health_msg}\n"
+            'api-service  | INFO:     GET /items runtime probe -> 200 OK\n'
             "All services healthy. Deploy complete."
         )
         return 0, stdout, ""
@@ -1124,6 +1167,97 @@ class SimulatedPipelineRunner:
                 'ERROR: for api  Cannot create container for service api: '
                 'invalid port specification: "not-a-number:5000"\n'
                 "ERROR: Encountered errors while bringing up the project."
+            )
+
+        if fault == "invalid_database_url":
+            return 1, (
+                "Creating sample-app_api_1 ... done\n"
+                "api-service  | INFO:     Started server process [1]\n"
+                "api-service  | INFO:     Waiting for application startup.\n"
+                "api-service  | INFO:     Application startup complete.\n"
+                "api-service  | INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)\n"
+                "api-service  | INFO:     GET /health -> 200 OK\n"
+            ), (
+                "api-service  | ERROR:    GET /items runtime probe failed\n"
+                "api-service  | psycopg2.OperationalError: connection to server at \"db\" (172.18.0.2), port 15432 failed: Connection refused\n"
+                "api-service  | DETAIL: DATABASE_URL came from .env and points at the wrong port.\n"
+                "api-service  | HINT: Verify DATABASE_URL in .env before re-running the pipeline.\n"
+                "ERROR: Deploy smoke test failed after startup during the first database-backed request."
+            )
+
+        if fault == "empty_secret_key":
+            return 1, (
+                "Creating sample-app_api_1 ... done\n"
+                "api-service  | INFO:     Started server process [1]\n"
+                "api-service  | INFO:     Waiting for application startup.\n"
+                "api-service  | INFO:     Application startup complete.\n"
+                "api-service  | INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)\n"
+                "api-service  | INFO:     GET /health -> 200 OK\n"
+            ), (
+                "api-service  | ERROR:    GET /items runtime probe failed\n"
+                "api-service  | RuntimeError: SECRET_KEY is empty; secure request context cannot be initialized\n"
+                "api-service  | HINT: Restore SECRET_KEY in .env and rerun the deploy stage.\n"
+                "ERROR: Runtime configuration fault surfaced only when request handling touched auth/session state."
+            )
+
+        if fault == "missing_pythonpath":
+            return 1, (
+                "Creating sample-app_api_1 ... done\n"
+                "api-service  | INFO:     Started server process [1]\n"
+                "api-service  | INFO:     Waiting for application startup.\n"
+                "api-service  | INFO:     Application startup complete.\n"
+                "api-service  | INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)\n"
+                "api-service  | INFO:     GET /health -> 200 OK\n"
+            ), (
+                "api-service  | ERROR:    GET /items runtime probe failed\n"
+                "api-service  | ModuleNotFoundError: No module named 'services.runtime_support'\n"
+                "api-service  | DETAIL: virtualenv bootstrap file .venv/runtime.pth is missing /app/services.\n"
+                "ERROR: Lazy runtime import failed even though build and startup succeeded."
+            )
+
+        if fault == "circular_import_runtime":
+            return 1, (
+                "Creating sample-app_api_1 ... done\n"
+                "api-service  | INFO:     Started server process [1]\n"
+                "api-service  | INFO:     Waiting for application startup.\n"
+                "api-service  | INFO:     Application startup complete.\n"
+                "api-service  | INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)\n"
+                "api-service  | INFO:     GET /health -> 200 OK\n"
+            ), (
+                "api-service  | ERROR:    GET /items runtime probe failed\n"
+                "api-service  | ImportError: cannot import name 'load_runtime_probe' from partially initialized module 'services.api.runtime_probe' (most likely due to a circular import)\n"
+                "api-service  | DETAIL: The circular import is triggered only by the request-path helper.\n"
+                "ERROR: Runtime smoke test exposed a lazy circular import."
+            )
+
+        if fault == "missing_package_init":
+            return 1, (
+                "Creating sample-app_api_1 ... done\n"
+                "api-service  | INFO:     Started server process [1]\n"
+                "api-service  | INFO:     Waiting for application startup.\n"
+                "api-service  | INFO:     Application startup complete.\n"
+                "api-service  | INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)\n"
+                "api-service  | INFO:     GET /health -> 200 OK\n"
+            ), (
+                "api-service  | ERROR:    GET /items runtime probe failed\n"
+                "api-service  | ModuleNotFoundError: No module named 'services.runtime_support'\n"
+                "api-service  | DETAIL: services/runtime_support/__init__.py is missing, so the lazy support package cannot be imported during request handling.\n"
+                "ERROR: Package initialization fault only surfaced when runtime code path executed."
+            )
+
+        if fault == "none_config_runtime":
+            return 1, (
+                "Creating sample-app_api_1 ... done\n"
+                "api-service  | INFO:     Started server process [1]\n"
+                "api-service  | INFO:     Waiting for application startup.\n"
+                "api-service  | INFO:     Application startup complete.\n"
+                "api-service  | INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)\n"
+                "api-service  | INFO:     GET /health -> 200 OK\n"
+            ), (
+                "api-service  | ERROR:    GET /items runtime probe failed\n"
+                "api-service  | TypeError: 'NoneType' object is not subscriptable\n"
+                "api-service  | DETAIL: FEATURE_CACHE_BACKEND resolved to None from .env and crashed only when the request path dereferenced it.\n"
+                "ERROR: Runtime-only config dereference fault triggered after startup."
             )
 
         if fault == "schema_drift":

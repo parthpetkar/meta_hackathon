@@ -4,7 +4,7 @@ Mirrors fault_injector.py's inject_fault() API exactly but:
 - Writes real file mutations (so SimulatedPipelineRunner's file-read checks work)
 - Skips all git add/commit operations (no git required)
 - Returns the same FaultMetadata dataclass
-- Supports the same 11 fault types as fault_injector.py
+- Supports the full simulated fault catalog, including runtime-only env and virtualenv faults
 
 This is used by SimulatedCICDRepairEnvironment when CICD_SIMULATE=true.
 """
@@ -36,6 +36,12 @@ def inject_fault_simulated(workspace: str, fault_type: str) -> FaultMetadata:
         "missing_permission":  _inject_missing_permission,
         "secret_exposure":     _inject_secret_exposure,
         "env_drift":           _inject_env_drift,
+        "invalid_database_url": _inject_invalid_database_url,
+        "empty_secret_key":     _inject_empty_secret_key,
+        "missing_pythonpath":   _inject_missing_pythonpath,
+        "circular_import_runtime": _inject_circular_import_runtime,
+        "missing_package_init": _inject_missing_package_init,
+        "none_config_runtime":  _inject_none_config_runtime,
         "log_pii_leak":        _inject_log_pii_leak,
         "log_disabled":        _inject_log_disabled,
         "bad_migration_sql":   _inject_bad_migration_sql,
@@ -69,6 +75,32 @@ def _read(path: str) -> str:
             return f.read()
     except (OSError, FileNotFoundError):
         return ""
+
+
+def _upsert_line(content: str, key: str, value: str) -> str:
+    lines = content.splitlines()
+    updated = False
+    for idx, line in enumerate(lines):
+        if line.startswith(f"{key}="):
+            lines[idx] = f"{key}={value}"
+            updated = True
+            break
+    if not updated:
+        lines.append(f"{key}={value}")
+    normalized = "\n".join(lines).strip()
+    return normalized + "\n"
+
+
+def _write_default_env(path: str) -> str:
+    content = _read(path)
+    if not content.strip():
+        content = (
+            "DATABASE_URL=postgresql://postgres:postgres@db:5432/appdb\n"
+            "SECRET_KEY=dev-secret-key\n"
+            "FEATURE_CACHE_BACKEND=redis\n"
+        )
+    _write(path, content if content.endswith("\n") else content + "\n")
+    return _read(path)
 
 
 # ── Fault injectors (mirrors fault_injector.py exactly, no git) ─────────────
@@ -251,6 +283,84 @@ def _inject_env_drift(workspace: str) -> FaultMetadata:
         fault_type="env_drift",
         affected_files=["docker-compose.yml"],
         description="Invalid runtime env var PORT=not-a-number breaks docker compose deploy port mapping",
+    )
+
+
+def _inject_invalid_database_url(workspace: str) -> FaultMetadata:
+    path = os.path.join(workspace, ".env")
+    content = _write_default_env(path)
+    content = _upsert_line(content, "DATABASE_URL", "postgresql://postgres:postgres@db:15432/appdb")
+    _write(path, content)
+    return FaultMetadata(
+        fault_type="invalid_database_url",
+        affected_files=[".env"],
+        description="DATABASE_URL points at the wrong postgres port, so the app boots but the first DB call fails at runtime",
+    )
+
+
+def _inject_empty_secret_key(workspace: str) -> FaultMetadata:
+    path = os.path.join(workspace, ".env")
+    content = _write_default_env(path)
+    content = _upsert_line(content, "SECRET_KEY", "")
+    _write(path, content)
+    return FaultMetadata(
+        fault_type="empty_secret_key",
+        affected_files=[".env"],
+        description="SECRET_KEY is blank in .env, so request-time session/config access fails after startup",
+    )
+
+
+def _inject_missing_pythonpath(workspace: str) -> FaultMetadata:
+    path = os.path.join(workspace, ".venv", "runtime.pth")
+    _write(path, "/app\n")
+    return FaultMetadata(
+        fault_type="missing_pythonpath",
+        affected_files=[".venv/runtime.pth"],
+        description="Virtualenv path bootstrap omits /app/services, so a lazy runtime import fails only when the endpoint is exercised",
+    )
+
+
+def _inject_circular_import_runtime(workspace: str) -> FaultMetadata:
+    path = os.path.join(workspace, "services", "api", "runtime_probe.py")
+    _write(path, textwrap.dedent("""\
+        \"\"\"Runtime probe helpers.\"\"\"
+
+        FAULT_CIRCULAR_IMPORT_RUNTIME = True
+
+        def load_runtime_probe():
+            return "runtime-import-cycle"
+    """))
+    return FaultMetadata(
+        fault_type="circular_import_runtime",
+        affected_files=["services/api/runtime_probe.py"],
+        description="A lazy request helper introduces a circular import that does not trigger until the runtime probe endpoint executes",
+    )
+
+
+def _inject_missing_package_init(workspace: str) -> FaultMetadata:
+    pkg_dir = os.path.join(workspace, "services", "runtime_support")
+    os.makedirs(pkg_dir, exist_ok=True)
+    helper_path = os.path.join(pkg_dir, "request_context.py")
+    _write(helper_path, "def runtime_context():\n    return 'ok'\n")
+    init_path = os.path.join(pkg_dir, "__init__.py")
+    if os.path.exists(init_path):
+        os.remove(init_path)
+    return FaultMetadata(
+        fault_type="missing_package_init",
+        affected_files=["services/runtime_support/__init__.py", "services/runtime_support/request_context.py"],
+        description="A runtime-only support package is missing __init__.py, so lazy imports fail during request handling instead of build/install",
+    )
+
+
+def _inject_none_config_runtime(workspace: str) -> FaultMetadata:
+    path = os.path.join(workspace, ".env")
+    content = _write_default_env(path)
+    content = _upsert_line(content, "FEATURE_CACHE_BACKEND", "None")
+    _write(path, content)
+    return FaultMetadata(
+        fault_type="none_config_runtime",
+        affected_files=[".env"],
+        description="A config value resolves to None at runtime and only crashes when the request path dereferences it",
     )
 
 
