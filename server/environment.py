@@ -94,10 +94,14 @@ KNOWN_CONFIG_PATHS = (
     "Dockerfile",
     "docker-compose.yml",
     ".env",
+    ".venv/runtime.pth",
     "services/api/requirements.txt",
     "services/api/routes.py",
     "services/api/app.py",
     "services/api/logging_config.py",
+    "services/api/runtime_probe.py",
+    "services/runtime_support/__init__.py",
+    "services/runtime_support/request_context.py",
     "tests/test_api.py",
     ".github/ci.yml",
     "db/migrations/001_init.sql",
@@ -171,7 +175,7 @@ class EpisodeState:
 def _extract_config_path_from_text(text: str) -> str:
     patterns = [
         r" in ([^:]+):\d+:",
-        r"\b((?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:py|ya?ml|txt|env))\b",
+        r"\b((?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:py|ya?ml|txt|env|pth))\b",
         r"\b(Dockerfile)\b",
     ]
     for pattern in patterns:
@@ -843,6 +847,12 @@ class SimulatedCICDRepairEnvironment(Environment):
             "missing_permission":  "hard",
             "secret_exposure":     "security",
             "env_drift":           "network",
+            "invalid_database_url": "network",
+            "empty_secret_key":     "security",
+            "missing_pythonpath":   "hard",
+            "circular_import_runtime": "hard",
+            "missing_package_init": "medium",
+            "none_config_runtime":  "medium",
             "log_pii_leak":        "security",
             "log_disabled":        "medium",
             "bad_migration_sql":   "medium",
