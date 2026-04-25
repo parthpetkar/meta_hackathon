@@ -514,7 +514,14 @@ async def websocket_endpoint(websocket: WebSocket, workspace_id: str):
     try:
         while True:
             try:
-                data = await websocket.receive_json()
+                # Use a timeout so the loop stays alive during long pipeline runs.
+                # If no message arrives within 45 s we loop back and wait again —
+                # this keeps the coroutine scheduled so the event loop can service
+                # WebSocket ping/pong frames sent by the client.
+                data = await asyncio.wait_for(websocket.receive_json(), timeout=45.0)
+            except asyncio.TimeoutError:
+                # No command received — just keep the connection alive and loop.
+                continue
             except Exception:
                 break
 
@@ -728,4 +735,4 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=8001, ws_ping_interval=30, ws_ping_timeout=60)

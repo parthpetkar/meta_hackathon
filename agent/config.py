@@ -79,6 +79,25 @@ BENCHMARK = os.getenv("META_HACKATHON_BENCHMARK", "meta_hackathon")
 MAX_STEPS = 16
 TEMPERATURE = 0.1
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "512"))
+
+# Tool-call compliance mode.
+#   required — tool_choice="required", hard-fail if model emits no tool call (default for large models)
+#   auto     — tool_choice="auto", fall back to XML/JSON text parsing when no native tool call returned
+#   text     — no tools sent at all; model must respond in plain JSON (for models that don't support tool-call API)
+#
+# If not set explicitly, we auto-detect: models with <=14b in the name default to "auto".
+def _resolve_tool_call_mode() -> str:
+    explicit = (os.getenv("TOOL_CALL_MODE") or "").strip().lower()
+    if explicit in ("required", "auto", "text"):
+        return explicit
+    # Auto-detect small models by name
+    name_lower = (MODEL_NAME or "").lower()
+    small_hints = ["7b", "8b", "3b", "4b", "1b", "mini", "small", "tiny", "phi-3", "gemma-3-4b"]
+    if any(h in name_lower for h in small_hints):
+        return "auto"
+    return "required"
+
+TOOL_CALL_MODE: str = _resolve_tool_call_mode()
 SUCCESS_SCORE_THRESHOLD = float(os.getenv("SUCCESS_SCORE_THRESHOLD", "0.20"))
 # Number of episodes to run per inference session.
 # Fault selection is always by LLM adversarial designer.
