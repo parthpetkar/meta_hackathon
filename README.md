@@ -15,7 +15,7 @@ tags:
 
 # Can an AI Agent Fix Your Broken Pipeline?
 
-> **[Try the environment on Hugging Face Spaces](https://huggingface.co/spaces/parthpetkar/metahackathon)** · **[Blog post / writeup](#)** `[placeholder — add HF blog post]` · **[Colab Notebook Link](#)**
+> **[Try the environment on Hugging Face Spaces](https://huggingface.co/spaces/parthpetkar/metahackathon)** · **[Blog post](https://huggingface.co/spaces/parthpetkar/metahackathon/blob/main/blog.md)** · **[Colab Notebook Link](https://colab.research.google.com/drive/1FgVs1PooBOcaZbEMhUmetrAy5mX8Foy6?usp=sharing)**
 
 > **Hackathon Themes:** `Theme #3.1` — Professional Tasks (CI/CD repair as a high-stakes real-world engineering workflow) · `Theme #4` — Self-Improvement (UCB1 curriculum scheduler + GRPO policy training loop)
 
