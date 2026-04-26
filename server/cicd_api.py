@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
@@ -513,23 +513,165 @@ app = FastAPI(
 )
 
 
+def _build_landing_page() -> str:
+        return """<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Meta Hackathon CI/CD Repair Environment</title>
+    <style>
+        :root {
+            --bg: #08111f;
+            --panel: rgba(15, 23, 42, 0.84);
+            --panel-2: rgba(30, 41, 59, 0.92);
+            --text: #e2e8f0;
+            --muted: #94a3b8;
+            --border: rgba(148, 163, 184, 0.22);
+            --accent: #fb923c;
+            --accent-2: #38bdf8;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            color: var(--text);
+            background:
+                radial-gradient(circle at top left, rgba(56, 189, 248, 0.22), transparent 28%),
+                radial-gradient(circle at top right, rgba(251, 146, 60, 0.18), transparent 26%),
+                linear-gradient(180deg, #050816 0%, var(--bg) 100%);
+        }
+        .wrap { max-width: 1120px; margin: 0 auto; padding: 32px 20px 48px; }
+        .hero {
+            padding: 36px;
+            border-radius: 28px;
+            border: 1px solid var(--border);
+            background: linear-gradient(135deg, rgba(15, 23, 42, 0.95), rgba(30, 41, 59, 0.9));
+            box-shadow: 0 24px 60px rgba(2, 6, 23, 0.36);
+        }
+        .badge {
+            display: inline-flex;
+            padding: 6px 12px;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.08);
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            font-size: 11px;
+            font-weight: 700;
+        }
+        h1 {
+            margin: 18px 0 14px;
+            font-size: clamp(34px, 5vw, 62px);
+            line-height: 1.02;
+            letter-spacing: -0.05em;
+            max-width: 12ch;
+        }
+        p {
+            margin: 0;
+            max-width: 780px;
+            font-size: 18px;
+            line-height: 1.65;
+            color: rgba(226, 232, 240, 0.84);
+        }
+        .actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin-top: 22px;
+        }
+        a.button {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 44px;
+            padding: 0 16px;
+            border-radius: 14px;
+            text-decoration: none;
+            font-weight: 700;
+            border: 1px solid transparent;
+            transition: transform 120ms ease, border-color 120ms ease;
+        }
+        a.button:hover { transform: translateY(-1px); }
+        .primary { color: #0f172a; background: linear-gradient(135deg, #fde68a, #fb923c); }
+        .secondary { color: var(--text); background: rgba(255, 255, 255, 0.06); border-color: var(--border); }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 16px;
+            margin-top: 18px;
+        }
+        .card {
+            padding: 18px;
+            border-radius: 20px;
+            background: var(--panel);
+            border: 1px solid var(--border);
+        }
+        .card h2 {
+            margin: 0 0 10px;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 0.10em;
+            color: #f8fafc;
+        }
+        .card p, .card li { color: var(--muted); font-size: 15px; }
+        .card ul { margin: 0; padding-left: 18px; }
+        code {
+            padding: 2px 6px;
+            border-radius: 8px;
+            background: rgba(148, 163, 184, 0.14);
+            color: #f8fafc;
+        }
+    </style>
+</head>
+<body>
+    <main class="wrap">
+        <section class="hero">
+            <div class="badge">Meta Hackathon · CI/CD repair lab</div>
+            <h1>Something should be visible here.</h1>
+            <p>
+                The Space is alive, and the API is serving the repair environment. Use the links below to inspect
+                the docs or check health instead of seeing a blank Not Found page.
+            </p>
+            <div class="actions">
+                <a class="button primary" href="/docs">Open API docs</a>
+                <a class="button secondary" href="/health">Check health</a>
+                <a class="button secondary" href="/api/workspace/create">Workspace API</a>
+            </div>
+            <div class="grid">
+                <article class="card">
+                    <h2>What this is</h2>
+                    <p>A deterministic benchmark for diagnosing and repairing broken CI/CD pipelines.</p>
+                </article>
+                <article class="card">
+                    <h2>Visible endpoints</h2>
+                    <ul>
+                        <li><code>GET /health</code></li>
+                        <li><code>POST /api/workspace/create</code></li>
+                        <li><code>WS /api/ws/{workspace_id}</code></li>
+                    </ul>
+                </article>
+                <article class="card">
+                    <h2>Next step</h2>
+                    <p>Open the docs, create a workspace, and follow the surfaced logs to the smallest safe fix.</p>
+                </article>
+            </div>
+        </section>
+    </main>
+</body>
+</html>"""
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     asyncio.create_task(_gc_loop())
 
 
-@app.get("/")
-async def root():
-    return {
-        "service": "CI/CD Dynamic API",
-        "version": "2.0.0",
-        "endpoints": {
-            "websocket": "/api/ws/{workspace_id}",
-            "workspace": "/api/workspace/*",
-            "pipeline": "/api/pipeline/*",
-            "docs": "/docs",
-        },
-    }
+@app.get("/", include_in_schema=False)
+@app.get("/web", include_in_schema=False)
+@app.get("/web/", include_in_schema=False)
+async def root() -> HTMLResponse:
+    return HTMLResponse(_build_landing_page())
 
 
 # ── WebSocket endpoint ───────────────────────────────────────────────────────

@@ -852,8 +852,7 @@ from starlette.requests import Request as _StarletteRequest
 from starlette.responses import Response as _StarletteResponse
 from starlette.datastructures import Headers
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse as _JSONResponse
-from fastapi.responses import RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse as _JSONResponse
 
 
 @app.get("/health")
@@ -861,11 +860,196 @@ async def health() -> Dict[str, str]:
     return {"status": "ok", "service": "meta-hackathon-env"}
 
 
+def _build_landing_page() -> str:
+        return """<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Meta Hackathon CI/CD Repair Environment</title>
+    <style>
+        :root {
+            color-scheme: light;
+            --bg: #09111f;
+            --panel: rgba(15, 23, 42, 0.78);
+            --panel-2: rgba(30, 41, 59, 0.88);
+            --text: #e2e8f0;
+            --muted: #94a3b8;
+            --accent: #f97316;
+            --accent-2: #38bdf8;
+            --border: rgba(148, 163, 184, 0.22);
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            color: var(--text);
+            background:
+                radial-gradient(circle at top left, rgba(56, 189, 248, 0.22), transparent 30%),
+                radial-gradient(circle at top right, rgba(249, 115, 22, 0.20), transparent 28%),
+                linear-gradient(180deg, #050816 0%, var(--bg) 100%);
+        }
+        .wrap {
+            max-width: 1120px;
+            margin: 0 auto;
+            padding: 32px 20px 48px;
+        }
+        .hero {
+            position: relative;
+            overflow: hidden;
+            padding: 36px;
+            border: 1px solid var(--border);
+            border-radius: 28px;
+            background: linear-gradient(135deg, rgba(15, 23, 42, 0.92), rgba(30, 41, 59, 0.88));
+            box-shadow: 0 24px 60px rgba(2, 6, 23, 0.40);
+        }
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 12px;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.08);
+            color: #f8fafc;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            font-size: 11px;
+            font-weight: 700;
+        }
+        h1 {
+            margin: 18px 0 14px;
+            font-size: clamp(34px, 5vw, 62px);
+            line-height: 1.02;
+            letter-spacing: -0.05em;
+            max-width: 12ch;
+        }
+        .lede {
+            max-width: 760px;
+            margin: 0;
+            font-size: 18px;
+            line-height: 1.65;
+            color: rgba(226, 232, 240, 0.82);
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 16px;
+            margin-top: 18px;
+        }
+        .card {
+            padding: 18px;
+            border-radius: 20px;
+            background: var(--panel);
+            border: 1px solid var(--border);
+            backdrop-filter: blur(14px);
+        }
+        .card h2 {
+            margin: 0 0 10px;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 0.10em;
+            color: #f8fafc;
+        }
+        .card p, .card li {
+            margin: 0;
+            color: var(--muted);
+            line-height: 1.6;
+        }
+        .card ul {
+            margin: 0;
+            padding-left: 18px;
+        }
+        .actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin-top: 22px;
+        }
+        a.button {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 44px;
+            padding: 0 16px;
+            border-radius: 14px;
+            text-decoration: none;
+            font-weight: 700;
+            border: 1px solid transparent;
+            transition: transform 120ms ease, border-color 120ms ease, background 120ms ease;
+        }
+        a.button:hover { transform: translateY(-1px); }
+        .primary {
+            color: #0f172a;
+            background: linear-gradient(135deg, #fde68a, #fb923c);
+        }
+        .secondary {
+            color: var(--text);
+            background: rgba(255, 255, 255, 0.06);
+            border-color: var(--border);
+        }
+        .footer {
+            margin-top: 16px;
+            color: var(--muted);
+            font-size: 13px;
+        }
+        code {
+            padding: 2px 6px;
+            border-radius: 8px;
+            background: rgba(148, 163, 184, 0.14);
+            color: #f8fafc;
+        }
+    </style>
+</head>
+<body>
+    <main class="wrap">
+        <section class="hero">
+            <div class="badge">Meta Hackathon · CI/CD repair lab</div>
+            <h1>Something should be visible here.</h1>
+            <p class="lede">
+                This Space exposes a full repair environment, but the landing page should not be blank.
+                Use the controls below to inspect the API, check health, and jump into the interactive environment.
+            </p>
+            <div class="actions">
+                <a class="button primary" href="/docs">Open API docs</a>
+                <a class="button secondary" href="/health">Check health</a>
+                <a class="button secondary" href="/">Open interactive UI</a>
+            </div>
+            <div class="grid">
+                <article class="card">
+                    <h2>What this is</h2>
+                    <p>A deterministic benchmark for diagnosing and repairing broken CI/CD pipelines.</p>
+                </article>
+                <article class="card">
+                    <h2>First step</h2>
+                    <p>Reset an episode, inspect the surfaced logs, and apply the smallest safe fix.</p>
+                </article>
+                <article class="card">
+                    <h2>Visible endpoints</h2>
+                    <ul>
+                        <li><code>GET /health</code></li>
+                        <li><code>POST /api/workspace/create</code></li>
+                        <li><code>WS /api/ws/{workspace_id}</code></li>
+                    </ul>
+                </article>
+            </div>
+            <div class="footer">If you still see a blank page, the backend is up and this route is the right place to diagnose next.</div>
+        </section>
+    </main>
+</body>
+</html>"""
+
+
+@app.get("/", include_in_schema=False)
+async def landing_page() -> HTMLResponse:
+        return HTMLResponse(_build_landing_page())
+
+
 @app.get("/web", include_in_schema=False)
 @app.get("/web/", include_in_schema=False)
-async def web_alias() -> RedirectResponse:
-    # Local Docker users often try /web (HF Space base path); route it to UI root.
-    return RedirectResponse(url="/", status_code=307)
+async def web_alias() -> HTMLResponse:
+        # HF Spaces mount the app under /web, so serve a real landing page there.
+        return HTMLResponse(_build_landing_page())
 
 
 @app.exception_handler(RequestValidationError)
