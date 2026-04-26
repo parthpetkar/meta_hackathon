@@ -35,10 +35,10 @@ PHASE_ORDER: List[str] = ["triage", "investigation", "hypothesis", "fix", "verif
 
 # Per-action bonuses when following correct SRE workflow
 PHASE_BONUS = 0.15
-FIX_SKIP_PENALTY = -0.25      # jumping to fix without hypothesis
-RED_HERRING_PENALTY = -0.10   # hypothesis matches red-herring symptom
+FIX_SKIP_PENALTY = 0.0        # jumping to fix without hypothesis
+RED_HERRING_PENALTY = 0.0     # hypothesis matches red-herring symptom
 CORRECT_HYPOTHESIS_BONUS = 0.20
-FULL_RESOLUTION_BONUS = 0.50  # all faults resolved at finalize
+FULL_RESOLUTION_BONUS = 1.0   # all faults resolved at finalize
 PARTIAL_RESOLUTION_BONUS = 0.15
 
 

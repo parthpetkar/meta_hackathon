@@ -498,7 +498,7 @@ class SimulatedCICDRepairEnvironment(Environment):
         if operation not in CANONICAL_OPERATIONS:
             return self._error_observation(
                 f"Unsupported operation '{raw_operation}'",
-                reward=-0.20,
+                reward=0.0,
             )
 
         history_entry = {"operation": operation, "target": target, "value": value}
@@ -1002,7 +1002,7 @@ class SimulatedCICDRepairEnvironment(Environment):
     def _dict_to_observation(self, obs_dict: dict) -> MetaHackathonObservation:
         return MetaHackathonObservation(**obs_dict)
 
-    def _error_observation(self, message: str, reward: float = -0.20) -> MetaHackathonObservation:
+    def _error_observation(self, message: str, reward: float = 0.0) -> MetaHackathonObservation:
         return MetaHackathonObservation(
             pipeline_status="error",
             reward=reward,
