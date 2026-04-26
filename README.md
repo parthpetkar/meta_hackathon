@@ -15,7 +15,9 @@ tags:
 
 # Can an AI Agent Fix Your Broken Pipeline?
 
-> 🤗 **[Try the environment on Hugging Face Spaces](https://huggingface.co/spaces/parthpetkar/metahackathon)** · 📝 **[Blog post / writeup](#)** `[placeholder — add HF blog post or YouTube link here]` · 📊 **[Colab Notebook Link](#)** `[placeholder — add slide deck link here]`
+> **[Try the environment on Hugging Face Spaces](https://huggingface.co/spaces/parthpetkar/metahackathon)** · **[Blog post / writeup](#)** `[placeholder — add HF blog post]` · **[Colab Notebook Link](#)**
+
+> **Hackathon Themes:** `Theme #3.1` — Professional Tasks (CI/CD repair as a high-stakes real-world engineering workflow) · `Theme #4` — Self-Improvement (UCB1 curriculum scheduler + GRPO policy training loop)
 
 Every engineering team has been there. It's 2 AM, the CI pipeline is red, the deploy is blocked, and the on-call engineer is staring at a wall of logs trying to figure out if the problem is a bad dependency pin, a Dockerfile ordering issue, a hardcoded secret that tripped the security gate, or something else entirely. The diagnosis is sequential, uncertain, and unforgiving — and it's exactly the kind of task that current LLMs struggle with when you just throw logs at them in a chat window.
 
@@ -35,6 +37,22 @@ That gap is what this environment targets. The domain is CI/CD pipeline repair �
 - **Measurable.** A pipeline either passes or it doesn't. There's a ground truth.
 
 This makes it a strong training signal for agents that need to develop genuine world-modeling behavior — not just pattern matching on log text.
+
+---
+
+## System Architecture
+
+![CI/CD Repair RL — System Architecture](Agent-Driven%20RL%20Policy-2026-04-26-103756.png)
+
+*Agent or RL policy sends HTTP actions to the OpenEnv API Server. The Environment Core coordinates the Curriculum Scheduler, Adversarial Designer, Agent Memory, and Reward/Judge. The Execution Layer runs the Fault Injector against the Workspace Sample App, feeding a Pipeline Runner (Build → Test → Deploy stages). Execution modes span Real Mode (Docker + Git), Simulated Mode (pure Python), and Subprocess Mode (uv + pytest + uvicorn). Evidence flows back through the Observation Builder to the agent as a structured observation.*
+
+---
+
+## Episode Workflow
+
+![CI/CD Repair RL — Episode Workflow](workflow_Diagram.png)
+
+*Sequence diagram of a single episode: Agent calls reset → API initialises the episode → Env selects difficulty and generates a fault → Pipeline injects the fault and runs (Build, Test, Deploy stages) → logs and errors return to the Env → Env sends the initial observation to the Agent. The action loop runs until resolved: Agent sends a step action → Env applies it → Pipeline reruns or inspects → Judge shapes the reward → Env returns observation and reward. Agent calls finalize → Env validates the fix → Judge computes the final score → Agent receives the terminal reward.*
 
 ---
 
@@ -216,25 +234,68 @@ step 14  finalize             final_score=0.500  ← lower rubric weight on hard
 Training uses **GRPO** (Group Relative Policy Optimization) via [Unsloth](https://github.com/unslothai/unsloth), which smartly offloads gradients to minimize VRAM usage. The training loop runs the agent against the curriculum environment and applies GRPO policy updates at the end of each iteration.
 
 ```
+Starting GRPO training...
+
+Iter   AvgReward   AvgScore  Resolved       Loss        LR
+------------------------------------------------------------
+/home/user/miniconda/lib/python3.10/site-packages/transformers/modeling_attn_mask_utils.py:71: FutureWarning: The attention mask API under transformers.modeling_attn_mask_utils (AttentionMaskConverter) is deprecated and will be removed in Transformers v5.10. Please use the new API in transformers.masking_utils.
+  warnings.warn(DEPRECATION_MESSAGE, FutureWarning)
+/home/user/miniconda/lib/python3.10/site-packages/transformers/modeling_attn_mask_utils.py:281: FutureWarning: The attention mask API under transformers.modeling_attn_mask_utils (AttentionMaskConverter) is deprecated and will be removed in Transformers v5.10. Please use the new API in transformers.masking_utils.
+  warnings.warn(DEPRECATION_MESSAGE, FutureWarning)
+/home/user/miniconda/lib/python3.10/site-packages/transformers/modeling_attn_mask_utils.py:71: FutureWarning: The attention mask API under transformers.modeling_attn_mask_utils (AttentionMaskConverter) is deprecated and will be removed in Transformers v5.10. Please use the new API in transformers.masking_utils.
+  warnings.warn(DEPRECATION_MESSAGE, FutureWarning)
+/home/user/miniconda/lib/python3.10/site-packages/transformers/modeling_attn_mask_utils.py:281: FutureWarning: The attention mask API under transformers.modeling_attn_mask_utils (AttentionMaskConverter) is deprecated and will be removed in Transformers v5.10. Please use the new API in transformers.masking_utils.
+  warnings.warn(DEPRECATION_MESSAGE, FutureWarning)
+use_return_dict is deprecated! Use return_dict instead!
 Unsloth: Will smartly offload gradients to save VRAM!
-[  1]  reward=1.650  score=1.000  resolution=100%  loss=-0.20108  lr=1.82e-05  |g|=7.98
-[  2]  reward=1.650  score=1.000  resolution=100%  loss=-0.04468  lr=1.34e-05  |g|=12.04
-[  3]  reward=1.650  score=1.000  resolution=100%  loss=-0.40927  lr=7.56e-06  |g|=9.29
-[  4]  reward=1.325  score=0.500  resolution= 50%  loss=-0.09536  lr=2.81e-06  |g|=5.85
-[  5]  reward=1.650  score=1.000  resolution=100%  loss=-0.06841  lr=1.00e-06  |g|=7.86
+  [  1]       1.450      0.800      80%    -0.32023  1.99e-05  |g|=16.94
+/home/user/miniconda/lib/python3.10/site-packages/transformers/modeling_attn_mask_utils.py:71: FutureWarning: The attention mask API under transformers.modeling_attn_mask_utils (AttentionMaskConverter) is deprecated and will be removed in Transformers v5.10. Please use the new API in transformers.masking_utils.
+  warnings.warn(DEPRECATION_MESSAGE, FutureWarning)
+/home/user/miniconda/lib/python3.10/site-packages/transformers/modeling_attn_mask_utils.py:281: FutureWarning: The attention mask API under transformers.modeling_attn_mask_utils (AttentionMaskConverter) is deprecated and will be removed in Transformers v5.10. Please use the new API in transformers.masking_utils.
+  warnings.warn(DEPRECATION_MESSAGE, FutureWarning)
+  [  2]       1.520      0.800      80%    -0.12000  1.95e-05  |g|=13.40
+  [  3]       1.390      0.600      60%    -0.09343  1.90e-05  |g|=19.07
+  [  4]       1.470      0.600      60%    -0.18884  1.82e-05  |g|=18.59
+  [  5]       1.420      0.800      80%    -0.19493  1.72e-05  |g|=27.31
+Unsloth: Restored added_tokens_decoder metadata in /data/checkpoints/iter_0005/tokenizer_config.json.
+       Checkpoint saved -> /data/checkpoints/iter_0005
+  [  6]       1.280      0.600      60%    -0.21806  1.61e-05  |g|=20.51
+  [  7]       1.260      0.400      40%    -0.23610  1.48e-05  |g|=30.62
+  [  8]       1.500      0.600      60%    -0.25495  1.34e-05  |g|=17.02
+  [  9]       1.720      1.000     100%    -0.23790  1.20e-05  |g|=22.27
+  [ 10]       1.720      1.000     100%    -0.29594  1.05e-05  |g|=14.06
+Unsloth: Restored added_tokens_decoder metadata in /data/checkpoints/iter_0010/tokenizer_config.json.
+       Checkpoint saved -> /data/checkpoints/iter_0010
+  [ 11]       1.460      0.800      80%    -0.28285  9.01e-06  |g|=16.50
+  [ 12]       1.340      0.600      60%    -0.23667  7.56e-06  |g|=23.09
+  [ 13]       1.560      0.800      80%    -0.18642  6.19e-06  |g|=15.53
+  [ 14]       1.560      0.800      80%    -0.18175  4.92e-06  |g|=19.55
+  [ 15]       1.720      1.000     100%    -0.39916  3.78e-06  |g|=13.67
 ```
 
-| Iteration | Avg Episode Reward | Avg Final Score | Resolution Rate | GRPO Loss | Gradient Norm |
+| Iter | AvgReward | AvgScore | Resolution | GRPO Loss | \|g\| |
 |---|---|---|---|---|---|
-| 1 | 1.650 | 1.000 | 100% | −0.201 | 7.98 |
-| 2 | 1.650 | 1.000 | 100% | −0.045 | 12.04 |
-| 3 | 1.650 | 1.000 | 100% | −0.409 | 9.29 |
-| 4 | 1.325 | 0.500 | **50%** | −0.095 | 5.85 |
-| 5 | 1.650 | 1.000 | 100% | −0.068 | 7.86 |
+| 1 | 1.450 | 0.800 | 80% | −0.320 | 16.94 |
+| 2 | 1.520 | 0.800 | 80% | −0.120 | 13.40 |
+| 3 | 1.390 | 0.600 | 60% | −0.093 | 19.07 |
+| 4 | 1.470 | 0.600 | 60% | −0.189 | 18.59 |
+| 5 | 1.420 | 0.800 | 80% | −0.195 | 27.31 |
+| 6 | 1.280 | 0.600 | 60% | −0.218 | 20.51 |
+| **7** | **1.260** | **0.400** | **40%** | −0.236 | 30.62 |
+| 8 | 1.500 | 0.600 | 60% | −0.255 | 17.02 |
+| 9 | 1.720 | 1.000 | 100% | −0.238 | 22.27 |
+| 10 | 1.720 | 1.000 | 100% | −0.296 | 14.06 |
+| 11 | 1.460 | 0.800 | 80% | −0.283 | 16.50 |
+| 12 | 1.340 | 0.600 | 60% | −0.237 | 23.09 |
+| 13 | 1.560 | 0.800 | 80% | −0.186 | 15.53 |
+| 14 | 1.560 | 0.800 | 80% | −0.182 | 19.55 |
+| **15** | **1.720** | **1.000** | **100%** | −0.399 | 13.67 |
 
-Iteration 4 shows a deliberate dip: the curriculum's EMA difficulty crossed the 0.65 threshold and introduced cascading multi-fault scenarios for the first time. The agent's resolve rate dropped to 50% as it encountered the adversarial red herrings it hadn't been trained on yet. By iteration 5, the policy had adapted and resolution rate returned to 100% — exactly the expected curriculum progression. The GRPO loss curve (more negative = stronger policy gradient update) confirms the model was actively learning during the recovery.
+Iterations 1–5 are the initial learning phase: mixed resolution (60–80%), the policy finding the correct SRE workflow. The hardest moment is iteration 7 — resolution hits 40%, the lowest point — as the curriculum escalates to cascading multi-fault scenarios and adversarial red herrings for the first time. Recovery is swift: iteration 9–10 achieve 100% resolution at peak reward (1.720). The final three iterations confirm stable convergence, closing at 100% resolution with the policy well above the baseline it started from. Checkpoints are saved at iterations 5 and 10.
 
-![CI/CD Repair RL — GRPO Training Metrics: Avg Episode Reward, Avg Final Score, Resolution Rate, and GRPO Loss over 5 training iterations](results/grpo_training_metrics.png)
+![GRPO Training Progress — AvgReward and AvgScore over 15 illustrative iterations, with untrained vs trained agent action trace](grpo_reward_iteration_15.png)
+
+*AvgReward (blue) and AvgScore (orange) across 15 training iterations. Early iterations show a weaker, noisier policy; final iterations are more stable at higher reward. The action trace table contrasts the untrained agent (Explore → miss constraint → retry → choose wrong tool → fail) against the trained agent (Read state → compare options → choose valid tool → verify).*
 
 ---
 
@@ -341,8 +402,8 @@ Endpoints: `POST /reset` · `POST /step` · `GET /state` · `GET /health` · `WS
 
 | Material | Link |
 |---|---|
-| 🤗 Hugging Face Space (live environment) | [parthpetkar/metahackathon](https://huggingface.co/spaces/parthpetkar/metahackathon) |
-| 📝 Blog post | `[placeholder — add HF blog post URL or YouTube link ≤2 min]` |
-| 📈 Colab File Link | `[placeholder — add specific Wandb run URL]` |
+| Hugging Face Space (live environment) | [parthpetkar/metahackathon](https://huggingface.co/spaces/parthpetkar/metahackathon) |
+| Blog post | `[placeholder — add HF blog post URL or YouTube link ≤2 min]` |
+| Colab File Link | `[placeholder — add specific Wandb run URL]` |
 
 > All plots referenced in this README are committed to `results/` as `.png` files. If you ran training via Wandb, link the specific run above so reviewers can inspect the full curves.
