@@ -84,9 +84,6 @@ COPY --from=builder /app/env/.venv /app/.venv
 # Copy the environment code
 COPY --from=builder /app/env /app/env
 
-# Remove any stale DB baked in from the host — a fresh one is created at runtime.
-RUN rm -f /app/env/server/agent_memory.db
-
 # Set PATH to use the virtual environment
 ENV PATH="/app/.venv/bin:$PATH"
 
@@ -99,6 +96,10 @@ ENV ENABLE_WEB_INTERFACE=true
 # DB lives in the server folder; path is overridable via env var.
 ENV AGENT_MEMORY_DB_PATH=/app/env/server/agent_memory.db
 
+# Initialise the SQLite DB at build time so it survives HF Spaces ephemeral restarts.
+RUN cd /app/env && python -c 'from server.agent_memory import _init_db; _init_db(); print("DB ready:", __import__("os").getenv("AGENT_MEMORY_DB_PATH"))' && \
+    ls -lh /app/env/server/agent_memory.db
+
 # Health check — cicd_api.py exposes /health on port 8000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
@@ -108,4 +109,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 #   POST /api/workspace/create         — bootstrap workspace, inject fault, pre-run pipeline
 #   WS   /api/ws/{workspace_id}        — persistent per-episode WebSocket session
 #   GET  /health                       — health probe
-CMD ["sh", "-c", "cd /app/env && python -c 'from server.agent_memory import _init_db; _init_db(); print(\"DB ready:\", __import__(\"os\").getenv(\"AGENT_MEMORY_DB_PATH\"))' && uvicorn server.cicd_api:app --host 0.0.0.0 --port 8000 --ws-ping-interval 30 --ws-ping-timeout 60"]
+CMD ["sh", "-c", "cd /app/env && uvicorn server.cicd_api:app --host 0.0.0.0 --port 8000 --ws-ping-interval 30 --ws-ping-timeout 60"]
