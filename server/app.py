@@ -930,6 +930,17 @@ async def startup_event():
     logger.info("Starting Meta Hackathon Environment Server")
     logger.info("=" * 60)
 
+    # Initialise SQLite DBs at runtime so they exist on HF Spaces (ephemeral FS,
+    # no Docker build step runs there).
+    try:
+        from server.agent_memory import _init_db as _init_agent_memory
+        _init_agent_memory()
+        from server.curriculum import _conn as _curriculum_conn
+        _curriculum_conn().close()
+        logger.info("DB ready: %s", os.getenv("AGENT_MEMORY_DB_PATH", "<default>"))
+    except Exception as exc:
+        logger.error("DB init failed: %s", exc)
+
     # Run in thread pool so the sync polling loop doesn't block the event loop
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _start_cicd_api_server, cicd_api_port, cicd_api_host)
