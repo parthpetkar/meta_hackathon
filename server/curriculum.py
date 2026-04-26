@@ -20,7 +20,7 @@ try:
 except ImportError:
     from ..cicd.fault_types import FAULT_TYPES
 
-_DB_PATH = Path(__file__).parent / "agent_memory.db"
+_DB_PATH = Path(os.getenv("AGENT_MEMORY_DB_PATH", str(Path(__file__).parent / "agent_memory.db")))
 
 _EMA_ALPHA = float(os.getenv("CURRICULUM_EMA_ALPHA", "0.20"))
 _UCB_C = float(os.getenv("CURRICULUM_UCB_C", "0.5"))
@@ -30,6 +30,7 @@ _DIFFICULTY_MAX = 0.95
 
 
 def _conn() -> sqlite3.Connection:
+    _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(str(_DB_PATH), check_same_thread=False)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("""

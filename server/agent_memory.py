@@ -8,11 +8,12 @@
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 from pathlib import Path
 
-_DB_PATH = Path(__file__).parent / "agent_memory.db"
+_DB_PATH = Path(os.getenv("AGENT_MEMORY_DB_PATH", str(Path(__file__).parent / "agent_memory.db")))
 
 
 def _init_db() -> None:
@@ -22,6 +23,7 @@ def _init_db() -> None:
 
 
 def _connect() -> sqlite3.Connection:
+    _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(_DB_PATH), check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("""
@@ -146,10 +148,7 @@ def recall(errors: list[str], fault_type: str = "unknown") -> dict:
 import time as _time
 
 # Ensure DB and tables exist as soon as the module is imported.
-try:
-    _init_db()
-except Exception:
-    pass
+_init_db()
 
 
 def remember_optimal_path(fault_type: str, path: list[dict]) -> None:
