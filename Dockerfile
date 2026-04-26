@@ -93,10 +93,13 @@ ENV PYTHONPATH="/app/env:$PYTHONPATH"
 # Enable OpenEnv web interface so /web is available when running locally.
 ENV ENABLE_WEB_INTERFACE=true
 
-# Health check
+# Health check — cicd_api.py exposes /health on port 8000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Run the FastAPI server
-# The module path is constructed to work with the /app/env structure
-CMD ["sh", "-c", "cd /app/env && uvicorn server.app:app --host 0.0.0.0 --port 8000"]
+# Run cicd_api.py (workspace + WebSocket API) on port 8000.
+# Exposes:
+#   POST /api/workspace/create         — bootstrap workspace, inject fault, pre-run pipeline
+#   WS   /api/ws/{workspace_id}        — persistent per-episode WebSocket session
+#   GET  /health                       — health probe
+CMD ["sh", "-c", "cd /app/env && uvicorn server.cicd_api:app --host 0.0.0.0 --port 8000 --ws-ping-interval 30 --ws-ping-timeout 60"]

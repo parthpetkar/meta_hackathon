@@ -6,7 +6,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
-from .pipeline_runner import PipelineResult, PipelineStatus, StageStatus, STAGE_ORDER
+from cicd.simulated_runner import PipelineResult, PipelineStatus, StageStatus, STAGE_ORDER
 
 
 # ── Error pattern matching ─────────────────────────────────────────────────
@@ -57,12 +57,20 @@ _CONFIG_PATHS = [
     "Dockerfile",
     "docker-compose.yml",
     ".env",
+    ".venv/runtime.pth",
     "services/api/requirements.txt",
     "services/api/routes.py",
     "services/api/app.py",
     "services/api/logging_config.py",
+    "services/api/runtime_probe.py",
+    "services/runtime_support/__init__.py",
+    "services/runtime_support/request_context.py",
     "tests/test_api.py",
     ".github/ci.yml",
+    ".github/workflows/ci.yml",
+    "infra/main.tf",
+    "infra/variables.tf",
+    "infra/terraform.tfvars",
 ]
 
 
@@ -115,6 +123,26 @@ def build_visible_logs(
             tail = lines[-12:] if stage.status == StageStatus.FAILED else lines[-3:]
             logs.extend(tail)
     return {app_name: logs[:max_lines]}
+
+
+def build_stage_log_tail(
+    pipeline_result: PipelineResult,
+    stage_name: str,
+    tail_lines: int = 10,
+) -> str:
+    stage = pipeline_result.stages.get(stage_name)
+    if not stage:
+        return f"No logs available for stage '{stage_name}'"
+
+    combined = ((stage.stdout or "") + "\n" + (stage.stderr or "")).strip()
+    lines = [line.strip() for line in combined.splitlines() if line.strip()]
+    tail = lines[-tail_lines:] if lines else []
+    header = (
+        f"=== Stage tail: {stage_name} ===\n"
+        f"Status: {stage.status.value}  Exit code: {stage.exit_code}  "
+        f"Showing last {tail_lines} line(s)\n"
+    )
+    return header + ("\n".join(tail) if tail else "(no output yet)")
 
 
 def build_logs_by_stage(pipeline_result: PipelineResult) -> Dict[str, List[str]]:
@@ -376,6 +404,7 @@ def build_observation(
     task_id: str = "",
     task_title: str = "",
     difficulty: str = "",
+    available_tools: Optional[List[str]] = None,
     reward: float = 0.0,
     done: bool = False,
     action_history: Optional[List[str]] = None,
@@ -394,6 +423,8 @@ def build_observation(
     rubric_blend_weight: float = 0.0,
     rubric_judge_used: bool = False,
     rubric_judge_error: str = "",
+    log_tokens_remaining: int = 0,
+    log_access_mode: str = "full",
     metadata: Optional[Dict[str, Any]] = None,
     findings: Optional[List[str]] = None,
     affected_apps: Optional[List[str]] = None,
@@ -422,14 +453,16 @@ def build_observation(
         "current_stage": current_stage,
         "pipeline_stages": pipeline_result.get_stage_statuses(),
         "available_stages": list(STAGE_ORDER),
-        "available_tools": [
-            "view_logs", "inspect_config", "inspect_dockerfile", "inspect_permissions",
+        "available_tools": available_tools or [
+            "view_logs", "tail_logs", "inspect_config", "inspect_dockerfile", "inspect_permissions",
             "set_hypothesis", "modify_config", "add_dependency",
             "rerun_pipeline", "verify_fix", "finalize",
         ],
         "visible_alerts": build_visible_alerts(pipeline_result),
         "visible_logs_per_app": _logs_per_app,
         "visible_logs": [line for lines in _logs_per_app.values() for line in lines],
+        "log_tokens_remaining": int(log_tokens_remaining),
+        "log_access_mode": str(log_access_mode or "full"),
         "affected_apps": affected_apps or [],
         "service_dependency_graph": service_dependency_graph if service_dependency_graph is not None else _DEFAULT_SERVICE_DEPENDENCY_GRAPH,
         "logs_by_stage": build_logs_by_stage(pipeline_result),

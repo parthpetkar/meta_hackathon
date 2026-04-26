@@ -53,7 +53,7 @@ class MetaHackathonAction(Action):
     operation: str = Field(
         ...,
         description=(
-            "Operation name. Preferred values: view_logs, inspect_config, "
+            "Operation name. Preferred values: view_logs, tail_logs, inspect_config, "
             "inspect_dockerfile, modify_config, add_dependency, rerun_pipeline, "
             "verify_fix, finalize, inspect_permissions, set_hypothesis. "
             "Legacy aliases are accepted for backward compatibility."
@@ -100,6 +100,14 @@ class MetaHackathonObservation(Observation):
     visible_logs_per_app: Dict[str, List[str]] = Field(
         default_factory=dict,
         description="Visible log lines per app: {'frontend': [...], 'api-service': [...], ...}.",
+    )
+    log_tokens_remaining: int = Field(
+        default=0,
+        description="Remaining observation budget for full log access in the current episode.",
+    )
+    log_access_mode: str = Field(
+        default="full",
+        description="Current log access mode: full when view_logs is allowed, tail_only after budget exhaustion.",
     )
     logs_by_stage: Dict[str, List[str]] = Field(
         default_factory=dict,

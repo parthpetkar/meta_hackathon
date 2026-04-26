@@ -4,8 +4,12 @@ import json
 import re
 from typing import Any, Dict, Optional, Tuple
 
-from .config import MAX_TOKENS, MODEL_NAME, TEMPERATURE
+from .config import MAX_TOKENS, MODEL_NAME, TEMPERATURE, HTTP_TIMEOUT_SECONDS, USE_WS_API
 from .tool_schemas import TOOL_SCHEMAS
+from .api_tool_schemas import API_TOOL_SCHEMAS
+
+# Select tool schema based on mode
+_ACTIVE_TOOL_SCHEMAS = API_TOOL_SCHEMAS if USE_WS_API else TOOL_SCHEMAS
 
 
 def _parse_tool_arguments(arguments: Any) -> Dict[str, Any]:
@@ -39,18 +43,22 @@ def _parse_xml_tool_call(text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
 
 def _tool_call_to_action_parts(tool_name: str, tool_args: Dict[str, Any]) -> Tuple[str, str, str]:
     name = (tool_name or "").strip()
+
+    # ── Legacy 10-tool schema ──────────────────────────────────────────────
     if name == "view_logs":
         stage = str(tool_args.get("stage", "") or "")
         detail = str(tool_args.get("detail", "") or "")
         return "view_logs", stage, detail
+    if name == "tail_logs":
+        stage = str(tool_args.get("stage", "") or "")
+        detail = str(tool_args.get("detail", "") or "")
+        return "tail_logs", stage, detail
     if name == "inspect_config":
         return "inspect_config", str(tool_args.get("component", "") or ""), ""
     if name == "inspect_dockerfile":
         return "inspect_dockerfile", str(tool_args.get("component", "") or ""), ""
     if name == "inspect_permissions":
         return "inspect_permissions", str(tool_args.get("component", "") or ""), ""
-    if name == "set_hypothesis":
-        return "set_hypothesis", "", str(tool_args.get("hypothesis", "") or "")
     if name == "modify_config":
         return (
             "modify_config",
@@ -67,8 +75,25 @@ def _tool_call_to_action_parts(tool_name: str, tool_args: Dict[str, Any]) -> Tup
         return "rerun_pipeline", "", ""
     if name == "verify_fix":
         return "verify_fix", "", ""
+
+    # ── API-native 6-tool schema ───────────────────────────────────────────
+    if name == "read_file":
+        return "read_file", str(tool_args.get("path", "") or ""), ""
+    if name == "write_file":
+        path = str(tool_args.get("path", "") or "")
+        content = str(tool_args.get("content", "") or "")
+        return "write_file", path, content
+    if name == "list_files":
+        return "list_files", str(tool_args.get("directory", "") or ""), ""
+    if name == "trigger_pipeline":
+        return "trigger_pipeline", "", ""
+
+    # ── Shared tools ───────────────────────────────────────────────────────
+    if name == "set_hypothesis":
+        return "set_hypothesis", "", str(tool_args.get("hypothesis", "") or "")
     if name == "finalize":
         return "finalize", "", ""
+
     return name.lower(), "", ""
 
 
@@ -81,11 +106,12 @@ def get_model_action(
         completion = client.chat.completions.create(
             model=MODEL_NAME,
             messages=messages,
-            tools=TOOL_SCHEMAS,
+            tools=_ACTIVE_TOOL_SCHEMAS,
             tool_choice="required",
             temperature=TEMPERATURE,
             max_tokens=MAX_TOKENS,
             stream=False,
+            timeout=HTTP_TIMEOUT_SECONDS,  # Add explicit timeout
         )
     except Exception as exc:
         # Groq (and some other providers) return a 400 BadRequestError when the

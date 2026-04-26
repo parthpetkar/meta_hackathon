@@ -16,10 +16,12 @@ from typing import Dict, List, Optional
 from openai import OpenAI
 
 try:
-    from cicd.fault_injector import FAULT_TYPES, FAULT_STAGE_MAP, FAULT_KEYWORDS, FaultMetadata, inject_fault
+    from cicd.fault_types import FAULT_TYPES, FAULT_STAGE_MAP, FAULT_KEYWORDS, FaultMetadata
+    from cicd.simulated_fault_injector import inject_fault_simulated as inject_fault
     from models import AdversarialCICDScenario, IncidentStep
 except ImportError:
-    from ..cicd.fault_injector import FAULT_TYPES, FAULT_STAGE_MAP, FAULT_KEYWORDS, FaultMetadata, inject_fault
+    from ..cicd.fault_types import FAULT_TYPES, FAULT_STAGE_MAP, FAULT_KEYWORDS, FaultMetadata
+    from ..cicd.simulated_fault_injector import inject_fault_simulated as inject_fault
     from ..models import AdversarialCICDScenario, IncidentStep
 
 LOGGER = logging.getLogger(__name__)
