@@ -180,12 +180,6 @@ The environment was validated against a frontier model agent running a tool-call
 
 The gradient is clean: harder tasks require more steps and produce lower scores, which is exactly what a well-calibrated benchmark should show. The environment is solvable by a capable agent, but not trivially — the hard tier requires multi-step reasoning across cascading failures.
 
-### Score gradient across task tiers
-
-![Score vs task difficulty — all four tiers resolve at 100% with a clean descending score gradient from easy (0.735) to hard (0.500)](results/score_gradient.png)
-
-*Score vs. task difficulty. All four tiers resolve at 100%. Harder tasks require more steps and produce lower terminal scores, confirming the difficulty calibration works as intended. `[placeholder — commit this plot to results/score_gradient.png]`*
-
 ### Episode reward trace — easy task (7 steps)
 
 Every step returns `reward = 0.0`. The full blended score (`deterministic + rubric`) arrives only at `finalize`:
@@ -222,12 +216,6 @@ step 12  rerun_pipeline       reward=0.0   (pipeline passes)
 step 13  verify_fix           reward=0.0
 step 14  finalize             final_score=0.500  ← lower rubric weight on hard tier + cascading penalty
 ```
-
-### Cumulative reward over steps (baseline runs)
-
-![Cumulative reward over steps for all four task tiers — x-axis: episode step (1–14), y-axis: cumulative reward (0.0–1.0). All reward arrives at the final step.](results/reward_over_steps_2026-04-07.csv)
-
-*Cumulative reward over steps across all four task tiers. With the terminal-first reward model, the curve is flat at 0.0 until the final `finalize` step, where the full terminal score is assigned. `[placeholder — generate and commit results/reward_over_steps.png from the CSV data]`*
 
 ### GRPO Training Results (Unsloth + Qwen2.5-7B)
 
