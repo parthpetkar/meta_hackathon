@@ -391,7 +391,7 @@ Endpoints: `POST /reset` · `POST /step` · `GET /state` · `GET /health` · `WS
 | Material | Link |
 |---|---|
 | Hugging Face Space (live environment) | [parthpetkar/metahackathon](https://huggingface.co/spaces/parthpetkar/metahackathon) |
-| Blog post | `[placeholder — add HF blog post URL or YouTube link ≤2 min]` |
-| Colab File Link | `[placeholder — add specific Wandb run URL]` |
+| Blog post | `[https://huggingface.co/spaces/parthpetkar/metahackathon/blob/main/blog.md]` |
+| Colab File Link | `[https://colab.research.google.com/drive/1FgVs1PooBOcaZbEMhUmetrAy5mX8Foy6?usp=sharing]`
 
-> All plots referenced in this README are committed to `results/` as `.png` files. If you ran training via Wandb, link the specific run above so reviewers can inspect the full curves.
+
