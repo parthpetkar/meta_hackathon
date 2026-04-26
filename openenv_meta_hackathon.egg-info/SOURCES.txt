@@ -6,6 +6,7 @@ inference.py
 models.py
 pyproject.toml
 reset_sqlite_db.py
+run_remote_episode.py
 ./__init__.py
 ./client.py
 ./eval_runner.py
@@ -34,6 +35,7 @@ cicd/simulated_fault_injector.py
 cicd/simulated_fix_applier.py
 cicd/simulated_runner.py
 cicd/subprocess_runner.py
+cicd/terraform_simulator.py
 openenv_meta_hackathon.egg-info/PKG-INFO
 openenv_meta_hackathon.egg-info/SOURCES.txt
 openenv_meta_hackathon.egg-info/dependency_links.txt
