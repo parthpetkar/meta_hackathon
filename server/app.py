@@ -853,6 +853,19 @@ from starlette.responses import Response as _StarletteResponse
 from starlette.datastructures import Headers
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse as _JSONResponse
+from fastapi.responses import RedirectResponse
+
+
+@app.get("/health")
+async def health() -> Dict[str, str]:
+    return {"status": "ok", "service": "meta-hackathon-env"}
+
+
+@app.get("/web", include_in_schema=False)
+@app.get("/web/", include_in_schema=False)
+async def web_alias() -> RedirectResponse:
+    # Local Docker users often try /web (HF Space base path); route it to UI root.
+    return RedirectResponse(url="/", status_code=307)
 
 
 @app.exception_handler(RequestValidationError)
