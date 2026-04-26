@@ -399,10 +399,7 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                     messages.append(
                         {
                             "role": "user",
-                            "content": (
-                                "Your previous response did not include a native tool call. "
-                                "Return exactly one valid tool call from the provided tool schema."
-                            ),
+                            "content": "Missing tool call. Return one valid tool call.",
                         }
                     )
                     if (
@@ -432,7 +429,7 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                     operation, target, value = pre_finalize_guard_action(observation)
                     assistant_message = {
                         "role": "assistant",
-                        "content": f"Guarded action selected before finalize: {operation}|{target}|{value}",
+                        "content": f"Guarded: {operation}|{target}|{value}",
                     }
                     tool_call_id = None
 
@@ -441,14 +438,14 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                     operation, target, value = guarded_progression
                     assistant_message = {
                         "role": "assistant",
-                        "content": f"Progression guard action selected: {operation}|{target}|{value}",
+                        "content": f"Progression guard: {operation}|{target}|{value}",
                     }
                     tool_call_id = None
 
                 should_resample = False
                 surfaced_file = _extract_primary_surfaced_error_file(observation)
 
-                # Inject surfaced-file guardrail at most once per unique file
+                # Critical guardrails only - reduced verbosity
                 _sf_key = f"sf:{surfaced_file}"
                 if (
                     surfaced_file
@@ -460,29 +457,7 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                     messages.append(
                         {
                             "role": "user",
-                            "content": (
-                                "surfaced_errors names a primary file. Your next action must be "
-                                f"inspect_config on '{surfaced_file}' before any other operation."
-                            ),
-                        }
-                    )
-                    should_resample = True
-
-                _hyp_sf_key = f"hyp_sf:{surfaced_file}"
-                if (
-                    operation == "set_hypothesis"
-                    and surfaced_file
-                    and surfaced_file not in inspected_config_targets
-                    and _hyp_sf_key not in injected_guardrails
-                ):
-                    injected_guardrails.add(_hyp_sf_key)
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "Before set_hypothesis, call inspect_config on the surfaced_errors file "
-                                f"'{surfaced_file}'."
-                            ),
+                            "content": f"Inspect '{surfaced_file}' first.",
                         }
                     )
                     should_resample = True
@@ -496,10 +471,7 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                             messages.append(
                                 {
                                     "role": "user",
-                                    "content": (
-                                        "You already tried this exact hypothesis and it scored negatively. "
-                                        "Choose a different root cause and different hypothesis text."
-                                    ),
+                                    "content": "That hypothesis failed. Try a different root cause.",
                                 }
                             )
                         should_resample = True
@@ -517,15 +489,12 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                         messages.append(
                             {
                                 "role": "user",
-                                "content": (
-                                    "You already tried this exact action and it failed. "
-                                    "Choose a different operation, target, or value."
-                                ),
+                                "content": "Action already tried. Choose different operation or target.",
                             }
                         )
                     should_resample = True
 
-                if should_resample and guard_attempts < 3:  # reduced from 4 to 3
+                if should_resample and guard_attempts < 2:  # reduced from 3 to 2
                     messages = trim_messages(messages)
                     continue
 
@@ -613,15 +582,11 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                 injected_guardrails.discard(f"hyp_sf:{target}")
             if operation in {"modify_config", "add_dependency"} and value:
                 fix_applied_since_rerun = True
-                # After any fix, push the agent to rerun immediately so it sees the
-                # updated error state. Without this nudge, agents often inspect stale
-                # errors and exhaust the budget before verifying the fix.
                 fix_note = str(observation.findings[-1]) if observation.findings else ""
                 fix_succeeded = "Fix applied" in fix_note or reward >= 0.0
                 if fix_succeeded and not observation.incident_resolved and not done:
                     forced_messages.append(
-                        "Fix applied. Call rerun_pipeline NOW to see whether the issue is resolved. "
-                        "Do not inspect files or form hypotheses until you have seen the new pipeline state."
+                        "Fix applied. Call rerun_pipeline NOW to verify."
                     )
             if operation == "rerun_pipeline":
                 fix_applied_since_rerun = False
@@ -636,9 +601,7 @@ def run_task(client: "OpenAI", session: requests.Session, fallback_task_name: st
                         forced_messages.append(_STRUCTURED_FIX_HINT)
                 elif reward < 0:
                     forced_messages.append(
-                        "Your last hypothesis was incorrect (negative reward). "
-                        "You must NOT repeat it. Re-read surfaced_errors and form a new hypothesis "
-                        "targeting a different file or root cause."
+                        "Hypothesis incorrect. Re-read surfaced_errors and try different root cause."
                     )
 
             messages.append(assistant_message)
@@ -946,7 +909,7 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
                             injected_guardrails.add(_dup_key)
                             messages.append({
                                 "role": "user",
-                                "content": "You already tried this exact action. Choose a different operation or target.",
+                                "content": "Action already tried. Choose different operation or target.",
                             })
                         should_resample = True
 
@@ -959,24 +922,20 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
                                 injected_guardrails.add(_dup_hyp_key)
                                 messages.append({
                                     "role": "user",
-                                    "content": "That hypothesis already scored negatively. Choose a different root cause.",
+                                    "content": "Hypothesis failed. Try different root cause.",
                                 })
                             should_resample = True
 
-                    # Hard block: write_file with no path is always wrong — fire every attempt
+                    # Hard block: write_file with no path
                     if operation == "write_file" and not target:
                         _last_read = next(
                             (t for op, t, v in reversed(action_history) if op == "read_file" and t),
                             "",
                         )
-                        _path_hint = f"'{_last_read}'" if _last_read else "<relative file path>"
+                        _path_hint = f"'{_last_read}'" if _last_read else "<path>"
                         messages.append({
                             "role": "user",
-                            "content": (
-                                "ERROR: write_file was called without a 'path' argument — the tool call is invalid.\n"
-                                f"You must provide BOTH arguments: path={_path_hint} and content='<complete file content>'.\n"
-                                "Re-issue write_file with the correct path and the full corrected file content."
-                            ),
+                            "content": f"write_file needs path. Use: path={_path_hint}, content='...'",
                         })
                         should_resample = True
 
@@ -987,14 +946,11 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
                             injected_guardrails.add(_rbw_key)
                             messages.append({
                                 "role": "user",
-                                "content": (
-                                    f"You must read_file('{target}') before writing it. "
-                                    "Call read_file on that path now so you have the current content."
-                                ),
+                                "content": f"Read '{target}' first before writing.",
                             })
                         should_resample = True
 
-                    if should_resample and guard_attempts < 3:
+                    if should_resample and guard_attempts < 2:  # reduced from 3 to 2
                         messages = trim_messages(messages)
                         continue
 
@@ -1019,13 +975,11 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
                 value = ""
                 assistant_message = {
                     "role": "assistant",
-                    "content": f"Hard redirect: write_file had no path → {operation}|{target}",
+                    "content": f"Redirect: {operation}|{target}",
                 }
                 tool_call_id = None
                 forced_messages.append(
-                    f"write_file was blocked because 'path' was missing. "
-                    f"Now call write_file(path='{_last_read or '<file_path>'}', "
-                    "content='<the complete corrected file>') — both arguments are required."
+                    f"write_file needs path. Use: write_file(path='{_last_read or '<path>'}', content='...')"
                 )
 
             # Repetition escape — force a different action after too many identical attempts
@@ -1061,32 +1015,27 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
             result = execute_tool(operation, tool_args, ws)
             tool_result_str = format_tool_result(operation, result)
 
-            # ── Reward ────────────────────────────────────────────────────
+            # ── Reward — all values in [0.0, 1.0] ────────────────────────
             op_success = result.get("success", False)
-            # Per-step cost encourages efficiency; finalize is exempt.
-            STEP_PENALTY = -0.01
             if operation == "trigger_pipeline":
                 pipeline_passed = result.get("passed", False)
                 pipeline_triggered_once = True
                 if pipeline_passed:
-                    reward = 0.30
+                    reward = 0.35
                 elif op_success:
                     reward = 0.05
                 else:
-                    reward = -0.10
+                    reward = 0.0
             elif operation == "set_hypothesis":
-                reward = 0.10 if op_success else -0.10
+                reward = 0.10 if op_success else 0.0
             elif operation == "write_file":
-                reward = 0.10 if op_success else -0.15
+                reward = 0.15 if op_success else 0.0
             elif operation == "read_file":
-                # Only reward reads that follow a pipeline run (agent has seen the error).
-                # Blind pre-trigger reads score negatively to discourage the preamble pattern.
                 if op_success and result.get("exists"):
-                    reward = 0.05 if pipeline_triggered_once else -0.02
+                    reward = 0.05 if pipeline_triggered_once else 0.0
                 else:
-                    reward = -0.05
+                    reward = 0.0
             elif operation == "list_files":
-                # list_files is rarely necessary; give no positive reward to avoid padding.
                 reward = 0.0
             elif operation == "finalize":
                 reward = 1.0 if pipeline_passed else 0.0
@@ -1094,9 +1043,6 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
                 success = pipeline_passed
             else:
                 reward = 0.0
-            # Apply step penalty to all non-finalize actions.
-            if operation != "finalize":
-                reward += STEP_PENALTY
 
             rewards.append(reward)
             step_trace.append({
@@ -1133,14 +1079,13 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
                 fix_applied_since_rerun = True
                 if op_success and not pipeline_passed:
                     forced_messages.append(
-                        "Fix applied. Call trigger_pipeline NOW to see whether the issue is resolved. "
-                        "Do not read files again until you have seen the new pipeline state."
+                        "Fix applied. Call trigger_pipeline NOW to verify."
                     )
             if operation == "trigger_pipeline":
                 fix_applied_since_rerun = False
                 if pipeline_passed:
                     forced_messages.append(
-                        "The pipeline PASSED. Call finalize NOW to complete the episode."
+                        "Pipeline PASSED. Call finalize NOW."
                     )
             if operation == "set_hypothesis":
                 norm = _normalize_hypothesis(value)
@@ -1153,19 +1098,16 @@ def run_task_ws(client: "OpenAI", episode_label: str) -> Tuple[str, bool, int, f
                         forced_messages.append(_STRUCTURED_FIX_HINT_WS)
                 elif reward < 0:
                     forced_messages.append(
-                        "Your last hypothesis was incorrect (negative reward). "
-                        "Re-read the pipeline logs and form a new hypothesis targeting a different root cause."
+                        "Hypothesis incorrect. Re-read logs and try different root cause."
                     )
 
-            # Recovery: write_file failed because path was missing — remind the model of correct usage
+            # Recovery: write_file failed because path was missing
             if operation == "write_file" and not op_success and "requires 'path'" in (tool_error or ""):
                 _rbw_recovery_key = "write_file_path_missing"
                 if _rbw_recovery_key not in injected_guardrails:
                     injected_guardrails.add(_rbw_recovery_key)
                     forced_messages.append(
-                        "write_file failed because 'path' was missing. "
-                        "You must call write_file with BOTH path='<file path>' AND content='<complete file content>'. "
-                        "Example: write_file(path='tests/test_api.py', content='<the entire corrected file>')"
+                        "write_file needs BOTH path and content. Example: write_file(path='file.py', content='...')"
                     )
 
             messages.append(assistant_message)

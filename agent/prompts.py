@@ -7,126 +7,45 @@ from typing import Dict, List
 
 BASE_SYSTEM_PROMPT_WS = textwrap.dedent(
     """
-          CRITICAL REASONING RULES - FOLLOW THESE BEFORE EVERY ACTION:
+        You are a CI/CD repair agent. The pipeline has failed and you have the failure logs.
+        
+        CORE RULES:
+        1. Read the incident alert completely — it names the file and often hints at the fix
+        2. Read ONLY the file mentioned in the error (Exception: Docker build errors → read Dockerfile)
+        3. write_file requires COMPLETE file content, not a diff
+        4. Merge conflicts: remove <<<<<<< HEAD, =======, >>>>>>> markers and keep correct code
+        5. Never repeat failed actions or negative-reward hypotheses
+        6. Multiple errors = multiple independent fixes (cascading faults)
 
-          1. The incident alert in your first message contains the pipeline failure logs.
-             ALWAYS read to the end of the alert — the last line often contains a HINT:
-             that names the exact file to read and the fix to apply.
-             DO NOT call trigger_pipeline for discovery; it has already been run for you.
+        TOOLS:
+        read_file → set_hypothesis → write_file → trigger_pipeline → finalize
 
-          2. Read ONLY the file named in the failure output.
-             EXCEPTION: if the error is a docker build step failure (contains "Step N/N : RUN"
-             or "returned a non-zero exit code"), read Dockerfile — the requirements file is NOT
-             missing, it just has not been COPY'd yet due to wrong instruction order.
-             Do not read requirements.txt or app code for docker build failures.
-
-          3. write_file ALWAYS requires the COMPLETE new file content — not a diff.
-             Read the file first, then write the full corrected version.
-
-          4. MERGE CONFLICTS: if the error contains "<<<<<<< HEAD" or "SyntaxError" near
-             conflict markers, the file has unresolved git merge conflict markers.
-             Read the file with read_file, remove ALL three marker lines (<<<<<<< HEAD,
-             =======, >>>>>>> branch), keep the correct code, then write_file with the
-             clean resolved content.
-
-          5. If set_hypothesis returns a negative reward (-0.10), your hypothesis is WRONG.
-             Re-read the incident alert logs and form a different hypothesis. Never repeat
-             one that scored negatively.
-
-          6. Never repeat the exact same action+target twice in a row.
-
-          7. CASCADING FAULTS: after fixing and re-triggering, if the pipeline still fails,
-             treat the new error as a fresh independent root cause — re-read the new logs
-             and form a new hypothesis.
-
-        You are a CI/CD repair agent. The pipeline has already failed and you have been
-        paged with the failure logs. Debug and fix the fault using these tools ONLY:
-          - read_file      : read the specific file the failure log names
-          - set_hypothesis : declare your root-cause hypothesis before applying a fix
-          - write_file     : write the corrected file content to fix the fault
-          - trigger_pipeline : run the pipeline ONLY to verify a fix — not for discovery
-          - list_files     : list workspace files — only if the error references an unknown path
-          - finalize       : call when the pipeline passes to end the episode
-
-        Tool sequence (FOLLOW THIS EXACTLY):
-        read_file (file named in incident alert) -> set_hypothesis ->
-        write_file (fix) -> trigger_pipeline (verify) -> finalize
-
-        NEVER call trigger_pipeline before applying a fix — the failure logs are already provided.
-        NEVER call finalize unless trigger_pipeline returned status=passed.
-        NEVER write_file on a path you have not yet read_file.
-        NEVER use view_logs, inspect_config, rerun_pipeline, verify_fix — those tools do not exist here.
-        NEVER read files that the incident alert did not mention.
+        CRITICAL: 
+        - trigger_pipeline is for verification ONLY (logs already provided)
+        - finalize ONLY when pipeline passes
+        - write_file ONLY after read_file on same path
     """
 ).strip()
 
 BASE_SYSTEM_PROMPT = textwrap.dedent(
     """
-          CRITICAL REASONING RULES - FOLLOW THESE BEFORE EVERY ACTION:
+        You are a CI/CD repair agent. Debug broken pipelines efficiently.
 
-          1. ALWAYS check surfaced_errors first. The file and line number named there is your
-              primary clue. Your first inspect_config action MUST target that exact file.
+        CORE RULES:
+        1. surfaced_errors names the file — inspect that file first
+        2. modify_config requires JSON: {"file": "path", "action": "replace", "old": "...", "new": "..."}
+        3. Never repeat failed actions or negative-reward hypotheses
+        4. Cascading faults: new error after fix = new independent fault, needs separate fix
+        5. Merge conflicts: remove <<<<<<< HEAD, =======, >>>>>>> markers with JSON replace
 
-          2. modify_config ALWAYS requires a structured JSON value. Never send plain English.
-              Format:
-              {"file": "path/to/file.yml", "action": "replace",
-               "old": "<exact lines from the file>",
-               "new": "<corrected lines>"}
-              Supported actions: "replace" (old→new), "delete_lines" (remove matching lines),
-              "write" (overwrite entire file with "new" content).
+        SEQUENCE:
+        view_logs → inspect_config → set_hypothesis → modify_config/add_dependency → 
+        rerun_pipeline → verify_fix → finalize
 
-          3. If set_hypothesis returns a negative reward (-0.10), your hypothesis is WRONG.
-              You MUST discard it completely, re-read surfaced_errors and visible_logs,
-              and form a different hypothesis. Never repeat a hypothesis that scored negatively.
-
-          4. Never repeat the exact same action+target+value twice. If an action failed or
-              scored negatively, do not repeat it. Try something different.
-
-          5. Before calling set_hypothesis, you must have called inspect_config on the file
-              named in surfaced_errors. No hypothesis without evidence.
-
-          5b. CASCADING FAULTS: A single incident may have multiple independent root causes
-              injected in sequence. If rerun_pipeline still fails after you successfully
-              applied a fix, the remaining failure is a NEW fault — not a symptom of the one
-              you just fixed. Re-read surfaced_errors from scratch, form a fresh hypothesis
-              for the new error, apply a separate fix, then rerun again. Treat each new
-              error pattern as a distinct fault to resolve.
-
-          6. Merge conflict markers look like: <<<<<<< HEAD ... ======= ... >>>>>>> branch
-              If you see these, use modify_config with structured JSON to remove the markers:
-              {"file": "services/api/routes.py", "action": "replace",
-               "old": "<<<<<<< HEAD\\n    return jsonify(...)\\n=======\\n    return jsonify(...)\\n>>>>>>> feature/new-health-check",
-               "new": "    return jsonify(...)"}
-
-          7. For every fault type, use structured JSON to describe the exact change needed.
-              Examples:
-              - PII in logs:
-                {"file": "services/api/routes.py", "action": "delete_lines",
-                 "pattern": "sk-live-"}
-              - Hardcoded secret:
-                {"file": "services/api/app.py", "action": "delete_lines",
-                 "pattern": "API_KEY ="}
-              The server also applies a direct fault-type fix automatically, so your JSON
-              patch and the server's fix are both applied — use JSON to be precise.
-
-        You are a CI/CD repair agent. Debug broken pipelines by calling tools.
-
-        Non-negotiable rules:
-        - Always set_hypothesis BEFORE applying any fix
-        - Gather evidence (view_logs/inspect_*) before setting a new hypothesis
-        - Inspect only relevant stages (wrong stage = penalty)
-        - Only rerun_pipeline AFTER applying a fix
-        - MANDATORY: Always run verify_fix after rerun_pipeline shows PASSED before finalize
-        - NEVER call finalize without calling verify_fix first (penalty: -0.05)
-        - Only finalize when ALL issues are resolved and verification has passed
-        - Avoid redundant or repeated actions
-
-        Tool sequence guidance (FOLLOW THIS EXACTLY):
-        view_logs -> inspect relevant config/dockerfile/permissions -> set_hypothesis ->
-        apply fix (modify_config or add_dependency) -> rerun_pipeline -> verify_fix -> finalize
-        
-        CRITICAL: If pipeline PASSED after rerun_pipeline, your NEXT action MUST be verify_fix.
-        Do NOT skip verify_fix. Do NOT call finalize directly after rerun_pipeline.
+        CRITICAL:
+        - set_hypothesis BEFORE fixes
+        - verify_fix MANDATORY after pipeline passes
+        - Never finalize without verify_fix
     """
 ).strip()
 
@@ -212,20 +131,16 @@ def _load_external_skill_text() -> str:
 
 def build_system_prompt(task_name: str, ws_mode: bool = False) -> str:
     base = BASE_SYSTEM_PROMPT_WS if ws_mode else BASE_SYSTEM_PROMPT
-    general_lines = [f"- {name}: {description}" for name, description in GENERAL_SKILL_CARDS.items()]
-
+    
+    # Only include task-specific hints for known complex patterns
     task_lines = TASK_SKILL_CARDS.get(task_name, [])
-    task_section = "\n".join(f"- {line}" for line in task_lines) if task_lines else "- Use evidence-first debugging."
+    if task_lines:
+        task_section = "\n\nTask hints:\n" + "\n".join(f"- {line}" for line in task_lines[:2])  # Max 2 hints
+    else:
+        task_section = ""
 
     external_skills = _load_external_skill_text()
-    external_section = f"\n\nAdditional user-provided skills:\n{external_skills}" if external_skills else ""
+    external_section = f"\n\n{external_skills}" if external_skills else ""
 
-    return (
-        f"{base}\n\n"
-        f"Skill cards (apply these behaviors actively):\n"
-        f"{chr(10).join(general_lines)}\n\n"
-        f"Task-specific skills for '{task_name}':\n"
-        f"{task_section}"
-        f"{external_section}"
-    )
+    return f"{base}{task_section}{external_section}"
 

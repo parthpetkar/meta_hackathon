@@ -137,12 +137,22 @@ class CICDWebSocketClient:
         except Exception as exc:
             logger.error("WS recv loop error: %s", exc)
         finally:
-            # Fail any still-pending futures
-            for fut in self._pending.values():
+            # Cancel pending futures and retrieve their exceptions so asyncio does
+            # not log "Future exception was never retrieved" to stderr.
+            for fut in list(self._pending.values()):
                 if not fut.done():
-                    fut.set_exception(ConnectionError("WebSocket connection closed"))
+                    fut.cancel()
+                    try:
+                        fut.exception()
+                    except Exception:
+                        pass
+            self._pending.clear()
             if self._pipeline_future and not self._pipeline_future.done():
-                self._pipeline_future.set_exception(ConnectionError("WebSocket connection closed"))
+                self._pipeline_future.cancel()
+                try:
+                    self._pipeline_future.exception()
+                except Exception:
+                    pass
 
     async def _dispatch(self, msg: Dict[str, Any]) -> None:
         msg_type = msg.get("type", "")
@@ -197,19 +207,28 @@ class CICDWebSocketClient:
     # ── Command helpers ──────────────────────────────────────────────────────
 
     async def _send_command(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Send a command and wait for the matching response."""
-        if self._ws is None:
-            raise RuntimeError("Not connected — call connect() first")
-        request_id = str(uuid.uuid4())[:8]
-        payload["request_id"] = request_id
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
-        self._pending[request_id] = fut
-        await self._ws.send(json.dumps(payload))
-        try:
-            return await asyncio.wait_for(fut, timeout=self.timeout)
-        except asyncio.TimeoutError:
-            self._pending.pop(request_id, None)
-            raise TimeoutError(f"WS command {payload['type']!r} timed out after {self.timeout}s")
+        """Send a command and wait for the matching response, reconnecting once on drop."""
+        from websockets.exceptions import ConnectionClosed as _CC
+        for attempt in range(2):
+            if self._ws is None:
+                raise RuntimeError("Not connected — call connect() first")
+            request_id = str(uuid.uuid4())[:8]
+            payload["request_id"] = request_id
+            fut: asyncio.Future = asyncio.get_event_loop().create_future()
+            self._pending[request_id] = fut
+            try:
+                await self._ws.send(json.dumps(payload))
+                return await asyncio.wait_for(fut, timeout=self.timeout)
+            except asyncio.TimeoutError:
+                self._pending.pop(request_id, None)
+                raise TimeoutError(f"WS command {payload['type']!r} timed out after {self.timeout}s")
+            except (_CC, ConnectionError, OSError) as exc:
+                self._pending.pop(request_id, None)
+                if attempt == 0:
+                    logger.info("WS connection dropped (%s), reconnecting…", exc)
+                    await self.reconnect()
+                    continue
+                raise ConnectionError(f"WS reconnect failed: {exc}") from exc
 
     # ── Public API ───────────────────────────────────────────────────────────
 
